@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -29,19 +30,26 @@ SPDEX_BASE_URL = "https://app.spdex.com/spdexapi"
 WORLD_CUP_LEAGUE_ID = 911
 
 WEIGHTS = {
-    "bifa": 0.30,
-    "bifa_trade": 0.15,
-    "asian_handicap": 0.20,
-    "euro_kelly": 0.10,
-    "market_balance": 0.20,
+    "bifa": 0.21,
+    "bifa_trade": 0.10,
+    "asian_handicap": 0.17,
+    "euro_kelly": 0.09,
+    "market_balance": 0.15,
+    "draw_risk": 0.07,
+    "fair_line": 0.06,
+    "bookmaker_consensus": 0.05,
+    "depth_profile": 0.04,
+    "snapshot_trend": 0.01,
     "data_quality": 0.05,
 }
 
 UPPER_THRESHOLD = 0.18
 LOWER_THRESHOLD = -0.18
+LEAN_THRESHOLD = 0.05
 
 TOP_BOOKMAKERS = ("PinnacleSports", "Bet365", "Singbet", "IBC", "Ysb88")
 MATCH_LIST_HOT_MODES = (1,)
+SNAPSHOT_DIR_NAME = ".spdex_snapshots"
 
 
 class DataError(RuntimeError):
@@ -116,12 +124,16 @@ class AnalysisResult:
 
     @property
     def lean(self) -> str:
+        if abs(self.score) < LEAN_THRESHOLD:
+            return "无明显倾向"
         if self.score < 0:
             return "下盘"
         return "上盘"
 
     @property
     def lean_team(self) -> str:
+        if self.lean == "无明显倾向":
+            return ""
         if self.lean == "下盘":
             return self.lower_team
         return self.upper_team
@@ -377,18 +389,77 @@ class SpdexClient:
         return [parse_euro_trend(item) for item in data if isinstance(item, dict)]
 
 
+class SnapshotStore:
+    """Append-only local JSONL cache for pre-match trend tracking."""
+
+    def __init__(self, root: str | Path = SNAPSHOT_DIR_NAME):
+        self.root = Path(root)
+
+    def event_path(self, event_id: int) -> Path:
+        return self.root / f"{event_id}.jsonl"
+
+    def save(self, result: "AnalysisResult", fetched_at: datetime | None = None) -> Path:
+        fetched_at = fetched_at or datetime.now(timezone.utc)
+        self.root.mkdir(parents=True, exist_ok=True)
+        record = {
+            "schema": 1,
+            "fetched_at": fetched_at.isoformat(),
+            "match": match_to_dict(result.match),
+            "result": result.to_dict(),
+        }
+        path = self.event_path(result.match.event_id)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        return path
+
+    def load_event(self, event_id: int) -> list[dict[str, Any]]:
+        path = self.event_path(event_id)
+        if not path.exists():
+            return []
+        records: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+        return sorted(records, key=lambda item: str(item.get("fetched_at", "")))
+
+
 class Predictor:
-    def __init__(self, client: SpdexClient):
+    def __init__(self, client: SpdexClient, snapshot_store: SnapshotStore | None = None):
         self.client = client
+        self.snapshot_store = snapshot_store
 
     def analyze(self, match: Match) -> AnalysisResult:
         upper_team, lower_team = upper_lower_teams(match)
         warnings: list[str] = []
 
+        handicap_rows = self._handicap_rows(match, warnings)
         bifa_signal = self._bifa_signal(match, upper_team, lower_team)
         trade_signal = self._trade_signal(match, upper_team, lower_team, warnings)
-        handicap_signal = self._handicap_signal(match, upper_team, lower_team, warnings)
+        handicap_signal = self._handicap_signal(match, upper_team, lower_team, handicap_rows)
         euro_kelly_signal = self._euro_kelly_signal(match, upper_team, lower_team, warnings)
+        draw_risk_signal = self._draw_risk_signal(match, upper_team, lower_team)
+        fair_line_signal = self._fair_line_signal(match, upper_team, lower_team, handicap_rows)
+        bookmaker_consensus_signal = self._bookmaker_consensus_signal(match, upper_team, handicap_rows)
+        depth_profile_signal = self._depth_profile_signal(
+            match,
+            upper_team,
+            lower_team,
+            handicap_rows,
+            bifa_signal,
+            trade_signal,
+            handicap_signal,
+            euro_kelly_signal,
+            draw_risk_signal,
+        )
+        snapshot_trend_signal = self._snapshot_trend_signal(match)
         market_balance_signal = self._market_balance_signal(
             match,
             upper_team,
@@ -397,6 +468,9 @@ class Predictor:
             trade_signal,
             handicap_signal,
             euro_kelly_signal,
+            draw_risk_signal,
+            fair_line_signal,
+            depth_profile_signal,
         )
 
         signals: list[Signal] = [
@@ -405,6 +479,11 @@ class Predictor:
             handicap_signal,
             euro_kelly_signal,
             market_balance_signal,
+            draw_risk_signal,
+            fair_line_signal,
+            bookmaker_consensus_signal,
+            depth_profile_signal,
+            snapshot_trend_signal,
         ]
 
         available_weight = sum(s.weight for s in signals if s.available)
@@ -445,6 +524,16 @@ class Predictor:
             warnings=warnings,
         )
 
+    def _handicap_rows(self, match: Match, warnings: list[str]) -> list[HandicapRow]:
+        try:
+            rows = self.client.handicap_list(match.event_id, match.asian_line)
+        except DataError as exc:
+            warnings.append(str(exc))
+            rows = fallback_handicap_rows_from_base(match)
+        if not rows:
+            rows = fallback_handicap_rows_from_base(match)
+        return sorted(rows, key=bookmaker_priority)
+
     def _bifa_signal(self, match: Match, upper_team: str, lower_team: str) -> Signal:
         raw = match.raw
         upper_key = side_key(match, upper_team)
@@ -476,6 +565,7 @@ class Predictor:
             heat_edge=0.55 * index_edge + 0.45 * amount_edge,
             confirmation_edge=odds_edge,
             payout_edge=payout_edge,
+            line_depth=line_depth(match.asian_line),
         )
         score = clamp(
             0.30 * index_edge
@@ -523,20 +613,12 @@ class Predictor:
         )
 
     def _handicap_signal(
-        self, match: Match, upper_team: str, lower_team: str, warnings: list[str]
+        self, match: Match, upper_team: str, lower_team: str, rows: list[HandicapRow]
     ) -> Signal:
-        try:
-            rows = self.client.handicap_list(match.event_id, match.asian_line)
-        except DataError as exc:
-            warnings.append(str(exc))
-            rows = fallback_handicap_rows_from_base(match)
-
-        if not rows:
-            rows = fallback_handicap_rows_from_base(match)
         if not rows:
             return unavailable_signal("亚盘水位", WEIGHTS["asian_handicap"], "该盘口暂无公司数据")
 
-        selected_rows = sorted(rows, key=bookmaker_priority)
+        selected_rows = rows
         row_scores: list[float] = []
         reasons: list[str] = []
         fallback_only = all(row.source == "fallback" for row in selected_rows)
@@ -608,6 +690,209 @@ class Predictor:
             ),
         )
 
+    def _draw_risk_signal(self, match: Match, upper_team: str, lower_team: str) -> Signal:
+        upper_key = side_key(match, upper_team)
+        lower_key = side_key(match, lower_team)
+        if upper_key not in ("Home", "Away") or lower_key not in ("Home", "Away"):
+            return unavailable_signal("平局风险", WEIGHTS["draw_risk"], "无法映射上下盘方向")
+
+        upper_price = first_positive(
+            match.raw.get(f"EuroAvr{upper_key}"),
+            match.raw.get(f"BfOdds{upper_key}"),
+        )
+        lower_price = first_positive(
+            match.raw.get(f"EuroAvr{lower_key}"),
+            match.raw.get(f"BfOdds{lower_key}"),
+        )
+        draw_price = first_positive(match.raw.get("EuroAvrDraw"), match.raw.get("BfOddsDraw"))
+        if upper_price <= 0 or lower_price <= 0 or draw_price <= 0:
+            return unavailable_signal("平局风险", WEIGHTS["draw_risk"], "缺少平局欧赔/必发赔率")
+
+        upper_prob, draw_prob, lower_prob = normalized_probabilities(upper_price, draw_price, lower_price)
+        draw_kelly = first_positive(match.raw.get("KellyDraw"))
+        upper_kelly = first_positive(match.raw.get(f"Kelly{upper_key}"))
+        lower_kelly = first_positive(match.raw.get(f"Kelly{lower_key}"))
+        kelly_warning = 0.0
+        if draw_kelly > 0 and upper_kelly > 0 and lower_kelly > 0:
+            best_side_kelly = min(upper_kelly, lower_kelly)
+            if draw_kelly < best_side_kelly:
+                kelly_warning = clamp((best_side_kelly - draw_kelly) / max(best_side_kelly, 1.0), 0, 0.35)
+
+        depth = line_depth(match.asian_line)
+        depth_factor = 1.0 if depth <= 0.5 else 0.70 if depth <= 1.25 else 0.45
+        draw_pressure = clamp((draw_prob - 0.255) / 0.14, 0, 1)
+        upper_win_buffer = clamp((upper_prob - draw_prob) / 0.20, -1, 1)
+        score = clamp(-(0.70 * draw_pressure + kelly_warning) * depth_factor + 0.18 * max(upper_win_buffer, 0), -1, 1)
+        reason = (
+            f"平局概率约 {draw_prob:.1%}，{upper_team}胜率约 {upper_prob:.1%}，"
+            f"盘口深度 {depth:.2f}"
+        )
+        if kelly_warning:
+            reason += f"，Kelly提示平局风险 {kelly_warning:.2f}"
+        return Signal("平局风险", score, WEIGHTS["draw_risk"], True, reason)
+
+    def _fair_line_signal(
+        self,
+        match: Match,
+        upper_team: str,
+        lower_team: str,
+        rows: list[HandicapRow],
+    ) -> Signal:
+        upper_key = side_key(match, upper_team)
+        lower_key = side_key(match, lower_team)
+        if upper_key not in ("Home", "Away") or lower_key not in ("Home", "Away"):
+            return unavailable_signal("盘口合理性", WEIGHTS["fair_line"], "无法映射上下盘方向")
+
+        upper_price = first_positive(
+            match.raw.get(f"EuroAvr{upper_key}"),
+            match.raw.get(f"BfOdds{upper_key}"),
+        )
+        lower_price = first_positive(
+            match.raw.get(f"EuroAvr{lower_key}"),
+            match.raw.get(f"BfOdds{lower_key}"),
+        )
+        if upper_price <= 0 or lower_price <= 0:
+            return unavailable_signal("盘口合理性", WEIGHTS["fair_line"], "缺少欧赔/必发价格")
+
+        price_edge = score_bifa_odds_confirmation(upper_price, lower_price)
+        fair_depth = fair_handicap_depth(price_edge)
+        actual_depth = line_depth(match.asian_line)
+        upper_water = average_upper_water(rows, match, upper_team)
+        gap = fair_depth - actual_depth
+        score = clamp(gap / 0.90, -0.75, 0.75)
+        if upper_water > 2.02:
+            score = clamp(score - 0.12, -1, 1)
+        elif 0 < upper_water < 1.82:
+            score = clamp(score + 0.08, -1, 1)
+        return Signal(
+            "盘口合理性",
+            score,
+            WEIGHTS["fair_line"],
+            True,
+            (
+                f"价格估算合理盘口约 {fair_depth:.2f}，实际盘口 {actual_depth:.2f}，"
+                f"上盘均水 {upper_water:.3g}"
+            ),
+        )
+
+    def _bookmaker_consensus_signal(
+        self, match: Match, upper_team: str, rows: list[HandicapRow]
+    ) -> Signal:
+        live_rows = [row for row in rows if row.source != "fallback"]
+        if len(live_rows) < 2:
+            return unavailable_signal("公司一致性", WEIGHTS["bookmaker_consensus"], "主流公司盘口点不足")
+
+        selected_rows = sorted(live_rows, key=bookmaker_priority)[:8]
+        scores = [score_handicap_row(match, row, upper_team) for row in selected_rows]
+        if not scores:
+            return unavailable_signal("公司一致性", WEIGHTS["bookmaker_consensus"], "主流公司盘口点不足")
+        positives = sum(1 for score in scores if score > 0.08)
+        negatives = sum(1 for score in scores if score < -0.08)
+        neutral = len(scores) - positives - negatives
+        avg = sum(scores) / len(scores)
+        dispersion = score_dispersion(scores)
+        consistency = clamp(1.0 - dispersion / 0.55, 0.25, 1.0)
+        mixed_penalty = 0.20 if positives and negatives else 0.0
+        score = clamp(avg * consistency - math.copysign(mixed_penalty, avg) if avg else 0.0, -1, 1)
+        return Signal(
+            "公司一致性",
+            score,
+            WEIGHTS["bookmaker_consensus"],
+            True,
+            f"{len(scores)}家公司：上盘{positives}，下盘{negatives}，中性{neutral}，分歧度 {dispersion:.2f}",
+        )
+
+    def _depth_profile_signal(
+        self,
+        match: Match,
+        upper_team: str,
+        lower_team: str,
+        rows: list[HandicapRow],
+        bifa_signal: Signal,
+        trade_signal: Signal,
+        handicap_signal: Signal,
+        euro_kelly_signal: Signal,
+        draw_risk_signal: Signal,
+    ) -> Signal:
+        depth = line_depth(match.asian_line)
+        category = line_depth_category(depth)
+        price_edge = score_bifa_price_edge(match, upper_team, lower_team)
+        handicap_edge = handicap_signal.score if handicap_signal.available else 0.0
+        trade_edge = trade_signal.score if trade_signal.available else 0.0
+        euro_edge = euro_kelly_signal.score if euro_kelly_signal.available else 0.0
+        draw_edge = draw_risk_signal.score if draw_risk_signal.available else 0.0
+        upper_water = average_upper_water(rows, match, upper_team)
+
+        if depth <= 0.5:
+            score = clamp(0.30 * price_edge + 0.25 * euro_edge + 0.25 * handicap_edge + 0.20 * draw_edge, -1, 1)
+            reason = "浅盘更看胜负确认和平局风险"
+        elif depth <= 1.25:
+            score = clamp(0.25 * price_edge + 0.35 * handicap_edge + 0.20 * euro_edge + 0.20 * trade_edge, -1, 1)
+            reason = "中盘要求价格、亚盘和成交同步"
+        else:
+            high_water_penalty = 0.0
+            if upper_water > 2.02:
+                high_water_penalty = 0.22 if depth >= 1.5 else 0.12
+            weak_cover_penalty = 0.0
+            if handicap_edge < 0.08:
+                weak_cover_penalty += 0.18
+            if trade_signal.available and trade_edge < 0.05:
+                weak_cover_penalty += 0.10
+            score = clamp(
+                0.20 * price_edge
+                + 0.38 * handicap_edge
+                + 0.20 * trade_edge
+                + 0.17 * euro_edge
+                + 0.05 * bifa_signal.score
+                - high_water_penalty
+                - weak_cover_penalty,
+                -1,
+                1,
+            )
+            reason = "深盘/超深盘更看打穿能力、上盘水位和连续确认"
+        return Signal(
+            "盘口深度/打穿能力",
+            score,
+            WEIGHTS["depth_profile"],
+            True,
+            f"{category}，盘口 {depth:.2f}，上盘均水 {upper_water:.3g}，{reason}",
+        )
+
+    def _snapshot_trend_signal(self, match: Match) -> Signal:
+        if self.snapshot_store is None:
+            return unavailable_signal("快照趋势", WEIGHTS["snapshot_trend"], "未启用本地快照目录")
+        records = self.snapshot_store.load_event(match.event_id)
+        if len(records) < 2:
+            return unavailable_signal("快照趋势", WEIGHTS["snapshot_trend"], "本地快照不足 2 条")
+
+        first_metrics = snapshot_metrics(records[0])
+        previous_metrics = snapshot_metrics(records[-2])
+        last_metrics = snapshot_metrics(records[-1])
+        total_score_delta = last_metrics["score"] - first_metrics["score"]
+        recent_score_delta = last_metrics["score"] - previous_metrics["score"]
+        heat_delta = last_metrics["heat_edge"] - previous_metrics["heat_edge"]
+        water_delta = last_metrics["upper_water"] - previous_metrics["upper_water"]
+        line_delta = last_metrics["line_depth"] - previous_metrics["line_depth"]
+        trend_score = clamp((0.60 * recent_score_delta + 0.40 * total_score_delta) / 0.25, -1, 1)
+        if heat_delta > 0.08 and water_delta > 0.04:
+            trend_score = clamp(trend_score - 0.25, -1, 1)
+        elif heat_delta > 0.08 and water_delta < -0.04:
+            trend_score = clamp(trend_score + 0.20, -1, 1)
+        if line_delta > 0.24:
+            trend_score = clamp(trend_score + 0.12, -1, 1)
+        elif line_delta < -0.24:
+            trend_score = clamp(trend_score - 0.12, -1, 1)
+        return Signal(
+            "快照趋势",
+            trend_score,
+            WEIGHTS["snapshot_trend"],
+            True,
+            (
+                f"本地 {len(records)} 条快照，近期score {recent_score_delta:+.3f}，"
+                f"总变化 {total_score_delta:+.3f}，热度 {heat_delta:+.3f}，上盘水位 {water_delta:+.3f}"
+            ),
+        )
+
     def _market_balance_signal(
         self,
         match: Match,
@@ -617,6 +902,9 @@ class Predictor:
         trade_signal: Signal,
         handicap_signal: Signal,
         euro_kelly_signal: Signal,
+        draw_risk_signal: Signal,
+        fair_line_signal: Signal,
+        depth_profile_signal: Signal,
     ) -> Signal:
         if not bifa_signal.available:
             return unavailable_signal("市场平衡/背离", WEIGHTS["market_balance"], "缺少必发基础热度，无法判断盘口防守")
@@ -629,6 +917,10 @@ class Predictor:
         handicap_is_fallback = "静态亚盘均值兜底" in handicap_signal.reason
         trade_edge = trade_signal.score if trade_signal.available else 0.0
         euro_edge = euro_kelly_signal.score if euro_kelly_signal.available else 0.0
+        draw_edge = draw_risk_signal.score if draw_risk_signal.available else 0.0
+        fair_edge = fair_line_signal.score if fair_line_signal.available else 0.0
+        depth_edge = depth_profile_signal.score if depth_profile_signal.available else 0.0
+        depth = line_depth(match.asian_line)
 
         components: list[float] = []
         reasons: list[str] = []
@@ -640,6 +932,8 @@ class Predictor:
             handicap_confirm = hot_direction * handicap_edge
             trade_confirm = hot_direction * trade_edge
             euro_confirm = hot_direction * euro_edge
+            fair_confirm = hot_direction * fair_edge
+            depth_confirm = hot_direction * depth_edge
 
             if price_confirm >= 0.10:
                 components.append(0.25 * hot_direction)
@@ -677,6 +971,26 @@ class Predictor:
                 elif euro_confirm <= -0.10:
                     components.append(-0.15 * hot_direction)
                     reasons.append("欧赔/Kelly背离")
+
+            if fair_line_signal.available:
+                if fair_confirm >= 0.10:
+                    components.append(0.12 * hot_direction)
+                    reasons.append("盘口深度与价格匹配")
+                elif fair_confirm <= -0.10:
+                    components.append(-0.16 * hot_direction)
+                    reasons.append("盘口相对价格偏深/偏危险")
+
+            if depth_profile_signal.available:
+                if depth_confirm >= 0.10:
+                    components.append((0.10 if depth <= 0.5 else 0.16) * hot_direction)
+                    reasons.append("盘口深度模型确认")
+                elif depth_confirm <= -0.10:
+                    components.append((-0.12 if depth <= 0.5 else -0.22) * hot_direction)
+                    reasons.append("盘口深度模型背离")
+
+            if draw_risk_signal.available and depth <= 0.5 and hot_direction > 0 and draw_edge <= -0.18:
+                components.append(draw_edge * 0.45)
+                reasons.append("浅盘热门存在平局风险")
         else:
             if handicap_signal.available and abs(handicap_edge) >= 0.20:
                 components.append(0.45 * math.copysign(1.0, handicap_edge))
@@ -687,6 +1001,9 @@ class Predictor:
             if euro_kelly_signal.available and abs(euro_edge) >= 0.20:
                 components.append(0.15 * math.copysign(1.0, euro_edge))
                 reasons.append("热度不高但欧赔/Kelly有方向")
+            if fair_line_signal.available and abs(fair_edge) >= 0.20:
+                components.append(0.15 * math.copysign(1.0, fair_edge))
+                reasons.append("热度不高但盘口合理性有方向")
 
         if not components:
             return Signal(
@@ -699,7 +1016,7 @@ class Predictor:
 
         score = clamp(sum(components), -1, 1)
         same_direction_count = count_same_direction(
-            [bifa_signal, trade_signal, handicap_signal, euro_kelly_signal]
+            [bifa_signal, trade_signal, handicap_signal, euro_kelly_signal, fair_line_signal, depth_profile_signal]
         )
         if same_direction_count >= 3:
             score = clamp(score * 1.10, -1, 1)
@@ -707,7 +1024,9 @@ class Predictor:
         elif same_direction_count <= -3:
             score = clamp(score * 1.10, -1, 1)
             reasons.append("多信号同向偏下盘")
-        elif signal_conflict_count([bifa_signal, trade_signal, handicap_signal, euro_kelly_signal]) >= 3:
+        elif signal_conflict_count(
+            [bifa_signal, trade_signal, handicap_signal, euro_kelly_signal, fair_line_signal, depth_profile_signal]
+        ) >= 3:
             score = clamp(score * 0.65, -1, 1)
             reasons.append("信号互相矛盾，降权")
 
@@ -751,6 +1070,20 @@ def parse_match(item: dict[str, Any]) -> Match:
         is_stop_update=bool(item.get("IsStopUpdate", False)),
         raw=item,
     )
+
+
+def match_to_dict(match: Match) -> dict[str, Any]:
+    return {
+        "event_id": match.event_id,
+        "match_time": match.match_time.isoformat(),
+        "home": match.home,
+        "away": match.away,
+        "league_id": match.league_id,
+        "league_name": match.league_name,
+        "asian_line": match.asian_line,
+        "is_stop_update": match.is_stop_update,
+        "raw": match.raw,
+    }
 
 
 def parse_handicap(item: dict[str, Any], bookmaker_id: int | None = None) -> HandicapRow:
@@ -847,6 +1180,20 @@ def line_value(line: str) -> float:
         return 0.0
 
 
+def line_depth(line: str) -> float:
+    return abs(line_value(line))
+
+
+def line_depth_category(depth: float) -> str:
+    if depth <= 0.5:
+        return "平浅盘"
+    if depth <= 1.25:
+        return "中盘"
+    if depth < 2.0:
+        return "深盘"
+    return "超深盘"
+
+
 def upper_lower_teams(match: Match) -> tuple[str, str]:
     value = line_value(match.asian_line)
     if value < 0:
@@ -871,6 +1218,49 @@ def selection_for_team(match: Match, team: str) -> str:
     if key == "Away":
         return "away"
     raise DataError(f"cannot map team {team} to Betfair selection")
+
+
+def first_positive(*values: Any) -> float:
+    for value in values:
+        numeric = float_or_zero(value)
+        if numeric > 0:
+            return numeric
+    return 0.0
+
+
+def normalized_probabilities(*prices: float) -> tuple[float, ...]:
+    probabilities = [1.0 / price if price > 0 else 0.0 for price in prices]
+    total = sum(probabilities)
+    if total <= 0:
+        return tuple(0.0 for _ in prices)
+    return tuple(probability / total for probability in probabilities)
+
+
+def fair_handicap_depth(price_edge: float) -> float:
+    if price_edge <= 0:
+        return 0.0
+    return clamp(price_edge * 2.35, 0.0, 2.5)
+
+
+def average_upper_water(rows: list[HandicapRow], match: Match, upper_team: str) -> float:
+    values: list[float] = []
+    upper_is_home = upper_team == match.home
+    for row in rows:
+        value = row.sec_a if upper_is_home else row.sec_b
+        if value > 0:
+            values.append(value)
+    if values:
+        return sum(values) / len(values)
+    upper_key = side_key(match, upper_team)
+    return first_positive(match.raw.get(f"AsianAvr{upper_key}"))
+
+
+def score_dispersion(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    avg = sum(values) / len(values)
+    variance = sum((value - avg) ** 2 for value in values) / len(values)
+    return math.sqrt(variance)
 
 
 def score_price_volume(points: list[PriceVolumePoint]) -> tuple[float | None, str]:
@@ -907,6 +1297,7 @@ def score_hot_divergence_penalty(
     heat_edge: float,
     confirmation_edge: float,
     payout_edge: float,
+    line_depth: float = 0.75,
 ) -> float:
     """Penalize public heat that is not confirmed by price or payout pressure."""
     heat_size = abs(heat_edge)
@@ -920,7 +1311,17 @@ def score_hot_divergence_penalty(
         return 0.0
     divergence = max(0.0, 0.12 - same_direction_confirmation)
     payout_warning = max(0.0, -same_direction_payout)
-    return clamp(0.20 + 0.35 * heat_size + 0.25 * divergence + 0.20 * payout_warning, 0, 0.55)
+    base = 0.20 + 0.35 * heat_size + 0.25 * divergence + 0.20 * payout_warning
+    if line_depth <= 0.5:
+        multiplier = 0.72
+        cap = 0.38
+    elif line_depth <= 1.25:
+        multiplier = 1.0
+        cap = 0.55
+    else:
+        multiplier = 1.18 if line_depth < 2.0 else 1.30
+        cap = 0.70
+    return clamp(base * multiplier, 0, cap)
 
 
 def fallback_handicap_rows_from_base(match: Match) -> list[HandicapRow]:
@@ -1125,13 +1526,14 @@ def print_upcoming(matches: list[Match], limit: int) -> None:
 
 def print_analysis(result: AnalysisResult, verbose: bool = False) -> None:
     match = result.match
-    target = (
-        result.upper_team
-        if result.recommendation == "上盘"
-        else result.lower_team
-        if result.recommendation == "下盘"
-        else f"倾向{result.lean}:{result.lean_team}"
-    )
+    if result.recommendation == "上盘":
+        target = result.upper_team
+    elif result.recommendation == "下盘":
+        target = result.lower_team
+    elif result.lean == "无明显倾向":
+        target = result.lean
+    else:
+        target = f"倾向{result.lean}:{result.lean_team}"
     print(
         f"{match.event_id} | {format_local(match.match_time)} | {match.home} vs {match.away} | "
         f"盘口 {match.asian_line} | 推荐 {result.recommendation}({target}) | "
@@ -1143,6 +1545,144 @@ def print_analysis(result: AnalysisResult, verbose: bool = False) -> None:
             print(f"  [{mark}] {signal.name}: {signal.score:+.3f} - {signal.reason}")
     for warning in result.warnings:
         print(f"  [WARN] {warning}")
+
+
+def print_snapshot_saved(path: Path, result: AnalysisResult) -> None:
+    print(
+        f"已保存快照: {path} | {result.match.event_id} | "
+        f"{result.match.home} vs {result.match.away} | score {result.score:+.3f}"
+    )
+
+
+def print_snapshot_trend(store: SnapshotStore, event_id: int) -> int:
+    records = store.load_event(event_id)
+    if not records:
+        print(f"没有找到本地快照: {store.event_path(event_id)}")
+        return 1
+    if len(records) < 2:
+        first_time = records[0].get("fetched_at", "unknown")
+        print(f"本地只有 1 条快照({first_time})，至少需要 2 条才能判断趋势。")
+        return 1
+
+    first = records[0]
+    last = records[-1]
+    first_metrics = snapshot_metrics(first)
+    last_metrics = snapshot_metrics(last)
+    match_info = last.get("match", {})
+    result_info = last.get("result", {})
+    home = match_info.get("home", "")
+    away = match_info.get("away", "")
+    score_delta = last_metrics["score"] - first_metrics["score"]
+    heat_delta = last_metrics["heat_edge"] - first_metrics["heat_edge"]
+    amount_delta = last_metrics["amount_edge"] - first_metrics["amount_edge"]
+    payout_delta = last_metrics["payout_edge"] - first_metrics["payout_edge"]
+    upper_water_delta = last_metrics["upper_water"] - first_metrics["upper_water"]
+    line_depth_delta = last_metrics["line_depth"] - first_metrics["line_depth"]
+
+    print(f"{event_id} | {home} vs {away} | 本地快照 {len(records)} 条")
+    print(f"  时间: {first.get('fetched_at')} -> {last.get('fetched_at')}")
+    print(
+        f"  score: {first_metrics['score']:+.3f} -> {last_metrics['score']:+.3f} "
+        f"({score_delta:+.3f}) | 当前推荐 {result_info.get('recommendation', '未知')}"
+    )
+    print(
+        f"  必发热度: {first_metrics['heat_edge']:+.3f} -> {last_metrics['heat_edge']:+.3f} "
+        f"({heat_delta:+.3f})；成交倾斜 {first_metrics['amount_edge']:+.3f} -> "
+        f"{last_metrics['amount_edge']:+.3f} ({amount_delta:+.3f})"
+    )
+    print(
+        f"  盈亏压力: {first_metrics['payout_edge']:+.3f} -> {last_metrics['payout_edge']:+.3f} "
+        f"({payout_delta:+.3f})；上盘水位 {first_metrics['upper_water']:.3g} -> "
+        f"{last_metrics['upper_water']:.3g} ({upper_water_delta:+.3f})"
+    )
+    print(
+        f"  盘口深度: {first_metrics['line_depth']:.2f} -> {last_metrics['line_depth']:.2f} "
+        f"({line_depth_delta:+.2f})；欧赔确认 {first_metrics['euro_edge']:+.3f} -> "
+        f"{last_metrics['euro_edge']:+.3f}"
+    )
+    print(f"  结论: {snapshot_trend_summary(score_delta, heat_delta, upper_water_delta, line_depth_delta)}")
+    return 0
+
+
+def snapshot_metrics(record: dict[str, Any]) -> dict[str, float]:
+    match_info = record.get("match", {})
+    result_info = record.get("result", {})
+    if not isinstance(match_info, dict):
+        match_info = {}
+    if not isinstance(result_info, dict):
+        result_info = {}
+    raw = match_info.get("raw", {})
+    if not isinstance(raw, dict):
+        raw = {}
+
+    upper_key = snapshot_side_key(match_info, str(result_info.get("upper_team", "")))
+    lower_key = snapshot_side_key(match_info, str(result_info.get("lower_team", "")))
+    upper_index = float_or_zero(raw.get(f"BfIndex{upper_key}"))
+    lower_index = float_or_zero(raw.get(f"BfIndex{lower_key}"))
+    upper_amount = float_or_zero(raw.get(f"BfAmount{upper_key}"))
+    lower_amount = float_or_zero(raw.get(f"BfAmount{lower_key}"))
+    upper_payout = float_or_zero(raw.get(f"BfPayout{upper_key}"))
+    lower_payout = float_or_zero(raw.get(f"BfPayout{lower_key}"))
+    upper_water = float_or_zero(raw.get(f"AsianAvr{upper_key}"))
+    lower_water = float_or_zero(raw.get(f"AsianAvr{lower_key}"))
+    upper_euro = float_or_zero(raw.get(f"EuroAvr{upper_key}"))
+    lower_euro = float_or_zero(raw.get(f"EuroAvr{lower_key}"))
+    amount_total = upper_amount + lower_amount
+    amount_edge = 0.0 if amount_total <= 0 else clamp((upper_amount - lower_amount) / amount_total, -1, 1)
+    index_edge = clamp((upper_index - lower_index) / 100.0, -1, 1)
+    return {
+        "score": float_or_zero(result_info.get("score")),
+        "heat_edge": clamp(0.55 * index_edge + 0.45 * amount_edge, -1, 1),
+        "amount_edge": amount_edge,
+        "payout_edge": clamp((lower_payout - upper_payout) / 100.0, -1, 1),
+        "upper_water": upper_water,
+        "lower_water": lower_water,
+        "line_depth": abs(line_value(str(match_info.get("asian_line", "0")))),
+        "euro_edge": score_bifa_odds_confirmation(upper_euro, lower_euro),
+    }
+
+
+def snapshot_side_key(match_info: dict[str, Any], team: str) -> str:
+    if team == match_info.get("home"):
+        return "Home"
+    if team == match_info.get("away"):
+        return "Away"
+    return "Home"
+
+
+def snapshot_trend_summary(
+    score_delta: float,
+    heat_delta: float,
+    upper_water_delta: float,
+    line_depth_delta: float,
+) -> str:
+    parts: list[str] = []
+    if score_delta > 0.05:
+        parts.append("综合分增强，趋势偏上盘")
+    elif score_delta < -0.05:
+        parts.append("综合分减弱，趋势偏下盘")
+    else:
+        parts.append("综合分变化不大")
+
+    if heat_delta > 0.08 and upper_water_delta > 0.04:
+        parts.append("热度增加但上盘水位变贵，警惕热门买入成本被抬高")
+    elif heat_delta > 0.08 and upper_water_delta < -0.04:
+        parts.append("热度增加且上盘水位被压低，属于顺势确认")
+    elif heat_delta < -0.08:
+        parts.append("上盘热度回落")
+
+    if line_depth_delta > 0.24:
+        parts.append("盘口升深，对上盘打穿能力要求提高")
+    elif line_depth_delta < -0.24:
+        parts.append("盘口降浅，上盘门槛降低但也可能代表信心下降")
+    return "；".join(parts)
+
+
+def float_or_zero(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 PUBLIC_SOURCES = [
@@ -1215,12 +1755,19 @@ def build_parser() -> argparse.ArgumentParser:
             "      批量分析未开赛世界杯比赛。\n\n"
             "  python3 worldcup_ah_cli.py predict --event-id 35035283 --json\n"
             "      输出 JSON，方便后续保存或回测。\n\n"
+            "  python3 worldcup_ah_cli.py snapshot --event-id 35035283\n"
+            "      抓取单场当前数据并追加到本地 .spdex_snapshots/，用于趋势判断。\n\n"
+            "  python3 worldcup_ah_cli.py trend --event-id 35035283\n"
+            "      根据本地快照比较 score、必发热度、盈亏压力、盘口/水位变化。\n\n"
             "  python3 worldcup_ah_cli.py sources\n"
             "      查看后续可接入的公开数据源。\n\n"
             "输出说明:\n"
             "  推荐 上盘/下盘: 分数超过购买阈值，给出购买方。\n"
             "  推荐 观望(倾向...): 有方向倾向，但置信度或信号一致性不足。\n"
+            "  推荐 观望(无明显倾向): |score| < 0.05，方向信号太弱。\n"
             "  score > 0 偏上盘，score < 0 偏下盘；默认阈值为 +/-0.18。\n"
+            "  算法会综合盘口深度、健康/危险大热、平局风险、盘口合理性、公司一致性、\n"
+            "  深盘打穿能力和本地快照趋势；深盘对热门水位和打穿确认更严格。\n"
             "  IsStopUpdate 场次只用于复盘提示，不再把模型置信度强制设为 0。"
         ),
     )
@@ -1235,6 +1782,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-curl-fallback",
         action="store_true",
         help="urllib 请求失败时不使用系统 curl 兜底",
+    )
+    parser.add_argument(
+        "--snapshot-dir",
+        default=SNAPSHOT_DIR_NAME,
+        help=f"本地快照目录，默认 {SNAPSHOT_DIR_NAME}；建议保持在 .gitignore 中",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1258,6 +1810,27 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--limit", type=int, default=20, help="--all 时最多分析多少场")
     predict_parser.add_argument("--json", action="store_true", help="输出 JSON")
     predict_parser.add_argument("--verbose", action="store_true", help="显示所有信号细节")
+
+    snapshot_parser = subparsers.add_parser(
+        "snapshot",
+        help="保存本地赛前快照",
+        description=(
+            "抓取当前 SPDEX 数据、执行一次预测，并把原始字段和预测结果追加到本地 JSONL。"
+            "默认目录 .spdex_snapshots/ 应保留在 .gitignore 中，不提交 Git。"
+        ),
+    )
+    snapshot_group = snapshot_parser.add_mutually_exclusive_group(required=True)
+    snapshot_group.add_argument("--event-id", type=int, help="SPDEX EventId")
+    snapshot_group.add_argument("--all", action="store_true", help="保存所有未开赛世界杯比赛快照")
+    snapshot_parser.add_argument("--limit", type=int, default=20, help="--all 时最多保存多少场")
+    snapshot_parser.add_argument("--verbose", action="store_true", help="保存后同时显示详细分析")
+
+    trend_parser = subparsers.add_parser(
+        "trend",
+        help="查看本地快照趋势",
+        description="读取本地快照，比较 score、必发热度、成交倾斜、盈亏压力、盘口深度和上盘水位变化。",
+    )
+    trend_parser.add_argument("--event-id", type=int, required=True, help="SPDEX EventId")
 
     subparsers.add_parser(
         "sources",
@@ -1291,7 +1864,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "predict":
-        predictor = Predictor(client)
+        predictor = Predictor(client, SnapshotStore(args.snapshot_dir))
         try:
             if args.all:
                 matches = upcoming_matches(client)[: args.limit]
@@ -1311,6 +1884,33 @@ def main(argv: list[str] | None = None) -> int:
                 print_analysis(result, verbose=args.verbose)
         maybe_print_ssl_warning(client)
         return 0
+
+    if args.command == "snapshot":
+        store = SnapshotStore(args.snapshot_dir)
+        predictor = Predictor(client, store)
+        try:
+            if args.all:
+                matches = upcoming_matches(client)[: args.limit]
+            else:
+                matches = [client.find_match(args.event_id)]
+        except DataError as exc:
+            print(f"数据获取失败: {exc}", file=sys.stderr)
+            return 2
+
+        for index, match in enumerate(matches):
+            if index:
+                print()
+            result = predictor.analyze(match)
+            path = store.save(result)
+            print_snapshot_saved(path, result)
+            if args.verbose:
+                print_analysis(result, verbose=True)
+        maybe_print_ssl_warning(client)
+        return 0
+
+    if args.command == "trend":
+        store = SnapshotStore(args.snapshot_dir)
+        return print_snapshot_trend(store, args.event_id)
 
     parser.print_help()
     return 1

@@ -1,13 +1,16 @@
 import unittest
 from datetime import datetime, timezone
+from tempfile import TemporaryDirectory
 
 from worldcup_ah_cli import (
+    AnalysisResult,
     DataError,
     EuroTrendPoint,
     HandicapRow,
     Match,
     PriceVolumePoint,
     Predictor,
+    SnapshotStore,
     normalize_line_for_spdex,
     parse_match,
     recommendation_from_score,
@@ -146,6 +149,21 @@ class WorldCupAhCliTests(unittest.TestCase):
         )
         self.assertEqual(penalty, 0.0)
 
+    def test_hot_penalty_is_stronger_for_deep_lines(self):
+        shallow = score_hot_divergence_penalty(
+            heat_edge=0.65,
+            confirmation_edge=0.02,
+            payout_edge=-0.30,
+            line_depth=0.5,
+        )
+        deep = score_hot_divergence_penalty(
+            heat_edge=0.65,
+            confirmation_edge=0.02,
+            payout_edge=-0.30,
+            line_depth=1.75,
+        )
+        self.assertGreater(deep, shallow)
+
     def test_hot_bifa_against_handicap_signal_is_penalized(self):
         penalty = score_heat_handicap_divergence_penalty(
             heat_edge=0.60,
@@ -231,9 +249,59 @@ class WorldCupAhCliTests(unittest.TestCase):
     def test_result_always_exposes_lean_even_when_watch(self):
         predictor = Predictor(FakeClient(handicap_rows=[]))
         result = predictor.analyze(sample_match())
-        self.assertIn(result.lean, {"上盘", "下盘"})
+        self.assertIn(result.lean, {"上盘", "下盘", "无明显倾向"})
         self.assertIn("lean", result.to_dict())
         self.assertIn("lean_team", result.to_dict())
+
+    def test_tiny_score_has_no_clear_lean(self):
+        match = sample_match()
+        result = AnalysisResult(
+            match=match,
+            recommendation="观望",
+            score=0.01,
+            confidence=10,
+            completeness=80,
+            upper_team=match.home,
+            lower_team=match.away,
+            signals=[],
+            warnings=[],
+        )
+        self.assertEqual(result.lean, "无明显倾向")
+        self.assertEqual(result.lean_team, "")
+
+    def test_new_optimization_signals_are_added(self):
+        raw = {
+            "BfIndexHome": 58.0,
+            "BfIndexAway": 24.0,
+            "BfAmountHome": 900_000.0,
+            "BfAmountAway": 260_000.0,
+            "BfPayoutHome": 20.0,
+            "BfPayoutAway": -12.0,
+            "BfOddsHome": 1.85,
+            "BfOddsAway": 4.80,
+            "BfOddsDraw": 3.25,
+            "EuroAvrHome": 1.82,
+            "EuroAvrAway": 4.60,
+            "EuroAvrDraw": 3.20,
+            "KellyHome": 1.9,
+            "KellyAway": 5.5,
+            "KellyDraw": 1.7,
+            "AsianAvrHome": 1.95,
+            "AsianAvrAway": 1.92,
+        }
+        rows = [
+            HandicapRow(51007, "PinnacleSports", 1.92, 1.96, 1.90, 1.98, 0.98, None),
+            HandicapRow(51003, "Ysb88", 1.95, 1.93, 1.91, 1.97, 0.96, None),
+        ]
+        predictor = Predictor(FakeClient(handicap_rows=rows))
+        result = predictor.analyze(sample_match(raw=raw, asian_line="-0.5"))
+        signal_names = {signal.name for signal in result.signals}
+        self.assertIn("平局风险", signal_names)
+        self.assertIn("盘口合理性", signal_names)
+        self.assertIn("公司一致性", signal_names)
+        self.assertIn("盘口深度/打穿能力", signal_names)
+        draw_signal = next(signal for signal in result.signals if signal.name == "平局风险")
+        self.assertLess(draw_signal.score, 0.2)
 
     def test_static_handicap_fallback_is_not_overweighted(self):
         raw = {
@@ -257,6 +325,20 @@ class WorldCupAhCliTests(unittest.TestCase):
         handicap_signal = next(signal for signal in result.signals if signal.name == "亚盘水位")
         self.assertGreater(handicap_signal.score, -0.35)
         self.assertEqual(result.lean, "上盘")
+
+    def test_snapshot_store_appends_and_loads_event_records(self):
+        predictor = Predictor(FakeClient(handicap_rows=[]))
+        result = predictor.analyze(sample_match(event_id=123))
+        with TemporaryDirectory() as tmpdir:
+            store = SnapshotStore(tmpdir)
+            path = store.save(result, fetched_at=datetime(2026, 6, 13, 0, 0, tzinfo=timezone.utc))
+            store.save(result, fetched_at=datetime(2026, 6, 13, 1, 0, tzinfo=timezone.utc))
+            records = store.load_event(123)
+
+        self.assertEqual(path.name, "123.jsonl")
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["match"]["event_id"], 123)
+        self.assertIn("result", records[0])
 
 
 if __name__ == "__main__":
