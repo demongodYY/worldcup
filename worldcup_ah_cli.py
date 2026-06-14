@@ -1035,7 +1035,13 @@ class Predictor:
         fair_depth = fair_handicap_depth(price_edge)
         actual_depth = line_depth(match.asian_line)
         upper_water = average_upper_water(rows, match, upper_team)
+        has_upper_water = upper_water > 0
         gap = fair_depth - actual_depth
+        heat_edge = score_bifa_heat_edge(match, upper_team, lower_team)
+        index_edge, amount_edge = bifa_index_amount_edges(match, upper_team, lower_team)
+        payout_edge = score_bifa_payout_edge(match, upper_team, lower_team)
+        heat_split = index_edge * amount_edge < 0 and abs(index_edge) >= 0.04 and abs(amount_edge) >= 0.18
+        hot_upper_pressure = max(heat_edge, amount_edge, 0.0)
         interpretation = "盘口与价格大致匹配"
         if gap > 0.12:
             shallow_pressure = clamp(gap / 0.65, 0, 1)
@@ -1046,6 +1052,15 @@ class Predictor:
             elif 0 < upper_water <= 1.82:
                 score = clamp(0.12 + 0.30 * shallow_pressure, 0, 0.45)
                 interpretation = "实际盘口偏浅但上盘低水防守，偏上盘确认"
+            elif gap >= 0.30:
+                neutral_water_pressure = clamp((upper_water - 1.86) / 0.14, 0, 1) if has_upper_water else 0.0
+                bifa_pressure = clamp(hot_upper_pressure / 0.45, 0, 1)
+                score = -clamp(
+                    0.12 + 0.26 * shallow_pressure + 0.18 * neutral_water_pressure + 0.12 * bifa_pressure,
+                    0,
+                    0.65,
+                )
+                interpretation = "实际盘口明显偏浅且上盘未低水防守，偏下盘风险"
             else:
                 score = clamp(0.12 * shallow_pressure, -0.15, 0.18)
                 interpretation = "实际盘口偏浅但未见明显高水诱导，弱上盘价值"
@@ -1069,6 +1084,32 @@ class Predictor:
             elif 0 < upper_water <= 1.82:
                 score = 0.08
                 interpretation = "盘口匹配且上盘低水，轻微偏上盘"
+
+        if not has_upper_water:
+            score *= 0.45
+            interpretation += "；缺少上盘水位，盘口合理性降权"
+
+        bifa_reasons: list[str] = []
+        if heat_split:
+            if score > 0:
+                score = max(0.0, score - 0.08)
+            elif score < 0:
+                score = min(0.0, score + 0.08)
+            bifa_reasons.append("必发指数/成交额分裂，盘口估算降权")
+        if gap > 0.12 and hot_upper_pressure >= 0.25 and upper_water > 1.86:
+            penalty = clamp(0.08 + 0.18 * clamp(hot_upper_pressure / 0.55, 0, 1), 0, 0.24)
+            score = clamp(score - penalty, -1, 1)
+            bifa_reasons.append(f"必发资金偏上盘但盘口未升深/低水防守，扣分 {penalty:.2f}")
+        if payout_edge < -0.10 and gap > 0.12:
+            penalty = clamp(0.05 + abs(payout_edge) * 0.20, 0, 0.18)
+            score = clamp(score - penalty, -1, 1)
+            bifa_reasons.append(f"必发盈亏不支持上盘，扣分 {penalty:.2f}")
+        elif payout_edge > 0.15 and score > 0:
+            bonus = clamp(payout_edge * 0.10, 0, 0.06)
+            score = clamp(score + bonus, -1, 1)
+            bifa_reasons.append(f"必发盈亏确认上盘，补强 {bonus:.2f}")
+        if bifa_reasons:
+            interpretation += "；" + "；".join(bifa_reasons)
         return Signal(
             "盘口合理性",
             score,
@@ -1702,26 +1743,29 @@ class Predictor:
         else:
             if handicap_signal.available and abs(handicap_edge) >= 0.20:
                 components.append(0.45 * math.copysign(1.0, handicap_edge))
-                reasons.append("热度不高但亚盘主动防守")
+                reasons.append(f"热度不高但亚盘主动防守偏{direction_label(handicap_edge)}")
             if trade_signal.available and abs(trade_edge) >= 0.25:
                 weight = 0.10 if trade_is_snapshot_fallback else 0.25
                 components.append(weight * math.copysign(1.0, trade_edge))
-                reasons.append("热度不高但成交走势有方向" + ("(历史快照降权)" if trade_is_snapshot_fallback else ""))
+                reasons.append(
+                    f"热度不高但成交走势偏{direction_label(trade_edge)}"
+                    + ("(历史快照降权)" if trade_is_snapshot_fallback else "")
+                )
             if euro_kelly_signal.available and abs(euro_edge) >= 0.20:
                 components.append(0.15 * math.copysign(1.0, euro_edge))
-                reasons.append("热度不高但欧赔/Kelly有方向")
+                reasons.append(f"热度不高但欧赔/Kelly偏{direction_label(euro_edge)}")
             if fair_line_signal.available and abs(fair_edge) >= 0.20:
                 components.append(0.15 * math.copysign(1.0, fair_edge))
-                reasons.append("热度不高但盘口合理性有方向")
+                reasons.append(f"热度不高但盘口合理性偏{direction_label(fair_edge)}")
             if market_elasticity_signal.available and abs(elasticity_edge) >= 0.20:
                 components.append(0.16 * math.copysign(1.0, elasticity_edge))
-                reasons.append("热度不高但资金/盘口弹性有方向")
+                reasons.append(f"热度不高但资金/盘口弹性偏{direction_label(elasticity_edge)}")
             if external_consensus_signal.available and abs(external_edge) >= 0.18:
                 components.append(0.12 * math.copysign(1.0, external_edge))
-                reasons.append("热度不高但外部校验有方向")
+                reasons.append(f"热度不高但外部校验偏{direction_label(external_edge)}")
             if water_value_signal.available and abs(water_value_edge) >= 0.30:
                 components.append(0.12 * math.copysign(1.0, water_value_edge))
-                reasons.append("热度不高但高低水价值有方向")
+                reasons.append(f"热度不高但高低水价值偏{direction_label(water_value_edge)}")
 
         if not components:
             return Signal(
@@ -1746,13 +1790,7 @@ class Predictor:
                 water_value_signal,
             ]
         )
-        if same_direction_count >= 3:
-            score = clamp(score * 1.10, -1, 1)
-            reasons.append("多信号同向")
-        elif same_direction_count <= -3:
-            score = clamp(score * 1.10, -1, 1)
-            reasons.append("多信号同向偏下盘")
-        elif signal_conflict_count(
+        conflicts = signal_conflict_count(
             [
                 bifa_signal,
                 trade_signal,
@@ -1764,7 +1802,16 @@ class Predictor:
                 external_consensus_signal,
                 water_value_signal,
             ]
-        ) >= 3:
+        )
+        if abs(score) < 0.08 and conflicts >= 2:
+            reasons.append("正反信号抵消，市场平衡中性")
+        elif same_direction_count >= 3 and score > 0:
+            score = clamp(score * 1.10, -1, 1)
+            reasons.append("多信号同向偏上盘")
+        elif same_direction_count <= -3 and score < 0:
+            score = clamp(score * 1.10, -1, 1)
+            reasons.append("多信号同向偏下盘")
+        elif conflicts >= 3:
             score = clamp(score * 0.65, -1, 1)
             reasons.append("信号互相矛盾，降权")
 
@@ -1957,6 +2004,10 @@ def side_team(side: str, upper_team: str, lower_team: str) -> str:
     if side == "下盘":
         return lower_team
     return ""
+
+
+def direction_label(score: float) -> str:
+    return "上盘" if score > 0 else "下盘"
 
 
 def side_key(match: Match, team: str) -> str:
@@ -2554,7 +2605,7 @@ def print_analysis(result: AnalysisResult, verbose: bool = False) -> None:
         model_text = f"观望(倾向{result.lean}:{result.lean_team})"
     print(
         f"{match.event_id} | {format_local(match.match_time)} | {match.home} vs {match.away} | "
-        f"盘口 {match.asian_line} | 推荐 {result.purchase_side}({result.purchase_team}) | "
+        f"盘口 {match.asian_line} | 推荐 {purchase_display_text(result)} | "
         f"模型 {model_text} | 置信度 {result.confidence}% | 完整度 {result.completeness}% | "
         f"score {result.score:+.3f} | purchase {result.purchase_score:+.3f}"
     )
@@ -2565,6 +2616,12 @@ def print_analysis(result: AnalysisResult, verbose: bool = False) -> None:
             print(f"  [{mark}] {signal.name}: {signal.score:+.3f} - {signal.reason}")
     for warning in result.warnings:
         print(f"  [WARN] {warning}")
+
+
+def purchase_display_text(result: AnalysisResult) -> str:
+    if abs(result.purchase_score) < 0.06:
+        return f"{result.purchase_side}(低优势:{result.purchase_team})"
+    return f"{result.purchase_side}({result.purchase_team})"
 
 
 def print_snapshot_saved(path: Path, result: AnalysisResult) -> None:

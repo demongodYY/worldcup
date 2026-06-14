@@ -16,6 +16,7 @@ from worldcup_ah_cli import (
     build_parser,
     normalize_line_for_spdex,
     parse_match,
+    purchase_display_text,
     recommendation_from_score,
     score_bifa_odds_confirmation,
     score_handicap_row,
@@ -381,6 +382,23 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertEqual(result.lean, "无明显倾向")
         self.assertEqual(result.lean_team, "")
 
+    def test_purchase_display_marks_tiny_binary_edge(self):
+        match = sample_match()
+        result = AnalysisResult(
+            match=match,
+            recommendation="下盘",
+            score=0.04,
+            confidence=28,
+            completeness=90,
+            upper_team=match.home,
+            lower_team=match.away,
+            signals=[],
+            warnings=[],
+            purchase_score=-0.03,
+        )
+
+        self.assertEqual(purchase_display_text(result), "下盘(低优势:客队)")
+
     def test_new_optimization_signals_are_added(self):
         raw = {
             "BfIndexHome": 58.0,
@@ -436,6 +454,91 @@ class WorldCupAhCliTests(unittest.TestCase):
 
         self.assertLess(fair_signal.score, 0)
         self.assertIn("实际盘口偏浅且上盘高水", fair_signal.reason)
+
+    def test_markedly_shallow_actual_line_without_low_water_penalizes_upper(self):
+        raw = {
+            **sample_match().raw,
+            "EuroAvrHome": 1.71,
+            "EuroAvrAway": 4.94,
+            "BfOddsHome": 1.78,
+            "BfOddsAway": 5.60,
+        }
+        rows = [
+            HandicapRow(51007, "PinnacleSports", 1.90, 1.93, 1.90, 1.93, 0.98, None),
+        ]
+        predictor = Predictor(FakeClient(handicap_rows=rows))
+        result = predictor.analyze(sample_match(raw=raw, asian_line="-0.75"))
+        fair_signal = next(signal for signal in result.signals if signal.name == "盘口合理性")
+
+        self.assertLess(fair_signal.score, -0.20)
+        self.assertIn("实际盘口明显偏浅且上盘未低水防守", fair_signal.reason)
+
+    def test_bifa_pressure_deepens_fair_line_penalty_when_line_is_shallow(self):
+        raw = {
+            **sample_match().raw,
+            "EuroAvrHome": 1.71,
+            "EuroAvrAway": 4.94,
+            "BfOddsHome": 1.78,
+            "BfOddsAway": 5.60,
+            "BfIndexHome": 54.0,
+            "BfIndexAway": 20.0,
+            "BfAmountHome": 1_200_000.0,
+            "BfAmountAway": 220_000.0,
+            "BfPayoutHome": 28.0,
+            "BfPayoutAway": 4.0,
+        }
+        rows = [
+            HandicapRow(51007, "PinnacleSports", 1.93, 1.90, 1.90, 1.93, 0.98, None),
+        ]
+        predictor = Predictor(FakeClient(handicap_rows=rows))
+        result = predictor.analyze(sample_match(raw=raw, asian_line="-0.75"))
+        fair_signal = next(signal for signal in result.signals if signal.name == "盘口合理性")
+
+        self.assertLess(fair_signal.score, -0.45)
+        self.assertIn("必发资金偏上盘但盘口未升深/低水防守", fair_signal.reason)
+        self.assertIn("必发盈亏不支持上盘", fair_signal.reason)
+
+    def test_missing_water_does_not_count_as_full_no_defense_penalty(self):
+        raw = {
+            **sample_match().raw,
+            "EuroAvrHome": 1.71,
+            "EuroAvrAway": 4.94,
+            "BfOddsHome": 1.78,
+            "BfOddsAway": 5.60,
+        }
+        predictor = Predictor(FakeClient(handicap_rows=[]))
+        result = predictor.analyze(sample_match(raw=raw, asian_line="-0.75"))
+        fair_signal = next(signal for signal in result.signals if signal.name == "盘口合理性")
+
+        self.assertGreater(fair_signal.score, -0.20)
+        self.assertIn("缺少上盘水位", fair_signal.reason)
+
+    def test_market_balance_neutral_conflict_is_not_called_same_direction(self):
+        raw = {
+            **sample_match().raw,
+            "BfIndexHome": 40.0,
+            "BfIndexAway": 38.0,
+            "BfAmountHome": 400_000.0,
+            "BfAmountAway": 390_000.0,
+            "EuroAvrHome": 1.71,
+            "EuroAvrAway": 4.94,
+            "BfOddsHome": 1.78,
+            "BfOddsAway": 5.60,
+        }
+        rows = [
+            HandicapRow(51007, "PinnacleSports", 1.90, 1.93, 1.90, 1.93, 0.98, None),
+        ]
+        class MissingTradeClient(FakeClient):
+            def price_volume(self, event_id, selection):
+                raise DataError("stopped")
+
+        predictor = Predictor(MissingTradeClient(handicap_rows=rows))
+        result = predictor.analyze(sample_match(raw=raw, asian_line="-0.75"))
+        market_signal = next(signal for signal in result.signals if signal.name == "市场平衡/背离")
+
+        self.assertAlmostEqual(market_signal.score, 0.0, places=6)
+        self.assertIn("正反信号抵消", market_signal.reason)
+        self.assertNotIn("多信号同向", market_signal.reason)
 
     def test_bookmaker_consensus_does_not_flip_negative_majority_positive(self):
         rows = [
