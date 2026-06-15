@@ -12,10 +12,12 @@ from worldcup_ah_cli import (
     Predictor,
     ScheduledTask,
     SnapshotStore,
+    Signal,
     build_scheduled_tasks,
     build_parser,
     normalize_line_for_spdex,
     parse_match,
+    purchase_decision_from_signals,
     purchase_display_text,
     recommendation_from_score,
     score_bifa_odds_confirmation,
@@ -139,8 +141,9 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertEqual(upper_lower_teams(sample_match(asian_line="+1.25")), ("客队", "主队"))
 
     def test_recommendation_thresholds(self):
-        self.assertEqual(recommendation_from_score(0.19), "上盘")
-        self.assertEqual(recommendation_from_score(-0.19), "下盘")
+        self.assertEqual(recommendation_from_score(0.13), "上盘")
+        self.assertEqual(recommendation_from_score(-0.13), "下盘")
+        self.assertEqual(recommendation_from_score(0.11), "观望")
         self.assertEqual(recommendation_from_score(0.02), "观望")
 
     def test_price_volume_scoring_prefers_buy_pressure_and_price_drop(self):
@@ -225,7 +228,7 @@ class WorldCupAhCliTests(unittest.TestCase):
     def test_network_failures_degrade_to_watch(self):
         predictor = Predictor(FakeClient(fail=True))
         result = predictor.analyze(sample_match())
-        self.assertIn(result.recommendation, {"上盘", "下盘"})
+        self.assertEqual(result.recommendation, "观望")
         self.assertEqual(result.model_recommendation, "观望")
         self.assertLessEqual(result.confidence, 35)
         self.assertTrue(result.warnings)
@@ -364,7 +367,7 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertIn("lean_team", result.to_dict())
         self.assertIn("purchase_side", result.to_dict())
         self.assertIn("purchase_score", result.to_dict())
-        self.assertIn(result.purchase_side, {"上盘", "下盘"})
+        self.assertIn(result.purchase_side, {"上盘", "下盘", "观望"})
 
     def test_tiny_score_has_no_clear_lean(self):
         match = sample_match()
@@ -398,6 +401,100 @@ class WorldCupAhCliTests(unittest.TestCase):
         )
 
         self.assertEqual(purchase_display_text(result), "下盘(低优势:客队)")
+
+    def test_purchase_display_keeps_watch_separate_from_lean(self):
+        match = sample_match()
+        result = AnalysisResult(
+            match=match,
+            recommendation="观望",
+            score=0.08,
+            confidence=28,
+            completeness=90,
+            upper_team=match.home,
+            lower_team=match.away,
+            signals=[],
+            warnings=[],
+            purchase_score=-0.04,
+        )
+
+        self.assertEqual(purchase_display_text(result), "观望(倾向上盘:主队)")
+        self.assertEqual(result.purchase_side, "观望")
+        self.assertEqual(result.purchase_team, "")
+
+    def test_purchase_gate_does_not_force_reverse_against_strong_consensus(self):
+        match = sample_match(asian_line="-1")
+        decision = purchase_decision_from_signals(
+            match=match,
+            weighted_score=0.12,
+            completeness=90,
+            available_weight=0.80,
+            model_recommendation="观望",
+            signals=[
+                Signal("赢盘门槛风险", -0.60, 0.05, True, "风险高"),
+                Signal("亚盘水位", 0.52, 0.13, True, "上盘降水"),
+                Signal("公司一致性", 0.42, 0.05, True, "4家公司同向"),
+                Signal("高低水价值", -0.70, 0.04, True, "低水偏贵"),
+                Signal("市场平衡/背离", 0.30, 0.07, True, "同步"),
+            ],
+        )
+
+        self.assertNotEqual(decision.side, "下盘")
+        self.assertIn("强亚盘/公司共识保护", decision.reason)
+
+    def test_stop_update_with_snapshots_skips_low_weight_gate(self):
+        """When SPDEX stops live updates but snapshot trend is available, do not short-circuit to 观望 solely for low weight."""
+        match = sample_match(is_stop_update=True)
+        decision = purchase_decision_from_signals(
+            match=match,
+            weighted_score=0.13,
+            completeness=68,
+            available_weight=0.40,
+            model_recommendation="上盘",
+            signals=[
+                Signal("快照趋势", 0.35, 0.06, True, "本地 3 条快照"),
+                Signal("亚盘水位", 0.48, 0.13, True, "降水"),
+                Signal("公司一致性", 0.20, 0.05, True, "同向"),
+                Signal("市场平衡/背离", 0.06, 0.07, True, "平衡"),
+                Signal("必发成交走势", 0.08, 0.08, True, "成交"),
+            ],
+        )
+        self.assertIn("临场停更且可用权重偏低", decision.reason)
+        self.assertNotIn("可用信号不足，观望不买", decision.reason)
+        self.assertIn(decision.side, ("上盘", "下盘"))
+        self.assertGreaterEqual(decision.confidence, 38)
+
+    def test_low_confidence_reverse_becomes_watch(self):
+        match = sample_match(asian_line="-0.75")
+        decision = purchase_decision_from_signals(
+            match=match,
+            weighted_score=0.07,
+            completeness=88,
+            available_weight=0.80,
+            model_recommendation="观望",
+            signals=[
+                Signal("赢盘门槛风险", -0.70, 0.05, True, "风险高"),
+                Signal("亚盘水位", -0.40, 0.13, True, "上盘升水"),
+                Signal("公司一致性", -0.25, 0.05, True, "公司偏下"),
+                Signal("高低水价值", -0.65, 0.04, True, "上盘偏贵"),
+            ],
+        )
+
+        self.assertEqual(decision.side, "观望")
+        self.assertFalse(decision.is_reversed)
+        self.assertIn("观望不买", decision.reason)
+
+    def test_near_zero_purchase_score_does_not_default_to_lower(self):
+        decision = purchase_decision_from_signals(
+            match=sample_match(asian_line="-0.25"),
+            weighted_score=0.01,
+            completeness=90,
+            available_weight=0.80,
+            model_recommendation="观望",
+            signals=[],
+        )
+
+        self.assertEqual(decision.side, "观望")
+        self.assertIn("方向和购买优势都不足", decision.reason)
 
     def test_new_optimization_signals_are_added(self):
         raw = {
@@ -436,13 +533,32 @@ class WorldCupAhCliTests(unittest.TestCase):
         draw_signal = next(signal for signal in result.signals if signal.name == "平局风险")
         self.assertLess(draw_signal.score, 0.2)
 
+    def test_one_goal_line_draw_risk_penalizes_upper(self):
+        raw = {
+            **sample_match().raw,
+            "EuroAvrHome": 1.65,
+            "EuroAvrDraw": 4.00,
+            "EuroAvrAway": 8.50,
+            "BfOddsHome": 1.68,
+            "BfOddsDraw": 3.95,
+            "BfOddsAway": 8.20,
+        }
+        predictor = Predictor(FakeClient(handicap_rows=[]))
+        result = predictor.analyze(sample_match(raw=raw, asian_line="-1"))
+        draw_signal = next(signal for signal in result.signals if signal.name == "平局风险")
+
+        self.assertLess(draw_signal.score, 0)
+        self.assertIn("一球盘附近平局输盘风险", draw_signal.reason)
+
     def test_shallow_actual_line_with_high_upper_water_penalizes_upper(self):
         raw = {
             **sample_match().raw,
-            "EuroAvrHome": 2.05,
-            "EuroAvrAway": 4.30,
-            "BfOddsHome": 2.08,
-            "BfOddsAway": 4.10,
+            "EuroAvrHome": 1.75,
+            "EuroAvrDraw": 3.60,
+            "EuroAvrAway": 5.40,
+            "BfOddsHome": 1.78,
+            "BfOddsDraw": 3.55,
+            "BfOddsAway": 5.20,
         }
         rows = [
             HandicapRow(51007, "PinnacleSports", 2.10, 1.82, 1.90, 1.98, 0.98, None),
@@ -458,10 +574,12 @@ class WorldCupAhCliTests(unittest.TestCase):
     def test_markedly_shallow_actual_line_without_low_water_penalizes_upper(self):
         raw = {
             **sample_match().raw,
-            "EuroAvrHome": 1.71,
-            "EuroAvrAway": 4.94,
-            "BfOddsHome": 1.78,
-            "BfOddsAway": 5.60,
+            "EuroAvrHome": 1.45,
+            "EuroAvrDraw": 4.30,
+            "EuroAvrAway": 9.00,
+            "BfOddsHome": 1.48,
+            "BfOddsDraw": 4.20,
+            "BfOddsAway": 8.60,
         }
         rows = [
             HandicapRow(51007, "PinnacleSports", 1.90, 1.93, 1.90, 1.93, 0.98, None),
@@ -476,10 +594,12 @@ class WorldCupAhCliTests(unittest.TestCase):
     def test_bifa_pressure_deepens_fair_line_penalty_when_line_is_shallow(self):
         raw = {
             **sample_match().raw,
-            "EuroAvrHome": 1.71,
-            "EuroAvrAway": 4.94,
-            "BfOddsHome": 1.78,
-            "BfOddsAway": 5.60,
+            "EuroAvrHome": 1.45,
+            "EuroAvrDraw": 4.30,
+            "EuroAvrAway": 9.00,
+            "BfOddsHome": 1.48,
+            "BfOddsDraw": 4.20,
+            "BfOddsAway": 8.60,
             "BfIndexHome": 54.0,
             "BfIndexAway": 20.0,
             "BfAmountHome": 1_200_000.0,
@@ -521,8 +641,10 @@ class WorldCupAhCliTests(unittest.TestCase):
             "BfAmountHome": 400_000.0,
             "BfAmountAway": 390_000.0,
             "EuroAvrHome": 1.71,
+            "EuroAvrDraw": 3.70,
             "EuroAvrAway": 4.94,
             "BfOddsHome": 1.78,
+            "BfOddsDraw": 3.65,
             "BfOddsAway": 5.60,
         }
         rows = [
@@ -533,7 +655,7 @@ class WorldCupAhCliTests(unittest.TestCase):
                 raise DataError("stopped")
 
         predictor = Predictor(MissingTradeClient(handicap_rows=rows))
-        result = predictor.analyze(sample_match(raw=raw, asian_line="-0.75"))
+        result = predictor.analyze(sample_match(raw=raw, asian_line="-0.25"))
         market_signal = next(signal for signal in result.signals if signal.name == "市场平衡/背离")
 
         self.assertAlmostEqual(market_signal.score, 0.0, places=6)
@@ -627,6 +749,49 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertGreater(water_value_signal.score, 0)
         self.assertIn("有赔率补偿", water_value_signal.reason)
 
+    def test_low_water_penalty_is_reduced_by_strong_handicap_consensus(self):
+        match = sample_match(asian_line="-1")
+        rows = [
+            HandicapRow(51007, "PinnacleSports", 1.76, 1.96, 1.96, 1.82, 0.98, None),
+            HandicapRow(51003, "Ysb88", 1.75, 1.98, 1.94, 1.84, 0.96, None),
+        ]
+        predictor = Predictor(FakeClient(handicap_rows=rows))
+        water_value_signal = predictor._water_value_signal(
+            match,
+            "主队",
+            "客队",
+            rows,
+            Signal("必发指数", -0.30, 0.16, True, "反向"),
+            Signal("必发成交走势", 0.00, 0.08, False, "缺失"),
+            Signal("欧赔/Kelly", -0.20, 0.07, True, "反向"),
+            Signal("盘口合理性", -0.45, 0.05, True, "偏深"),
+            Signal("亚盘水位", 0.55, 0.13, True, "上盘降水"),
+            Signal("公司一致性", 0.45, 0.05, True, "公司同向"),
+            Signal("盘口深度/打穿能力", 0.05, 0.03, True, "一般"),
+            Signal("快照趋势", 0.00, 0.06, False, "缺失"),
+            Signal("资金/盘口弹性", 0.00, 0.05, True, "中性"),
+            Signal("外部赔率/实力校验", 0.00, 0.04, False, "缺失"),
+        )
+        unprotected_signal = predictor._water_value_signal(
+            match,
+            "主队",
+            "客队",
+            rows,
+            Signal("必发指数", -0.30, 0.16, True, "反向"),
+            Signal("必发成交走势", 0.00, 0.08, False, "缺失"),
+            Signal("欧赔/Kelly", -0.20, 0.07, True, "反向"),
+            Signal("盘口合理性", -0.45, 0.05, True, "偏深"),
+            Signal("亚盘水位", 0.20, 0.13, True, "弱"),
+            Signal("公司一致性", 0.10, 0.05, True, "弱"),
+            Signal("盘口深度/打穿能力", 0.05, 0.03, True, "一般"),
+            Signal("快照趋势", 0.00, 0.06, False, "缺失"),
+            Signal("资金/盘口弹性", 0.00, 0.05, True, "中性"),
+            Signal("外部赔率/实力校验", 0.00, 0.04, False, "缺失"),
+        )
+
+        self.assertIn("低水偏贵惩罚降权", water_value_signal.reason)
+        self.assertGreater(water_value_signal.score, unprotected_signal.score)
+
     def test_external_consensus_signal_uses_adapter_fields(self):
         raw = {
             **sample_match().raw,
@@ -694,13 +859,15 @@ class WorldCupAhCliTests(unittest.TestCase):
         predictor = Predictor(MissingTradeEuroClient(handicap_rows=rows), StaticSnapshotStore(records))
         result = predictor.analyze(sample_match(raw=raw, asian_line="-0.75"))
 
-        self.assertEqual(result.recommendation, "下盘")
-        self.assertEqual(result.purchase_side, "下盘")
-        self.assertTrue(result.is_reversed)
-        self.assertIn("风险优先反向", result.decision_reason)
+        self.assertEqual(result.recommendation, "上盘")
+        self.assertEqual(result.purchase_side, "上盘")
+        self.assertFalse(result.is_reversed)
+        self.assertAlmostEqual(result.purchase_score, result.score)
+        self.assertNotIn("门槛风险向下修正", result.decision_reason)
+        self.assertNotIn("风险优先反向", result.decision_reason)
         cover_signal = next(signal for signal in result.signals if signal.name == "赢盘门槛风险")
         market_signal = next(signal for signal in result.signals if signal.name == "市场平衡/背离")
-        self.assertLessEqual(cover_signal.score, -0.35)
+        self.assertGreaterEqual(cover_signal.score, -0.35)
         self.assertLessEqual(market_signal.score, 0.55)
 
     def test_static_handicap_fallback_is_not_overweighted(self):

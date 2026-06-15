@@ -47,8 +47,8 @@ WEIGHTS = {
     "data_quality": 0.05,
 }
 
-UPPER_THRESHOLD = 0.18
-LOWER_THRESHOLD = -0.18
+UPPER_THRESHOLD = 0.12
+LOWER_THRESHOLD = -0.12
 LEAN_THRESHOLD = 0.05
 
 TOP_BOOKMAKERS = ("PinnacleSports", "Bet365", "Singbet", "IBC", "Ysb88")
@@ -206,15 +206,15 @@ class AnalysisResult:
     def purchase_side(self) -> str:
         if self.recommendation in ("上盘", "下盘"):
             return self.recommendation
-        if self.lean in ("上盘", "下盘"):
-            return self.lean
-        return "下盘"
+        return "观望"
 
     @property
     def purchase_team(self) -> str:
         if self.purchase_side == "上盘":
             return self.upper_team
-        return self.lower_team
+        if self.purchase_side == "下盘":
+            return self.lower_team
+        return ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -608,6 +608,8 @@ class Predictor:
             trade_signal,
             euro_kelly_signal,
             fair_line_signal,
+            handicap_signal,
+            bookmaker_consensus_signal,
             depth_profile_signal,
             snapshot_trend_signal,
             market_elasticity_signal,
@@ -636,6 +638,7 @@ class Predictor:
             trade_signal,
             euro_kelly_signal,
             draw_risk_signal,
+            handicap_signal,
             bookmaker_consensus_signal,
             depth_profile_signal,
             snapshot_trend_signal,
@@ -669,10 +672,18 @@ class Predictor:
         completeness = int(round(100 * available_weight / (1 - WEIGHTS["data_quality"])))
         completeness = clamp_int(completeness, 0, 100)
 
+        snapshot_stop_lift = snapshot_stop_update_lift(match, snapshot_trend_signal)
         if available_weight < 0.50:
-            model_recommendation = "观望"
-            model_confidence = clamp_int(int(35 * completeness / 100), 0, 45)
-            warnings.append("可用信号不足，未达到最低分析权重")
+            if snapshot_stop_lift:
+                model_recommendation = recommendation_from_score(weighted_score)
+                model_confidence = confidence_from_score(weighted_score, completeness, model_recommendation)
+                warnings.append(
+                    "临场数据停更且可用信号权重偏低；模型方向仍按综合分阈值计算，并请结合本地快照趋势理解"
+                )
+            else:
+                model_recommendation = "观望"
+                model_confidence = clamp_int(int(35 * completeness / 100), 0, 45)
+                warnings.append("可用信号不足，未达到最低分析权重")
         else:
             model_recommendation = recommendation_from_score(weighted_score)
             model_confidence = confidence_from_score(weighted_score, completeness, model_recommendation)
@@ -987,16 +998,21 @@ class Predictor:
             win_buffer_weight = 0.18
         elif depth <= 1.25:
             draw_baseline = 0.22
-            depth_factor = 0.85
-            win_buffer_weight = 0.12
+            depth_factor = 0.95
+            win_buffer_weight = 0.03
         else:
             draw_baseline = 0.18
             depth_factor = 0.45
             win_buffer_weight = 0.08
         draw_pressure = clamp((draw_prob - draw_baseline) / 0.14, 0, 1)
         upper_win_buffer = clamp((upper_prob - draw_prob) / 0.20, -1, 1)
+        cover_draw_penalty = 0.0
+        if 0.75 <= depth <= 1.25 and draw_prob > 0.20:
+            cover_draw_penalty = clamp((draw_prob - 0.20) / 0.08, 0, 1) * 0.30
         score = clamp(
-            -(0.70 * draw_pressure + kelly_warning) * depth_factor + win_buffer_weight * max(upper_win_buffer, 0),
+            -(0.70 * draw_pressure + kelly_warning) * depth_factor
+            + win_buffer_weight * max(upper_win_buffer, 0)
+            - cover_draw_penalty,
             -1,
             1,
         )
@@ -1006,6 +1022,8 @@ class Predictor:
         )
         if kelly_warning:
             reason += f"，Kelly提示平局风险 {kelly_warning:.2f}"
+        if cover_draw_penalty:
+            reason += f"，一球盘附近平局输盘风险 {cover_draw_penalty:.2f}"
         return Signal("平局风险", score, WEIGHTS["draw_risk"], True, reason)
 
     def _fair_line_signal(
@@ -1028,11 +1046,22 @@ class Predictor:
             match.raw.get(f"EuroAvr{lower_key}"),
             match.raw.get(f"BfOdds{lower_key}"),
         )
+        draw_price = first_positive(match.raw.get("EuroAvrDraw"), match.raw.get("BfOddsDraw"))
         if upper_price <= 0 or lower_price <= 0:
             return unavailable_signal("盘口合理性", WEIGHTS["fair_line"], "缺少欧赔/必发价格")
 
         price_edge = score_bifa_odds_confirmation(upper_price, lower_price)
-        fair_depth = fair_handicap_depth(price_edge)
+        probability_reason = ""
+        if draw_price > 0:
+            upper_prob, draw_prob, lower_prob = normalized_probabilities(upper_price, draw_price, lower_price)
+            fair_depth = fair_handicap_depth_from_probabilities(upper_prob, draw_prob, lower_prob)
+            probability_reason = (
+                f"胜/平/负概率约 {upper_prob:.1%}/{draw_prob:.1%}/{lower_prob:.1%}，"
+                "已纳入平局风险"
+            )
+        else:
+            fair_depth = fair_handicap_depth(price_edge) * 0.65
+            probability_reason = "缺少平局价格，盘口估算保守降权"
         actual_depth = line_depth(match.asian_line)
         upper_water = average_upper_water(rows, match, upper_team)
         has_upper_water = upper_water > 0
@@ -1117,7 +1146,7 @@ class Predictor:
             True,
             (
                 f"价格估算合理盘口约 {fair_depth:.2f}，实际盘口 {actual_depth:.2f}，"
-                f"上盘均水 {upper_water:.3g}；{interpretation}"
+                f"上盘均水 {upper_water:.3g}；{probability_reason}；{interpretation}"
             ),
         )
 
@@ -1214,6 +1243,7 @@ class Predictor:
         trade_signal: Signal,
         euro_kelly_signal: Signal,
         draw_risk_signal: Signal,
+        handicap_signal: Signal,
         bookmaker_consensus_signal: Signal,
         depth_profile_signal: Signal,
         snapshot_trend_signal: Signal,
@@ -1234,34 +1264,34 @@ class Predictor:
         reasons: list[str] = []
         trade_is_snapshot_fallback = is_snapshot_fallback_signal(trade_signal)
         if not trade_signal.available:
-            penalty += 0.12
+            penalty += 0.07
             reasons.append("临场必发成交走势不可用")
         elif trade_is_snapshot_fallback:
-            penalty += 0.06
+            penalty += 0.04
             reasons.append("临场必发成交走势仅历史快照兜底")
             if trade_signal.score < 0.08:
-                penalty += 0.04
+                penalty += 0.03
                 reasons.append("历史成交走势未继续确认上盘")
         elif trade_signal.score < 0.08:
-            penalty += 0.08
+            penalty += 0.06
             reasons.append("必发成交走势未继续确认上盘")
 
         if not euro_kelly_signal.available:
-            penalty += 0.10
+            penalty += 0.05
             reasons.append("临场欧赔/Kelly走势不可用")
         elif euro_kelly_signal.score < 0.05:
-            penalty += 0.08
+            penalty += 0.06
             reasons.append("欧赔/Kelly未继续确认上盘")
 
         if snapshot_trend_signal.available:
             if snapshot_trend_signal.score < -0.05:
-                penalty += 0.18
+                penalty += 0.12
                 reasons.append("快照历史趋势转弱")
             elif snapshot_trend_signal.score < 0.08:
-                penalty += 0.10
+                penalty += 0.07
                 reasons.append("快照历史趋势未增强")
         else:
-            penalty += 0.08
+            penalty += 0.05
             reasons.append("缺少快照趋势确认")
 
         if snapshot_context and snapshot_context.available:
@@ -1291,8 +1321,18 @@ class Predictor:
         if market_balance_signal.available and market_balance_signal.score > 0.75 and (
             not trade_signal.available or not euro_kelly_signal.available
         ):
-            penalty += 0.10
+            penalty += 0.07
             reasons.append("市场平衡高分依赖不完整临场数据")
+
+        strong_upper_confirmation = (
+            handicap_signal.available
+            and bookmaker_consensus_signal.available
+            and handicap_signal.score >= 0.40
+            and bookmaker_consensus_signal.score >= 0.30
+        )
+        if strong_upper_confirmation and penalty > 0.20:
+            penalty = 0.20
+            reasons.append("亚盘水位和公司一致性同向确认，缺数据风险封顶")
 
         score = -clamp(penalty, 0, 0.75)
         if not reasons:
@@ -1506,6 +1546,8 @@ class Predictor:
         trade_signal: Signal,
         euro_kelly_signal: Signal,
         fair_line_signal: Signal,
+        handicap_signal: Signal,
+        bookmaker_consensus_signal: Signal,
         depth_profile_signal: Signal,
         snapshot_trend_signal: Signal,
         market_elasticity_signal: Signal,
@@ -1578,6 +1620,15 @@ class Predictor:
                 reasons.append(f"{low_side}{low_team}低水 {low_water:.3g} 仍有模型溢价")
             else:
                 adjustment = 0.10 if low_side == "上盘" else -0.10
+                if (
+                    low_side == "上盘"
+                    and handicap_signal.available
+                    and bookmaker_consensus_signal.available
+                    and handicap_signal.score >= 0.40
+                    and bookmaker_consensus_signal.score >= 0.30
+                ):
+                    adjustment *= 0.30
+                    reasons.append("亚盘水位和公司一致性确认上盘，低水偏贵惩罚降权")
                 score = clamp(score - adjustment, -1, 1)
                 reasons.append(f"{low_side}{low_team}低水 {low_water:.3g} 偏贵，需更强确认")
 
@@ -2049,6 +2100,26 @@ def fair_handicap_depth(price_edge: float) -> float:
     return clamp(price_edge * 2.35, 0.0, 2.5)
 
 
+def fair_handicap_depth_from_probabilities(upper_prob: float, draw_prob: float, lower_prob: float) -> float:
+    if upper_prob <= lower_prob:
+        return 0.0
+    dominance = max(upper_prob - lower_prob, 0.0)
+    win_over_draw = max(upper_prob - draw_prob, 0.0)
+    draw_drag = clamp((draw_prob - 0.18) / 0.18, 0, 1)
+    raw_depth = (1.35 * dominance + 1.05 * win_over_draw) * (1 - 0.35 * draw_drag)
+    if upper_prob < 0.52:
+        cap = 0.50
+    elif upper_prob < 0.58:
+        cap = 0.75
+    elif upper_prob < 0.65:
+        cap = 1.25
+    elif upper_prob < 0.75:
+        cap = 1.75
+    else:
+        cap = 2.50
+    return clamp(raw_depth, 0.0, cap)
+
+
 def average_upper_water(rows: list[HandicapRow], match: Match, upper_team: str) -> float:
     return average_team_water(rows, match, upper_team)
 
@@ -2379,6 +2450,25 @@ def recommendation_from_score(score: float) -> str:
     return "观望"
 
 
+def snapshot_stop_update_lift(match: Match, snapshot_trend: Signal | None) -> bool:
+    """True when SPDEX marks the match stopped but we still have usable local snapshot history."""
+    return bool(
+        match.is_stop_update
+        and snapshot_trend is not None
+        and snapshot_trend.available
+    )
+
+
+def confidence_kwargs_for_snapshot_stop_lift(snapshot_stop_lift: bool, available_weight: float) -> dict[str, Any]:
+    """Relax purchase confidence caps when live feeds freeze but snapshots still inform the run."""
+    if not snapshot_stop_lift or available_weight >= 0.65:
+        return {}
+    kwargs: dict[str, Any] = {"confidence_cap_weight": max(available_weight, 0.58)}
+    if available_weight < 0.50:
+        kwargs["confidence_completeness_floor"] = 72
+    return kwargs
+
+
 def purchase_decision_from_signals(
     match: Match,
     weighted_score: float,
@@ -2387,97 +2477,169 @@ def purchase_decision_from_signals(
     model_recommendation: str,
     signals: list[Signal],
 ) -> PurchaseDecision:
-    """Convert the probabilistic model output into a required binary AH side."""
+    """Convert the model output into a purchase decision with risk gates."""
     lookup = {signal.name: signal for signal in signals}
+    snapshot_stop_lift = snapshot_stop_update_lift(match, lookup.get("快照趋势"))
+    conf_kwargs = confidence_kwargs_for_snapshot_stop_lift(snapshot_stop_lift, available_weight)
     adjusted_score = weighted_score
     reasons: list[str] = [f"原始综合分 {weighted_score:+.3f}"]
     depth = line_depth(match.asian_line)
 
+    if available_weight < 0.50 and not snapshot_stop_lift:
+        reasons.append("可用信号不足，观望不买")
+        confidence = purchase_confidence_from_score(
+            purchase_score=adjusted_score,
+            completeness=completeness,
+            available_weight=available_weight,
+            model_recommendation=model_recommendation,
+            final_side="观望",
+            raw_score=weighted_score,
+        )
+        return PurchaseDecision(
+            side="观望",
+            score=adjusted_score,
+            confidence=confidence,
+            reason="；".join(reasons),
+            is_reversed=False,
+        )
+
+    if available_weight < 0.50 and snapshot_stop_lift:
+        reasons.append("临场停更且可用权重偏低；继续应用购买门控（快照趋势已参与加权）")
+
+    secondary_enabled = abs(weighted_score) < 0.15 or model_recommendation == "观望"
+    if secondary_enabled:
+        reasons.append("原始优势较弱，启用购买门控")
+
+    handicap = lookup.get("亚盘水位")
+    bookmaker_consensus = lookup.get("公司一致性")
+    market_balance = lookup.get("市场平衡/背离")
+    strong_upper_consensus = (
+        weighted_score > 0.10
+        and signal_value(handicap) >= 0.40
+        and signal_value(bookmaker_consensus) >= 0.30
+    )
+
     cover_risk = lookup.get("赢盘门槛风险")
-    if cover_risk and cover_risk.available and cover_risk.score < -0.05:
-        risk_shift = clamp(abs(cover_risk.score) * 0.60, 0.03, 0.42)
+    if (
+        secondary_enabled
+        and cover_risk
+        and cover_risk.available
+        and cover_risk.score < -0.05
+        and weighted_score > -LEAN_THRESHOLD
+    ):
+        risk_shift = clamp(abs(cover_risk.score) * 0.35, 0.02, 0.20)
+        if strong_upper_consensus:
+            risk_shift *= 0.30
+            reasons.append("强亚盘/公司共识保护，门槛风险仅降权不反向")
         adjusted_score -= risk_shift
         reasons.append(f"上盘赢盘门槛风险向下修正 {risk_shift:.2f}")
-        if cover_risk.score <= -0.35 and weighted_score < 0.25:
-            adjusted_score = min(adjusted_score, -0.08)
-            reasons.append("原始上盘优势不足，风险优先反向")
+        if cover_risk.score <= -0.35 and weighted_score > 0 and not strong_upper_consensus:
+            adjusted_score = max(adjusted_score, weighted_score * 0.35)
+            reasons.append("门槛风险较高，仅缩小上盘优势")
 
     snapshot_trend = lookup.get("快照趋势")
-    if snapshot_trend and snapshot_trend.available:
+    if secondary_enabled and snapshot_trend and snapshot_trend.available:
         trend_shift = 0.18 * snapshot_trend.score
         adjusted_score += trend_shift
         if abs(trend_shift) >= 0.02:
             reasons.append(f"快照趋势二次修正 {trend_shift:+.2f}")
 
-    market_balance = lookup.get("市场平衡/背离")
-    if market_balance and market_balance.available and abs(market_balance.score) >= 0.25:
+    if secondary_enabled and market_balance and market_balance.available and abs(market_balance.score) >= 0.25:
         market_shift = 0.08 * market_balance.score
         adjusted_score += market_shift
         reasons.append(f"盘口防守/背离修正 {market_shift:+.2f}")
 
     market_elasticity = lookup.get("资金/盘口弹性")
-    if market_elasticity and market_elasticity.available and abs(market_elasticity.score) >= 0.12:
+    if secondary_enabled and market_elasticity and market_elasticity.available and abs(market_elasticity.score) >= 0.12:
         elasticity_shift = 0.12 * market_elasticity.score
         adjusted_score += elasticity_shift
         reasons.append(f"资金/盘口弹性修正 {elasticity_shift:+.2f}")
 
-    handicap = lookup.get("亚盘水位")
-    if handicap and handicap.available and abs(handicap.score) >= 0.15:
+    if secondary_enabled and handicap and handicap.available and abs(handicap.score) >= 0.15:
         water_shift = 0.10 * handicap.score
         adjusted_score += water_shift
         reasons.append(f"亚盘水位二次修正 {water_shift:+.2f}")
 
     water_value = lookup.get("高低水价值")
-    if water_value and water_value.available and abs(water_value.score) >= 0.12:
+    if secondary_enabled and water_value and water_value.available and abs(water_value.score) >= 0.12:
         value_shift = 0.11 * water_value.score
+        if strong_upper_consensus and value_shift < 0:
+            value_shift *= 0.40
+            reasons.append("强亚盘/公司共识保护，低水价值负修正降权")
         adjusted_score += value_shift
         reasons.append(f"高低水价值修正 {value_shift:+.2f}")
 
     external_consensus = lookup.get("外部赔率/实力校验")
-    if external_consensus and external_consensus.available and abs(external_consensus.score) >= 0.12:
+    if secondary_enabled and external_consensus and external_consensus.available and abs(external_consensus.score) >= 0.12:
         external_shift = 0.10 * external_consensus.score
         adjusted_score += external_shift
         reasons.append(f"外部赔率/实力修正 {external_shift:+.2f}")
 
     draw_risk = lookup.get("平局风险")
-    if draw_risk and draw_risk.available and depth <= 1.25 and draw_risk.score < -0.15:
+    if (
+        secondary_enabled
+        and draw_risk
+        and draw_risk.available
+        and depth <= 1.25
+        and draw_risk.score < -0.05
+        and weighted_score > -LEAN_THRESHOLD
+    ):
         draw_shift = clamp(0.12 * draw_risk.score, -0.08, 0)
         adjusted_score += draw_shift
         reasons.append(f"平局/小胜风险修正 {draw_shift:+.2f}")
 
     depth_profile = lookup.get("盘口深度/打穿能力")
-    if depth_profile and depth_profile.available:
-        if depth >= 1.50 and depth_profile.score < 0.10:
+    if secondary_enabled and depth_profile and depth_profile.available:
+        if depth >= 1.50 and depth_profile.score < 0.10 and weighted_score > -LEAN_THRESHOLD:
             adjusted_score -= 0.10
             reasons.append("深盘打穿能力不足，倾向下盘")
         elif depth <= 0.50 and depth_profile.score > 0.20:
             adjusted_score += 0.04
             reasons.append("浅盘胜负确认补强上盘")
 
-    bookmaker_consensus = lookup.get("公司一致性")
-    if bookmaker_consensus and bookmaker_consensus.available and bookmaker_consensus.score < -0.12:
+    if secondary_enabled and bookmaker_consensus and bookmaker_consensus.available and bookmaker_consensus.score < -0.12:
         adjusted_score -= 0.05
         reasons.append("主流公司一致性偏下盘")
 
+    if strong_upper_consensus and adjusted_score < 0:
+        adjusted_score = max(min(weighted_score * 0.50, 0.08), 0.03)
+        reasons.append("强亚盘/公司共识保护，不允许二次门控反向")
+
     if (
-        weighted_score > 0.35
+        weighted_score > 0.10
         and signal_value(market_balance) > 0.45
-        and signal_value(handicap) > 0.15
+        and signal_value(handicap) > 0.30
         and signal_value(cover_risk) > -0.55
     ):
-        adjusted_score = max(adjusted_score, 0.08)
-        reasons.append("强上盘信号保留正向")
+        adjusted_score = max(adjusted_score, 0.06)
+        reasons.append("盘口防守和亚盘同向，保留正向")
 
     adjusted_score = clamp(adjusted_score, -1, 1)
-    side = "上盘" if adjusted_score > 0 else "下盘"
     reference_side = reference_side_from_model(weighted_score, model_recommendation)
-    is_reversed = reference_side in ("上盘", "下盘") and side != reference_side and abs(weighted_score) >= LEAN_THRESHOLD
-    if is_reversed:
-        reasons.append(f"最终二元推荐由{reference_side}反向到{side}")
-    elif model_recommendation == "观望":
-        reasons.append(f"模型阈值为观望，二元兜底选择{side}")
+    if reference_side == "无明显倾向" and abs(adjusted_score) < 0.06:
+        side = "观望"
+        reasons.append("方向和购买优势都不足，观望不买")
     else:
-        reasons.append(f"最终二元推荐保持{side}")
+        side = "上盘" if adjusted_score > 0 else "下盘"
+    attempted_reverse = (
+        reference_side in ("上盘", "下盘")
+        and side != reference_side
+        and side != "观望"
+        and abs(weighted_score) >= LEAN_THRESHOLD
+    )
+    if attempted_reverse and (
+        model_recommendation == "观望"
+        or abs(adjusted_score) < 0.10
+        or (completeness < 60 and not snapshot_stop_lift)
+    ):
+        reasons.append(f"二次门控尝试由{reference_side}反向到{side}，但优势/置信不足，观望不买")
+        side = "观望"
+    elif attempted_reverse:
+        reasons.append(f"最终购买方向由{reference_side}反向到{side}")
+    elif model_recommendation == "观望":
+        reasons.append(f"模型阈值为观望，低优势选择{side}")
+    else:
+        reasons.append(f"最终购买方向保持{side}")
 
     confidence = purchase_confidence_from_score(
         purchase_score=adjusted_score,
@@ -2486,7 +2648,9 @@ def purchase_decision_from_signals(
         model_recommendation=model_recommendation,
         final_side=side,
         raw_score=weighted_score,
+        **conf_kwargs,
     )
+    is_reversed = attempted_reverse and side in ("上盘", "下盘")
     return PurchaseDecision(
         side=side,
         score=adjusted_score,
@@ -2519,9 +2683,29 @@ def purchase_confidence_from_score(
     model_recommendation: str,
     final_side: str,
     raw_score: float,
+    *,
+    confidence_cap_weight: float | None = None,
+    confidence_completeness_floor: int | None = None,
 ) -> int:
     if available_weight <= 0:
         return 0
+    cap_weight = available_weight if confidence_cap_weight is None else confidence_cap_weight
+    eff_completeness = completeness
+    if confidence_completeness_floor is not None:
+        eff_completeness = max(eff_completeness, confidence_completeness_floor)
+    eff_completeness = clamp_int(eff_completeness, 0, 100)
+    if final_side == "观望":
+        base = 28 + min(abs(raw_score), 0.35) * 55
+        if abs(purchase_score) < 0.08:
+            base -= 4
+        if cap_weight < 0.25:
+            base = min(base, 22)
+        elif cap_weight < 0.50:
+            base = min(base, 32)
+        elif cap_weight < 0.65:
+            base = min(base, 45)
+        quality_factor = 0.50 + 0.50 * (eff_completeness / 100)
+        return clamp_int(int(base * quality_factor), 0, 55)
     strength = min(abs(purchase_score), 0.70)
     base = 32 + strength * 72
     if model_recommendation == final_side:
@@ -2532,13 +2716,13 @@ def purchase_confidence_from_score(
         base -= 8
     if abs(raw_score) < LEAN_THRESHOLD and strength < 0.12:
         base -= 6
-    if available_weight < 0.25:
+    if cap_weight < 0.25:
         base = min(base, 25)
-    elif available_weight < 0.50:
+    elif cap_weight < 0.50:
         base = min(base, 35)
-    elif available_weight < 0.65:
+    elif cap_weight < 0.65:
         base = min(base, 55)
-    quality_factor = 0.50 + 0.50 * (completeness / 100)
+    quality_factor = 0.50 + 0.50 * (eff_completeness / 100)
     return clamp_int(int(base * quality_factor), 1, 92)
 
 
@@ -2619,6 +2803,10 @@ def print_analysis(result: AnalysisResult, verbose: bool = False) -> None:
 
 
 def purchase_display_text(result: AnalysisResult) -> str:
+    if result.purchase_side == "观望":
+        if result.lean == "无明显倾向":
+            return "观望(无明显倾向)"
+        return f"观望(倾向{result.lean}:{result.lean_team})"
     if abs(result.purchase_score) < 0.06:
         return f"{result.purchase_side}(低优势:{result.purchase_team})"
     return f"{result.purchase_side}({result.purchase_team})"
@@ -3244,7 +3432,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  推荐 上盘/下盘: 分数超过购买阈值，给出购买方。\n"
             "  推荐 观望(倾向...): 有方向倾向，但置信度或信号一致性不足。\n"
             "  推荐 观望(无明显倾向): |score| < 0.05，方向信号太弱。\n"
-            "  score > 0 偏上盘，score < 0 偏下盘；默认阈值为 +/-0.18。\n"
+            "  score > 0 偏上盘，score < 0 偏下盘；默认阈值为 +/-0.12。\n"
             "  算法会综合盘口深度、健康/危险大热、平局风险、盘口合理性、公司一致性、\n"
             "  深盘打穿能力、赢盘门槛风险、高低水价值和本地快照趋势；\n"
             "  高水只有在模型概率高于市场隐含概率时才加分，低水偏贵且缺少溢价会扣分。\n"
