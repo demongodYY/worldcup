@@ -699,13 +699,15 @@ class Predictor:
             available=True,
             reason=f"可用权重 {available_weight:.2f}，完整度 {completeness}%",
         )
+        score_momentum_signal = current_score_momentum_signal(weighted_score, snapshot_context)
+        decision_signals = [*signals, score_momentum_signal]
         purchase_decision = purchase_decision_from_signals(
             match=match,
             weighted_score=weighted_score,
             completeness=completeness,
             available_weight=available_weight,
             model_recommendation=model_recommendation,
-            signals=signals,
+            signals=decision_signals,
         )
         return AnalysisResult(
             match=match,
@@ -715,7 +717,7 @@ class Predictor:
             completeness=completeness,
             upper_team=upper_team,
             lower_team=lower_team,
-            signals=[*signals, data_quality_signal],
+            signals=[*decision_signals, data_quality_signal],
             warnings=warnings,
             model_recommendation=model_recommendation,
             model_confidence=model_confidence,
@@ -2471,6 +2473,36 @@ def confidence_kwargs_for_snapshot_stop_lift(snapshot_stop_lift: bool, available
     return kwargs
 
 
+def current_score_momentum_signal(current_score: float, snapshot_context: SnapshotContext | None) -> Signal:
+    if snapshot_context is None or not snapshot_context.records:
+        return unavailable_signal("临场score变化", 0.0, "本轮之前无本地快照")
+
+    first_score = snapshot_context.first_metrics.get("score", 0.0)
+    previous_score = snapshot_context.last_metrics.get("score", first_score)
+    recent_delta = current_score - previous_score
+    total_delta = current_score - first_score
+    momentum = clamp((0.85 * recent_delta + 0.15 * total_delta) / 0.22, -1, 1)
+    notes: list[str] = []
+
+    if previous_score > LEAN_THRESHOLD and current_score < LOWER_THRESHOLD:
+        momentum = min(momentum, -0.85)
+        notes.append("本轮跌破下盘阈值")
+    elif previous_score < -LEAN_THRESHOLD and current_score > UPPER_THRESHOLD:
+        momentum = max(momentum, 0.85)
+        notes.append("本轮升破上盘阈值")
+    elif abs(current_score) < 0.08 and abs(recent_delta) < 0.04:
+        momentum = clamp(momentum, -0.20, 0.20)
+        notes.append("当前score仍弱，历史趋势降权参考")
+
+    reason = (
+        f"当前score {current_score:+.3f}，上一快照 {previous_score:+.3f}，"
+        f"近期变化 {recent_delta:+.3f}，总变化 {total_delta:+.3f}"
+    )
+    if notes:
+        reason += "；" + "；".join(notes)
+    return Signal("临场score变化", momentum, 0.0, True, reason)
+
+
 def purchase_decision_from_signals(
     match: Match,
     weighted_score: float,
@@ -2539,9 +2571,22 @@ def purchase_decision_from_signals(
             adjusted_score = max(adjusted_score, weighted_score * 0.35)
             reasons.append("门槛风险较高，仅缩小上盘优势")
 
+    score_momentum = lookup.get("临场score变化")
+    if secondary_enabled and score_momentum and score_momentum.available and abs(score_momentum.score) >= 0.25:
+        momentum_shift = 0.14 * score_momentum.score
+        adjusted_score += momentum_shift
+        reasons.append(f"临场score变化修正 {momentum_shift:+.2f}")
+
     snapshot_trend = lookup.get("快照趋势")
     if secondary_enabled and snapshot_trend and snapshot_trend.available:
         trend_shift = 0.18 * snapshot_trend.score
+        if score_momentum and score_momentum.available:
+            if snapshot_trend.score * score_momentum.score < 0:
+                trend_shift *= 0.35
+                reasons.append("临场score变化与历史快照趋势冲突，快照修正降权")
+            elif abs(weighted_score) < 0.08 and abs(score_momentum.score) < 0.30:
+                trend_shift *= 0.45
+                reasons.append("当前score未强确认历史快照趋势，快照修正降权")
         adjusted_score += trend_shift
         if abs(trend_shift) >= 0.02:
             reasons.append(f"快照趋势二次修正 {trend_shift:+.2f}")

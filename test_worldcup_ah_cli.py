@@ -11,10 +11,12 @@ from worldcup_ah_cli import (
     PriceVolumePoint,
     Predictor,
     ScheduledTask,
+    SnapshotContext,
     SnapshotStore,
     Signal,
     build_scheduled_tasks,
     build_parser,
+    current_score_momentum_signal,
     normalize_line_for_spdex,
     parse_match,
     purchase_decision_from_signals,
@@ -440,6 +442,51 @@ class WorldCupAhCliTests(unittest.TestCase):
 
         self.assertNotEqual(decision.side, "下盘")
         self.assertIn("强亚盘/公司共识保护", decision.reason)
+
+    def test_current_score_momentum_detects_live_score_drop(self):
+        context = SnapshotContext(
+            records=[{"result": {"score": -0.3568}}, {"result": {"score": 0.053}}],
+            first_metrics={"score": -0.3568},
+            last_metrics={"score": 0.053},
+            signal_history_score=0.0,
+            signal_history_reason="",
+        )
+
+        signal = current_score_momentum_signal(-0.206, context)
+
+        self.assertLessEqual(signal.score, -0.85)
+        self.assertIn("本轮跌破下盘阈值", signal.reason)
+
+    def test_weak_current_score_caps_old_total_momentum(self):
+        context = SnapshotContext(
+            records=[{"result": {"score": -0.3568}}, {"result": {"score": 0.052}}],
+            first_metrics={"score": -0.3568},
+            last_metrics={"score": 0.052},
+            signal_history_score=0.0,
+            signal_history_reason="",
+        )
+
+        signal = current_score_momentum_signal(0.053, context)
+
+        self.assertLessEqual(signal.score, 0.20)
+        self.assertIn("当前score仍弱", signal.reason)
+
+    def test_live_score_momentum_reduces_stale_snapshot_boost(self):
+        decision = purchase_decision_from_signals(
+            match=sample_match(asian_line="-0.5"),
+            weighted_score=0.04,
+            completeness=88,
+            available_weight=0.84,
+            model_recommendation="观望",
+            signals=[
+                Signal("快照趋势", 0.70, 0.06, True, "历史快照偏上盘"),
+                Signal("临场score变化", -0.85, 0.0, True, "本轮跌破下盘阈值"),
+            ],
+        )
+
+        self.assertNotEqual(decision.side, "上盘")
+        self.assertIn("临场score变化修正", decision.reason)
+        self.assertIn("快照修正降权", decision.reason)
 
     def test_stop_update_with_snapshots_skips_low_weight_gate(self):
         """When SPDEX stops live updates but snapshot trend is available, do not short-circuit to 观望 solely for low weight."""
