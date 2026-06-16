@@ -1061,7 +1061,10 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertEqual(len(catch_up_tasks), 1)
         self.assertIn("T-4h", catch_up_tasks[0].label)
         self.assertEqual(catch_up_tasks[0].run_at, now)
-        self.assertTrue(any(task.label.startswith("T-60m") for task in tasks))
+        self.assertTrue(catch_up_tasks[0].do_predict)
+        self.assertTrue(any(task.label.startswith("T-3h") and task.do_predict for task in tasks))
+        self.assertTrue(any(task.label.startswith("T-2h") and task.do_predict for task in tasks))
+        self.assertTrue(any(task.label.startswith("T-60m") and task.do_predict for task in tasks))
 
     def test_watch_schedule_skips_completed_window(self):
         now = datetime(2026, 6, 13, 0, 0, tzinfo=timezone.utc)

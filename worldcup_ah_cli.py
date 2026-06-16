@@ -55,9 +55,11 @@ TOP_BOOKMAKERS = ("PinnacleSports", "Bet365", "Singbet", "IBC", "Ysb88")
 MATCH_LIST_HOT_MODES = (1,)
 SNAPSHOT_DIR_NAME = ".spdex_snapshots"
 SCHEDULE_WINDOWS = (
-    ("T-24h 建立基线", timedelta(hours=24), False),
-    ("T-8h 观察盘口", timedelta(hours=8), False),
-    ("T-4h 观察热度/水位背离", timedelta(hours=4), False),
+    ("T-24h 建立基线", timedelta(hours=24), True),
+    ("T-8h 观察盘口", timedelta(hours=8), True),
+    ("T-4h 观察热度/水位背离", timedelta(hours=4), True),
+    ("T-3h 追踪热度/盘口修正", timedelta(hours=3), True),
+    ("T-2h 追踪临场资金变化", timedelta(hours=2), True),
     ("T-60m 首次正式推荐", timedelta(minutes=60), True),
     ("T-30m 复核", timedelta(minutes=30), True),
     ("T-15m 最终确认", timedelta(minutes=15), True),
@@ -2755,6 +2757,8 @@ def suggested_pull_times(match_time: datetime, now: datetime | None = None) -> l
         ("T-24h 建立基线", match_time - timedelta(hours=24)),
         ("T-8h 观察盘口", match_time - timedelta(hours=8)),
         ("T-4h 进入重点观察", match_time - timedelta(hours=4)),
+        ("T-3h 追踪热度/盘口修正", match_time - timedelta(hours=3)),
+        ("T-2h 追踪临场资金变化", match_time - timedelta(hours=2)),
         ("T-60m 首次正式推荐", match_time - timedelta(minutes=60)),
         ("T-30m 复核", match_time - timedelta(minutes=30)),
         ("T-15m 最终确认", match_time - timedelta(minutes=15)),
@@ -3425,7 +3429,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python3 worldcup_ah_cli.py trend --event-id 35035283\n"
             "      根据本地快照比较 score、必发热度、盈亏压力、盘口/水位变化。\n\n"
             "  python3 worldcup_ah_cli.py watch --limit 20\n"
-            "      常驻运行，扫描未来 24 小时比赛并按 T-24h/T-8h/T-4h/T-60m/T-30m/T-15m 自动快照。\n\n"
+            "      常驻运行，按 T-24h/T-8h/T-4h/T-3h/T-2h/T-60m/T-30m/T-15m 自动快照并输出预测。\n\n"
             "  python3 worldcup_ah_cli.py sources\n"
             "      查看后续可接入的公开数据源。\n\n"
             "输出说明:\n"
@@ -3461,7 +3465,7 @@ def build_parser() -> argparse.ArgumentParser:
     upcoming_parser = subparsers.add_parser(
         "upcoming",
         help="列出未开赛世界杯赛程",
-        description="列出 SPDEX 当前可见的未开赛世界杯比赛，并给出 T-24h/T-8h/T-4h/T-60m 等建议拉取时间。",
+        description="列出 SPDEX 当前可见的未开赛世界杯比赛，并给出 T-24h/T-8h/T-4h/T-3h/T-2h/T-60m 等建议拉取时间。",
     )
     upcoming_parser.add_argument("--limit", type=int, default=20, help="最多显示多少场")
 
@@ -3504,8 +3508,8 @@ def build_parser() -> argparse.ArgumentParser:
         "watch",
         help="按赛前窗口自动保存快照/预测",
         description=(
-            "常驻运行：每次检查未来窗口内的世界杯比赛，并按 T-24h/T-8h/T-4h/T-60m/T-30m/T-15m "
-            "自动保存快照；T-60m/T-30m/T-15m 会同时打印预测。"
+            "常驻运行：每次检查未来窗口内的世界杯比赛，并按 T-24h/T-8h/T-4h/T-3h/T-2h/T-60m/T-30m/T-15m "
+            "自动保存快照并打印预测；T-24h 到 T-2h 为预判，T-60m/T-30m/T-15m 为正式复核/确认。"
         ),
     )
     watch_parser.add_argument("--limit", type=int, default=20, help="最多跟踪多少场未来比赛")
