@@ -1,1 +1,6 @@
 __pycache__/
+
+.env
+.spdex_snapshots/
+.titan007_snapshots/
+.exchange_odds_snapshots/

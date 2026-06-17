@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from worldcup_ah_cli import (
@@ -14,14 +15,17 @@ from worldcup_ah_cli import (
     SnapshotContext,
     SnapshotStore,
     Signal,
+    SpdexClient,
     build_scheduled_tasks,
     build_parser,
     current_score_momentum_signal,
+    normalize_cookie_value,
     normalize_line_for_spdex,
     parse_match,
     purchase_decision_from_signals,
     purchase_display_text,
     recommendation_from_score,
+    require_list_payload,
     score_bifa_odds_confirmation,
     score_handicap_row,
     score_hot_divergence_penalty,
@@ -29,8 +33,10 @@ from worldcup_ah_cli import (
     score_bifa_heat_edge,
     score_price_volume,
     score_snapshot_signal_history,
+    set_env_file_value,
     upper_lower_teams,
 )
+from okooo_ah_cli import detail_rows_to_points
 
 
 def sample_match(**overrides):
@@ -110,6 +116,32 @@ class StaticSnapshotStore:
         return self.records
 
 
+class NonJsonThenCurlJsonClient(SpdexClient):
+    def __init__(self):
+        super().__init__(use_env_auth=False)
+        self.open_calls = 0
+        self.curl_calls = 0
+
+    def _open_text(self, request, context=None):
+        self.open_calls += 1
+        return "<html>temporary edge response</html>"
+
+    def _curl_text(self, url):
+        self.curl_calls += 1
+        return '{"ok": true}'
+
+
+class LoginPageClient(SpdexClient):
+    def __init__(self, *, auth=False):
+        headers = {"Cookie": "sid=expired"} if auth else None
+        super().__init__(use_env_auth=False, extra_headers=headers, curl_fallback=False)
+        self.open_calls = 0
+
+    def _open_text(self, request, context=None):
+        self.open_calls += 1
+        return "<!DOCTYPE html><main class='login-page'>会员登录</main>"
+
+
 class WorldCupAhCliTests(unittest.TestCase):
     def test_parse_spdex_match_detail_shape(self):
         match = parse_match(
@@ -133,6 +165,98 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertEqual(match.away, "捷克")
         self.assertEqual(match.asian_line, "0")
 
+    def test_parse_newspdex_match_shape_maps_legacy_raw_fields(self):
+        match = parse_match(
+            {
+                "eventId": 35400001,
+                "matchTime": "2026-06-17T03:00:00+08:00",
+                "homeTeam": "法国",
+                "awayTeam": "塞内加尔",
+                "leagueName": "世界杯",
+                "handicap": "-1",
+                "bfIndex": [48.5, 17.0, 34.5],
+                "bfAmounts": [915598, 10000, 119294],
+                "bfPriceHome": 1.5,
+                "bfPriceAway": 8.4,
+                "euroHome": 1.42,
+                "euroDraw": 4.5,
+                "euroAway": 7.8,
+                "kellyHome": 0.91,
+                "kellyDraw": 0.95,
+                "kellyAway": 0.98,
+                "asianLet": [1.92, 1.98],
+            }
+        )
+
+        self.assertEqual(match.event_id, 35400001)
+        self.assertEqual(match.home, "法国")
+        self.assertEqual(match.asian_line, "-1")
+        self.assertEqual(match.raw["BfIndexHome"], 48.5)
+        self.assertEqual(match.raw["BfAmountAway"], 119294)
+        self.assertEqual(match.raw["BfOddsAway"], 8.4)
+        self.assertEqual(match.raw["AsianAvrHome"], 1.92)
+
+    def test_non_json_response_tries_curl_before_failing(self):
+        client = NonJsonThenCurlJsonClient()
+
+        data = client._get_json("/spdex/match_list", {"class": -1})
+
+        self.assertEqual(data, {"ok": True})
+        self.assertEqual(client.curl_calls, 1)
+        self.assertTrue(client.curl_fallback_used)
+
+    def test_login_page_non_json_error_mentions_cookie(self):
+        client = LoginPageClient()
+
+        with self.assertRaises(DataError) as ctx:
+            client._get_json("/spdex/match_list", {"class": -1})
+
+        self.assertIn("login page", str(ctx.exception))
+        self.assertIn("SPDEX_COOKIE", str(ctx.exception))
+
+    def test_login_page_with_configured_auth_mentions_expired_session(self):
+        client = LoginPageClient(auth=True)
+
+        with self.assertRaises(DataError) as ctx:
+            client._get_json("/spdex/match_list", {"class": -1})
+
+        self.assertIn("会话可能过期", str(ctx.exception))
+
+    def test_login_page_detection_short_circuits_followup_requests(self):
+        client = LoginPageClient()
+
+        with self.assertRaises(DataError):
+            client._get_json("/spdex/match_list", {"class": -1})
+
+        self.assertEqual(client.open_calls, 1)
+        with self.assertRaises(DataError) as ctx:
+            client._get_json("/spdex/odds/view/list", {"eid": 1})
+
+        self.assertIn("prior request", str(ctx.exception))
+        self.assertEqual(client.open_calls, 1)
+
+    def test_normalize_cookie_value_accepts_full_header(self):
+        raw = "Cookie: sid=abc; token=def; theme=light"
+
+        self.assertEqual(normalize_cookie_value(raw), "sid=abc; token=def; theme=light")
+
+    def test_set_env_file_value_updates_existing_cookie(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / ".env"
+            path.write_text("USERNAME=u\nSPDEX_COOKIE=old\nPASSWORD=p\n", encoding="utf-8")
+
+            set_env_file_value(path, "SPDEX_COOKIE", "new=value; token=ok")
+
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                "USERNAME=u\nSPDEX_COOKIE=new=value; token=ok\nPASSWORD=p\n",
+            )
+
+    def test_require_list_payload_accepts_nested_data_list(self):
+        payload = {"code": 0, "data": {"list": [{"EventId": 1}]}}
+
+        self.assertEqual(require_list_payload(payload, "match_list"), [{"EventId": 1}])
+
     def test_normalize_positive_line_for_spdex(self):
         self.assertEqual(normalize_line_for_spdex("+1.75"), "1.75")
         self.assertEqual(normalize_line_for_spdex("-0.750"), "-0.75")
@@ -149,7 +273,7 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertEqual(recommendation_from_score(0.02), "观望")
 
     def test_price_volume_scoring_prefers_buy_pressure_and_price_drop(self):
-        score, reason = score_price_volume(
+        score, reason, _meta = score_price_volume(
             [
                 PriceVolumePoint(2.00, 900, None, "买+"),
                 PriceVolumePoint(1.90, 100, None, "卖"),
@@ -158,6 +282,55 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertIsNotNone(score)
         self.assertGreater(score, 0)
         self.assertIn("买量", reason)
+
+    def test_price_volume_okooo_detail_without_buy_sell_attr(self):
+        """无买/卖 attr 时用速率曲线 / 回归刻画量随时间推进，而非粗糙对半。"""
+        ts0 = datetime(2026, 6, 17, 18, 0, 0, tzinfo=timezone.utc)
+        ts1 = datetime(2026, 6, 17, 19, 0, 0, tzinfo=timezone.utc)
+        ts2 = datetime(2026, 6, 17, 20, 0, 0, tzinfo=timezone.utc)
+        ts3 = datetime(2026, 6, 17, 21, 0, 0, tzinfo=timezone.utc)
+        score, reason, meta = score_price_volume(
+            [
+                PriceVolumePoint(1.79, 10_000.0, ts0, ""),
+                PriceVolumePoint(1.78, 12_000.0, ts1, ""),
+                PriceVolumePoint(1.77, 50_000.0, ts2, ""),
+                PriceVolumePoint(1.76, 80_000.0, ts3, "3.95"),
+            ]
+        )
+        self.assertIsNotNone(score)
+        self.assertEqual(meta.get("branch"), "trend")
+        self.assertIn("成交量时间趋势", reason)
+        self.assertIn("成交速率", reason)
+        self.assertIn("40%", reason)
+        self.assertIn("回归斜率", reason)
+        self.assertGreater(score, 0.0)
+
+    def test_price_volume_fallback_order_regression_when_no_intervals(self):
+        """相邻记录时间间隔无效时走 log(1+量)~次序回归，不依赖对半合计。"""
+        ts = datetime(2026, 6, 17, 12, 0, 0, tzinfo=timezone.utc)
+        score, reason, meta = score_price_volume(
+            [
+                PriceVolumePoint(1.9, 1_000.0, ts, ""),
+                PriceVolumePoint(1.85, 5_000.0, ts, ""),
+                PriceVolumePoint(1.80, 20_000.0, ts, ""),
+            ]
+        )
+        self.assertIsNotNone(score)
+        self.assertEqual(meta.get("branch"), "trend")
+        self.assertIn("次序回归", reason)
+        self.assertIn("前/后段量合计(参考)", reason)
+
+    def test_okooo_detail_first_cumulative_total_is_not_fresh_flow(self):
+        ts0 = datetime(2026, 6, 17, 18, 0, 0, tzinfo=timezone.utc)
+        ts1 = datetime(2026, 6, 17, 19, 0, 0, tzinfo=timezone.utc)
+        points = detail_rows_to_points(
+            [
+                {"time": ts0, "price": 2.0, "total": 1_000.0, "single": 0.0, "attr": ""},
+                {"time": ts1, "price": 1.9, "total": 1_250.0, "single": 0.0, "attr": ""},
+            ]
+        )
+        self.assertEqual(points[0].volume, 0.0)
+        self.assertEqual(points[1].volume, 250.0)
 
     def test_hot_bifa_without_odds_confirmation_is_penalized(self):
         confirmation = score_bifa_odds_confirmation(3.40, 2.10)
@@ -1003,7 +1176,7 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertGreater(score, 0.05)
         self.assertIn("历史仅1点", reason)
 
-    def test_trade_signal_uses_snapshot_history_when_live_stopped(self):
+    def test_trade_signal_does_not_use_snapshot_history_when_live_stopped(self):
         records = [
             {
                 "match": {
@@ -1051,13 +1224,14 @@ class WorldCupAhCliTests(unittest.TestCase):
         predictor = Predictor(MissingTradeEuroClient(), StaticSnapshotStore(records))
         result = predictor.analyze(sample_match())
         trade_signal = next(signal for signal in result.signals if signal.name == "必发成交走势")
+        snapshot_trend = next(signal for signal in result.signals if signal.name == "快照趋势")
 
-        self.assertTrue(trade_signal.available)
-        self.assertGreater(trade_signal.score, 0.25)
-        self.assertIn("历史快照兜底", trade_signal.reason)
-        self.assertIn("真实成交信号历史", trade_signal.reason)
+        self.assertFalse(trade_signal.available)
+        self.assertIn("成交走势接口不可用", trade_signal.reason)
+        self.assertTrue(snapshot_trend.available)
+        self.assertIn("必发成交走势历史", snapshot_trend.reason)
 
-    def test_snapshot_trade_fallback_ignores_prior_fallback_signal(self):
+    def test_snapshot_trade_history_ignores_prior_substitute_signal(self):
         def record(upper_amount, lower_amount, upper_odds, lower_odds):
             return {
                 "match": {
@@ -1093,11 +1267,12 @@ class WorldCupAhCliTests(unittest.TestCase):
         predictor = Predictor(MissingTradeEuroClient(), StaticSnapshotStore(records))
         result = predictor.analyze(sample_match())
         trade_signal = next(signal for signal in result.signals if signal.name == "必发成交走势")
+        snapshot_trend = next(signal for signal in result.signals if signal.name == "快照趋势")
 
-        self.assertTrue(trade_signal.available)
-        self.assertLess(trade_signal.score, -0.50)
-        self.assertIn("基础成交/赔率", trade_signal.reason)
-        self.assertNotIn("旧兜底结果", trade_signal.reason)
+        self.assertFalse(trade_signal.available)
+        self.assertTrue(snapshot_trend.available)
+        self.assertIn("全历史基础信号", snapshot_trend.reason)
+        self.assertNotIn("旧兜底结果", snapshot_trend.reason)
 
     def test_watch_schedule_catches_up_latest_missed_window(self):
         now = datetime(2026, 6, 13, 0, 0, tzinfo=timezone.utc)

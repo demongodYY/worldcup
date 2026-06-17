@@ -12,6 +12,8 @@ import argparse
 import http.client
 import json
 import math
+import os
+import re
 import shutil
 import ssl
 import subprocess
@@ -20,14 +22,17 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 
 SPDEX_BASE_URL = "https://app.spdex.com/spdexapi"
+SPDEX_WEB_BASE_URL = "https://app.spdex.com"
 WORLD_CUP_LEAGUE_ID = 911
+_ENV_VAR_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_COOKIE_HEADER_RE = re.compile(r"cookie\s*:\s*([^'\r\n]+)", re.IGNORECASE)
 
 WEIGHTS = {
     "bifa": 0.16,
@@ -52,7 +57,7 @@ LOWER_THRESHOLD = -0.12
 LEAN_THRESHOLD = 0.05
 
 TOP_BOOKMAKERS = ("PinnacleSports", "Bet365", "Singbet", "IBC", "Ysb88")
-MATCH_LIST_HOT_MODES = (1,)
+MATCH_LIST_HOT_MODES = (1, None)
 SNAPSHOT_DIR_NAME = ".spdex_snapshots"
 SCHEDULE_WINDOWS = (
     ("T-24h 建立基线", timedelta(hours=24), True),
@@ -66,8 +71,223 @@ SCHEDULE_WINDOWS = (
 )
 
 
+def default_env_file_path() -> Path:
+    return Path(__file__).resolve().parent / ".env"
+
+
+def load_dotenv_file(path: Path) -> int:
+    """Parse KEY=value lines into os.environ. Does not override existing variables.
+
+    Returns the number of variables newly set from non-empty values.
+    """
+    if not path.is_file():
+        return 0
+    set_count = 0
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or not _ENV_VAR_KEY_RE.match(key):
+            continue
+        if key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if value == "":
+            continue
+        os.environ[key] = value
+        set_count += 1
+    return set_count
+
+
+def normalize_cookie_value(raw: str) -> str:
+    text = raw.strip()
+    if not text:
+        return ""
+    header_match = _COOKIE_HEADER_RE.search(text)
+    if header_match:
+        text = header_match.group(1).strip()
+    elif text.lower().startswith("cookie:"):
+        text = text.split(":", 1)[1].strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    return " ".join(part.strip() for part in text.splitlines() if part.strip())
+
+
+def mask_secret(value: str, visible: int = 6) -> str:
+    value = value.strip()
+    if len(value) <= visible * 2:
+        return "*" * len(value)
+    return f"{value[:visible]}...{value[-visible:]}"
+
+
+def set_env_file_value(path: Path, key: str, value: str) -> None:
+    line = f"{key}={value}\n"
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
+    updated = False
+    for index, existing in enumerate(lines):
+        stripped = existing.strip()
+        if stripped.startswith("#"):
+            continue
+        candidate = stripped[7:].strip() if stripped.lower().startswith("export ") else stripped
+        if candidate.startswith(f"{key}="):
+            lines[index] = line
+            updated = True
+            break
+    if not updated:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] = f"{lines[-1]}\n"
+        lines.append(line)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def warn_if_credentials_without_cookie() -> None:
+    """new.spdex login API requires captcha; USERNAME/PASSWORD alone cannot populate session."""
+    user = os.environ.get("USERNAME", "").strip()
+    password = os.environ.get("PASSWORD", "").strip()
+    if not user or not password:
+        return
+    if os.environ.get("SPDEX_COOKIE", "").strip() or os.environ.get("SPDEX_AUTHORIZATION", "").strip():
+        return
+    print(
+        "提示: .env 中已设置 USERNAME/PASSWORD，但 new.spdex 登录接口需要验证码，"
+        "本脚本不会自动完成登录。请在浏览器登录后把对 *.spdex.com 生效的 Cookie 写入 SPDEX_COOKIE=...，"
+        "或设置 SPDEX_AUTHORIZATION（若接口返回 Bearer）。",
+        file=sys.stderr,
+    )
+
+
+def apply_spdex_auth_headers(target: dict[str, str]) -> None:
+    """Merge SPDEX_COOKIE / SPDEX_AUTHORIZATION from the environment into request headers."""
+    cookie = os.environ.get("SPDEX_COOKIE", "").strip()
+    if cookie:
+        target["Cookie"] = cookie
+    auth = os.environ.get("SPDEX_AUTHORIZATION", "").strip()
+    if auth:
+        if auth.lower().startswith("bearer "):
+            target["Authorization"] = auth
+        else:
+            target["Authorization"] = f"Bearer {auth}"
+
+
 class DataError(RuntimeError):
     """Raised when a data source cannot return usable data."""
+
+
+def looks_like_spdex_login_page(body: str) -> bool:
+    sample = body[:5000].lower()
+    return any(
+        marker in sample or marker in body
+        for marker in (
+            "会员登录",
+            "login-page",
+            'path":"/login"',
+            "/login",
+            "login-submit",
+        )
+    )
+
+
+def spdex_login_data_error(
+    url: str,
+    auth_configured: bool,
+    *,
+    cached: bool = False,
+    first_url: str | None = None,
+) -> DataError:
+    if cached:
+        source = f" 首次登录页来源: {first_url}." if first_url else ""
+        prefix = f"SPDEX login required from prior request: {url}.{source}"
+    else:
+        prefix = f"SPDEX returned login page instead of JSON: {url}."
+    if auth_configured:
+        return DataError(
+            f"{prefix} 已配置 SPDEX_COOKIE / SPDEX_AUTHORIZATION，但会话可能过期或不适用于 app.spdex.com；"
+            "请在浏览器重新登录后更新 .env 中的 SPDEX_COOKIE。"
+        )
+    return DataError(
+        f"{prefix} app.spdex.com 现在要求登录会话；请在浏览器登录后把 Cookie 写入 .env 的 "
+        "SPDEX_COOKIE=...，然后重新运行 auth-probe / predict。"
+    )
+
+
+def non_json_data_error(url: str, body: str, auth_configured: bool) -> DataError:
+    if looks_like_spdex_login_page(body):
+        return spdex_login_data_error(url, auth_configured)
+    compact = " ".join(body[:220].split())
+    return DataError(f"SPDEX returned non-JSON data: {url}; preview={compact!r}")
+
+
+def raise_if_spdex_error_json_payload(url: str, payload: Any) -> None:
+    """Raise DataError when the server returns JSON error objects instead of API data."""
+    if not isinstance(payload, dict):
+        return
+    if payload.get("error") is True and (
+        "statusCode" in payload or "statusMessage" in payload or "message" in payload
+    ):
+        msg = payload.get("statusMessage") or payload.get("message") or "unknown"
+        raise DataError(
+            f"SPDEX 返回错误 JSON（常见于 app.spdex.com 302 至 new.spdex.com 后旧 /spdexapi 路径未再提供数据）"
+            f" {url}: {msg}"
+        )
+    if payload.get("code") == 403 and payload.get("message") == "该接口暂未开放":
+        raise DataError(f"SPDEX 接口拒绝访问 {url}: {payload.get('message')}")
+    code = payload.get("code")
+    if code not in (None, 0, "0") and ("data" in payload or "message" in payload):
+        message = payload.get("message") or payload.get("msg") or payload.get("statusMessage") or "unknown"
+        raise DataError(f"SPDEX API 返回错误 {url}: code={code}, message={message}")
+
+
+_LIST_PAYLOAD_KEYS = (
+    "data",
+    "Data",
+    "rows",
+    "Rows",
+    "list",
+    "List",
+    "items",
+    "Items",
+    "matches",
+    "Matches",
+    "matchList",
+    "MatchList",
+    "result",
+    "Result",
+)
+
+
+def find_list_payload(data: Any, depth: int = 3) -> list[Any] | None:
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict) or depth <= 0:
+        return None
+    for key in _LIST_PAYLOAD_KEYS:
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+    for key in _LIST_PAYLOAD_KEYS:
+        nested = find_list_payload(data.get(key), depth - 1)
+        if nested is not None:
+            return nested
+    return None
+
+
+def require_list_payload(data: Any, source: str) -> list[Any]:
+    payload = find_list_payload(data)
+    if payload is not None:
+        return payload
+    if isinstance(data, dict):
+        keys = ", ".join(str(key) for key in data.keys())
+        raise DataError(f"SPDEX {source} returned an unexpected shape: dict keys=[{keys}]")
+    raise DataError(f"SPDEX {source} returned an unexpected shape: {type(data).__name__}")
 
 
 @dataclass(frozen=True)
@@ -272,6 +492,9 @@ class SpdexClient:
         ssl_fallback: bool = True,
         retries: int = 1,
         curl_fallback: bool = True,
+        *,
+        use_env_auth: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -280,21 +503,49 @@ class SpdexClient:
         self.curl_fallback = curl_fallback
         self.ssl_fallback_used = False
         self.curl_fallback_used = False
+        self.login_required_detected = False
+        self.login_required_url: str | None = None
+        self._extra_headers: dict[str, str] = {}
+        if use_env_auth:
+            apply_spdex_auth_headers(self._extra_headers)
+        if extra_headers:
+            self._extra_headers.update(extra_headers)
+
+    @property
+    def auth_configured(self) -> bool:
+        return bool(self._extra_headers.get("Cookie") or self._extra_headers.get("Authorization"))
+
+    def _request_headers(self) -> dict[str, str]:
+        headers = {
+            "User-Agent": "worldcup-ah-cli/1.0",
+            "Accept": "application/json,text/plain,*/*",
+        }
+        headers.update(self._extra_headers)
+        return headers
 
     def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         query = dict(params or {})
         query.setdefault("app", "a")
         query.setdefault("version", "1.01")
         query.setdefault("dateformat", "iso8601")
-        url = f"{self.base_url}{path}?{urllib.parse.urlencode(query)}"
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "worldcup-ah-cli/1.0",
-                "Accept": "application/json,text/plain,*/*",
-            },
-        )
+        return self._get_json_url(f"{self.base_url}{path}", query)
+
+    def _get_web_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._get_json_url(f"{SPDEX_WEB_BASE_URL}{path}", dict(params or {}))
+
+    def _get_json_url(self, base_url: str, params: dict[str, Any] | None = None) -> Any:
+        query = dict(params or {})
+        url = f"{base_url}?{urllib.parse.urlencode(query)}" if query else base_url
+        if self.login_required_detected:
+            raise spdex_login_data_error(
+                url,
+                self.auth_configured,
+                cached=True,
+                first_url=self.login_required_url,
+            )
+        request = urllib.request.Request(url, headers=self._request_headers())
         body: str | None = None
+        body_from_curl = False
         last_exc: BaseException | None = None
         network_errors = (
             urllib.error.HTTPError,
@@ -318,6 +569,12 @@ class SpdexClient:
                 else:
                     last_exc = exc
                 if isinstance(last_exc, urllib.error.HTTPError) and 400 <= last_exc.code < 500:
+                    try:
+                        raw = last_exc.read()
+                        if raw:
+                            body = raw.decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
                     break
                 if attempt < self.retries:
                     time.sleep(0.35 * (attempt + 1))
@@ -325,15 +582,35 @@ class SpdexClient:
             if self.curl_fallback:
                 try:
                     body = self._curl_text(url)
+                    body_from_curl = True
                     self.curl_fallback_used = True
                 except DataError as curl_exc:
                     raise DataError(f"SPDEX request failed: {url}: {last_exc}; curl fallback: {curl_exc}") from last_exc
             else:
                 raise DataError(f"SPDEX request failed: {url}: {last_exc}") from last_exc
         try:
-            return json.loads(body)
+            data = json.loads(body)
         except json.JSONDecodeError as exc:
-            raise DataError(f"SPDEX returned non-JSON data: {url}") from exc
+            if self.curl_fallback and not body_from_curl:
+                try:
+                    curl_body = self._curl_text(url)
+                    body_from_curl = True
+                    self.curl_fallback_used = True
+                    data = json.loads(curl_body)
+                except json.JSONDecodeError as curl_json_exc:
+                    body = curl_body
+                    exc = curl_json_exc
+                except DataError:
+                    pass
+                else:
+                    raise_if_spdex_error_json_payload(url, data)
+                    return data
+            if looks_like_spdex_login_page(body):
+                self.login_required_detected = True
+                self.login_required_url = self.login_required_url or url
+            raise non_json_data_error(url, body, self.auth_configured) from exc
+        raise_if_spdex_error_json_payload(url, data)
+        return data
 
     def _open_text(
         self,
@@ -357,8 +634,16 @@ class SpdexClient:
             str(max(1, int(self.timeout))),
             "--connect-timeout",
             str(max(1, min(5, int(self.timeout)))),
-            url,
         ]
+        cookie_header = self._extra_headers.get("Cookie")
+        if cookie_header:
+            # curl 跟随跨子域 302 时不会复用 -H Cookie:；用 -b 才能在 app→new 重定向链上持续携带会话
+            command.extend(["-b", cookie_header])
+        for hk, hv in self._extra_headers.items():
+            if hk.lower() == "cookie":
+                continue
+            command.extend(["-H", f"{hk}: {hv}"])
+        command.append(url)
         try:
             result = subprocess.run(
                 command,
@@ -376,29 +661,58 @@ class SpdexClient:
         if hot is not None:
             params["hot"] = hot
         data = self._get_json("/spdex/match_list", params)
-        if not isinstance(data, list):
-            raise DataError("SPDEX match_list returned an unexpected shape")
-        return [parse_match(item) for item in data if isinstance(item, dict)]
+        rows = require_list_payload(data, "match_list")
+        return [parse_match(item) for item in rows if isinstance(item, dict)]
 
-    def match_detail(self, keyword: str) -> Match | None:
+    def newspdex_matches(
+        self,
+        *,
+        date: str = "today-window",
+        status: str = "upcoming",
+        page: int = 1,
+        page_size: int = 200,
+    ) -> list[Match]:
+        params: dict[str, Any] = {
+            "date": date,
+            "status": status,
+            "page": page,
+            "pageSize": page_size,
+        }
+        data = self._get_web_json("/api/newspdex/matches", params)
+        rows = require_list_payload(data, "newspdex matches")
+        return [parse_newspdex_match(item) for item in rows if isinstance(item, dict)]
+
+    def newspdex_match_detail(self, event_id: int) -> Match | None:
+        data = self._get_web_json(f"/api/newspdex/match-detail/{event_id}")
+        payload = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            raise DataError("SPDEX newspdex match-detail returned an unexpected shape")
+        match_info = payload.get("match")
+        if not isinstance(match_info, dict):
+            return None
+        match = parse_newspdex_match(match_info)
+        raw = dict(match.raw)
+        enrich_newspdex_detail_raw(raw, payload)
+        return replace(match, raw=raw)
+
+    def _match_detail_candidates(self, keyword: str) -> list[dict[str, Any]]:
         data = self._get_json(
             "/spdex/match_detail",
             {"keyword": keyword, "product_id": 0, "tutorial": 0},
         )
-        candidates: list[dict[str, Any]]
         if isinstance(data, list):
-            candidates = [item for item in data if isinstance(item, dict)]
-        elif isinstance(data, dict):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
             nested = data.get("data")
             if isinstance(nested, list):
-                candidates = [item for item in nested if isinstance(item, dict)]
-            elif isinstance(nested, dict):
-                candidates = [nested]
-            else:
-                candidates = [data]
-        else:
-            candidates = []
-        for item in candidates:
+                return [item for item in nested if isinstance(item, dict)]
+            if isinstance(nested, dict):
+                return [nested]
+            return [data]
+        return []
+
+    def match_detail(self, keyword: str) -> Match | None:
+        for item in self._match_detail_candidates(keyword):
             try:
                 return parse_match(item)
             except (KeyError, TypeError, ValueError):
@@ -406,12 +720,31 @@ class SpdexClient:
         return None
 
     def find_match(self, event_id: int) -> Match:
-        for match in self.world_cup_matches():
-            if match.event_id == event_id:
-                return match
-        detail = self.match_detail(str(event_id))
-        if detail:
-            return detail
+        errors: list[DataError] = []
+        base_match: Match | None = None
+        try:
+            for match in self.world_cup_matches():
+                if match.event_id == event_id:
+                    base_match = match
+                    break
+        except DataError as exc:
+            errors.append(exc)
+        try:
+            detail = self.newspdex_match_detail(event_id)
+            if detail:
+                return merge_match_detail(base_match, detail) if base_match else detail
+        except DataError as exc:
+            errors.append(exc)
+        if base_match:
+            return base_match
+        try:
+            detail = self.match_detail(str(event_id))
+            if detail:
+                return detail
+        except DataError as exc:
+            errors.append(exc)
+        if errors:
+            raise errors[-1]
         raise DataError(f"cannot find event_id={event_id} in SPDEX")
 
     def world_cup_matches(self) -> list[Match]:
@@ -419,6 +752,20 @@ class SpdexClient:
         matches: list[Match] = []
         successful_requests = 0
         last_error: DataError | None = None
+        for date in newspdex_upcoming_dates():
+            try:
+                batch = self.newspdex_matches(date=date, status="upcoming")
+            except DataError as exc:
+                last_error = exc
+                continue
+            successful_requests += 1
+            for match in batch:
+                if match.event_id in seen or not is_world_cup(match):
+                    continue
+                seen.add(match.event_id)
+                matches.append(match)
+        if matches:
+            return sorted(matches, key=lambda item: item.match_time)
         for hot in MATCH_LIST_HOT_MODES:
             try:
                 batch = self.match_list(hot=hot)
@@ -446,9 +793,8 @@ class SpdexClient:
                 "line": normalize_line_for_spdex(asian_line),
             },
         )
-        if not isinstance(data, list):
-            raise DataError("SPDEX handicap list returned an unexpected shape")
-        return [parse_handicap(item) for item in data if isinstance(item, dict)]
+        rows = require_list_payload(data, "handicap list")
+        return [parse_handicap(item) for item in rows if isinstance(item, dict)]
 
     def handicap_detail(
         self, event_id: int, asian_line: str, bookmaker_id: int
@@ -462,27 +808,60 @@ class SpdexClient:
                 "bookmaker": bookmaker_id,
             },
         )
-        if not isinstance(data, list):
-            raise DataError("SPDEX handicap detail returned an unexpected shape")
-        return [parse_handicap(item, bookmaker_id=bookmaker_id) for item in data if isinstance(item, dict)]
+        rows = require_list_payload(data, "handicap detail")
+        return [parse_handicap(item, bookmaker_id=bookmaker_id) for item in rows if isinstance(item, dict)]
 
     def price_volume(self, event_id: int, selection: str) -> list[PriceVolumePoint]:
+        try:
+            return self.newspdex_tradeflow(event_id, selection)
+        except DataError:
+            pass
         data = self._get_json(
             "/spdex/price/volumn",
             {"eventid": event_id, "hour": -1, "selection": selection},
         )
-        if not isinstance(data, list):
-            raise DataError("SPDEX price/volumn returned an unexpected shape")
-        return [parse_price_volume(item) for item in data if isinstance(item, dict)]
+        rows = require_list_payload(data, "price/volumn")
+        return [parse_price_volume(item) for item in rows if isinstance(item, dict)]
+
+    def newspdex_tradeflow(self, event_id: int, selection: str) -> list[PriceVolumePoint]:
+        data = self._get_web_json(
+            f"/api/newspdex/charts/{event_id}/tradeflow",
+            {"market": "standard", "selection": selection, "granularity": "15m"},
+        )
+        payload = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            raise DataError("SPDEX newspdex tradeflow returned an unexpected shape")
+        if payload.get("status") == "no-access" or payload.get("accessLocked"):
+            raise DataError("SPDEX newspdex tradeflow is not available for current account")
+        buckets = payload.get("buckets")
+        if not isinstance(buckets, list):
+            raise DataError("SPDEX newspdex tradeflow returned no buckets")
+        points: list[PriceVolumePoint] = []
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            items = bucket.get("items")
+            if isinstance(items, dict):
+                volume = sum(amount_to_float(value) for value in items.values())
+            else:
+                volume = amount_to_float(bucket.get("volume"))
+            points.append(
+                PriceVolumePoint(
+                    price=to_float_or_none(bucket.get("price")) or 0.0,
+                    volume=volume,
+                    update_time=parse_datetime_or_none(bucket.get("time")),
+                    attr=None,
+                )
+            )
+        return points
 
     def euro_trend(self, event_id: int) -> list[EuroTrendPoint]:
         data = self._get_json(
             "/spdex/odds/1x2/trend",
             {"hour": -1, "eid": event_id},
         )
-        if not isinstance(data, list):
-            raise DataError("SPDEX euro trend returned an unexpected shape")
-        return [parse_euro_trend(item) for item in data if isinstance(item, dict)]
+        rows = require_list_payload(data, "euro trend")
+        return [parse_euro_trend(item) for item in rows if isinstance(item, dict)]
 
 
 class SnapshotStore:
@@ -569,8 +948,9 @@ class Predictor:
         self.snapshot_store = snapshot_store
 
     def analyze(self, match: Match) -> AnalysisResult:
-        upper_team, lower_team = upper_lower_teams(match)
         warnings: list[str] = []
+        match = self._refresh_newspdex_detail(match, warnings)
+        upper_team, lower_team = upper_lower_teams(match)
 
         snapshot_context = self._snapshot_context(match)
         handicap_rows = self._handicap_rows(match, warnings)
@@ -726,7 +1106,19 @@ class Predictor:
             is_reversed=purchase_decision.is_reversed,
         )
 
+    def _refresh_newspdex_detail(self, match: Match, warnings: list[str]) -> Match:
+        if match.raw.get("_source") != "newspdex":
+            return match
+        try:
+            detail = self.client.newspdex_match_detail(match.event_id)
+            return merge_match_detail(match, detail) if detail else match
+        except DataError as exc:
+            warnings.append(f"新版详情刷新失败，使用列表实时字段: {exc}")
+            return match
+
     def _handicap_rows(self, match: Match, warnings: list[str]) -> list[HandicapRow]:
+        if match.raw.get("_source") == "newspdex":
+            return sorted(fallback_handicap_rows_from_base(match), key=bookmaker_priority)
         try:
             rows = self.client.handicap_list(match.event_id, match.asian_line)
         except DataError as exc:
@@ -818,48 +1210,43 @@ class Predictor:
         try:
             upper_selection = selection_for_team(match, upper_team)
             lower_selection = selection_for_team(match, lower_team)
-            upper_points = self.client.price_volume(match.event_id, upper_selection)
-            lower_points = self.client.price_volume(match.event_id, lower_selection)
+            if match.raw.get("_source") == "newspdex":
+                upper_points = self.client.newspdex_tradeflow(match.event_id, upper_selection)
+                lower_points = self.client.newspdex_tradeflow(match.event_id, lower_selection)
+            else:
+                upper_points = self.client.price_volume(match.event_id, upper_selection)
+                lower_points = self.client.price_volume(match.event_id, lower_selection)
         except DataError as exc:
             warnings.append(str(exc))
-            snapshot_signal = self._snapshot_trade_signal(snapshot_context, "实时成交走势接口不可用")
-            if snapshot_signal:
-                return snapshot_signal
             return unavailable_signal("必发成交走势", WEIGHTS["bifa_trade"], "成交走势接口不可用")
 
-        upper_score, upper_reason = score_price_volume(upper_points)
-        lower_score, lower_reason = score_price_volume(lower_points)
+        upper_score, upper_reason, upper_meta = score_price_volume(upper_points)
+        lower_score, lower_reason, lower_meta = score_price_volume(lower_points)
         if upper_score is None or lower_score is None:
-            snapshot_signal = self._snapshot_trade_signal(snapshot_context, "实时成交走势点不足")
-            if snapshot_signal:
-                return snapshot_signal
             return unavailable_signal("必发成交走势", WEIGHTS["bifa_trade"], "近1小时成交走势不足")
 
-        score = clamp((upper_score - lower_score) / 2.0, -1, 1)
+        signal_score = clamp((upper_score - lower_score) / 2.0, -1, 1)
+        # 澳客明细等：两侧都是「时间趋势」且单边综合分差很小 → 用 raw_trend 对比强化相对强弱（少被同向价格项稀释）
+        if (
+            upper_meta
+            and lower_meta
+            and upper_meta.get("branch") == "trend"
+            and lower_meta.get("branch") == "trend"
+            and int(upper_meta.get("n", 0)) >= 5
+            and int(lower_meta.get("n", 0)) >= 5
+            and abs(upper_score - lower_score) < 0.20
+        ):
+            rt_u = float(upper_meta.get("raw_trend") or 0.0)
+            rt_l = float(lower_meta.get("raw_trend") or 0.0)
+            contrast = clamp((rt_u - rt_l) / 2.0, -1, 1)
+            signal_score = clamp(0.42 * signal_score + 0.58 * contrast, -1, 1)
+
         return Signal(
             "必发成交走势",
-            score,
+            signal_score,
             WEIGHTS["bifa_trade"],
             True,
             f"{upper_team}: {upper_reason}；{lower_team}: {lower_reason}",
-        )
-
-    def _snapshot_trade_signal(
-        self,
-        snapshot_context: SnapshotContext | None,
-        live_reason: str,
-    ) -> Signal | None:
-        if snapshot_context is None:
-            return None
-        score, reason = score_snapshot_trade_history(snapshot_context.records)
-        if score is None:
-            return None
-        return Signal(
-            "必发成交走势",
-            score,
-            WEIGHTS["bifa_trade"],
-            True,
-            f"{live_reason}，历史快照兜底：{reason}",
         )
 
     def _handicap_signal(
@@ -930,6 +1317,8 @@ class Predictor:
     def _euro_kelly_signal(
         self, match: Match, upper_team: str, lower_team: str, warnings: list[str]
     ) -> Signal:
+        if match.raw.get("_source") == "newspdex":
+            return fallback_euro_kelly_signal(match, upper_team, lower_team)
         try:
             points = self.client.euro_trend(match.event_id)
         except DataError as exc:
@@ -1266,16 +1655,9 @@ class Predictor:
 
         penalty = 0.0
         reasons: list[str] = []
-        trade_is_snapshot_fallback = is_snapshot_fallback_signal(trade_signal)
         if not trade_signal.available:
             penalty += 0.07
             reasons.append("临场必发成交走势不可用")
-        elif trade_is_snapshot_fallback:
-            penalty += 0.04
-            reasons.append("临场必发成交走势仅历史快照兜底")
-            if trade_signal.score < 0.08:
-                penalty += 0.03
-                reasons.append("历史成交走势未继续确认上盘")
         elif trade_signal.score < 0.08:
             penalty += 0.06
             reasons.append("必发成交走势未继续确认上盘")
@@ -1676,7 +2058,6 @@ class Predictor:
         handicap_edge = handicap_signal.score if handicap_signal.available else 0.0
         handicap_is_fallback = "静态亚盘均值兜底" in handicap_signal.reason
         trade_edge = trade_signal.score if trade_signal.available else 0.0
-        trade_is_snapshot_fallback = is_snapshot_fallback_signal(trade_signal)
         euro_edge = euro_kelly_signal.score if euro_kelly_signal.available else 0.0
         draw_edge = draw_risk_signal.score if draw_risk_signal.available else 0.0
         fair_edge = fair_line_signal.score if fair_line_signal.available else 0.0
@@ -1725,13 +2106,11 @@ class Predictor:
 
             if trade_signal.available:
                 if trade_confirm >= 0.10:
-                    weight = 0.08 if trade_is_snapshot_fallback else 0.20
-                    components.append(weight * hot_direction)
-                    reasons.append("成交走势顺热度" + ("(历史快照降权)" if trade_is_snapshot_fallback else ""))
+                    components.append(0.20 * hot_direction)
+                    reasons.append("成交走势顺热度")
                 elif trade_confirm <= -0.10:
-                    weight = 0.12 if trade_is_snapshot_fallback else 0.25
-                    components.append(-weight * hot_direction)
-                    reasons.append("成交走势反热度" + ("(历史快照降权)" if trade_is_snapshot_fallback else ""))
+                    components.append(-0.25 * hot_direction)
+                    reasons.append("成交走势反热度")
 
             if euro_kelly_signal.available:
                 if euro_confirm >= 0.10:
@@ -1800,12 +2179,8 @@ class Predictor:
                 components.append(0.45 * math.copysign(1.0, handicap_edge))
                 reasons.append(f"热度不高但亚盘主动防守偏{direction_label(handicap_edge)}")
             if trade_signal.available and abs(trade_edge) >= 0.25:
-                weight = 0.10 if trade_is_snapshot_fallback else 0.25
-                components.append(weight * math.copysign(1.0, trade_edge))
-                reasons.append(
-                    f"热度不高但成交走势偏{direction_label(trade_edge)}"
-                    + ("(历史快照降权)" if trade_is_snapshot_fallback else "")
-                )
+                components.append(0.25 * math.copysign(1.0, trade_edge))
+                reasons.append(f"热度不高但成交走势偏{direction_label(trade_edge)}")
             if euro_kelly_signal.available and abs(euro_edge) >= 0.20:
                 components.append(0.15 * math.copysign(1.0, euro_edge))
                 reasons.append(f"热度不高但欧赔/Kelly偏{direction_label(euro_edge)}")
@@ -1873,7 +2248,7 @@ class Predictor:
         if (
             score > 0.55
             and depth >= 0.75
-            and (not trade_signal.available or trade_is_snapshot_fallback or not euro_kelly_signal.available)
+            and (not trade_signal.available or not euro_kelly_signal.available)
             and (not snapshot_trend_signal.available or snapshot_trend_signal.score < 0.08)
         ):
             cap = 0.55 if depth <= 1.25 else 0.45
@@ -1890,6 +2265,9 @@ class Predictor:
 
 
 def parse_match(item: dict[str, Any]) -> Match:
+    if "eventId" in item:
+        return parse_newspdex_match(item)
+
     if isinstance(item.get("Match"), dict) and isinstance(item.get("BaseInfo"), dict):
         match_info = item["Match"]
         base_info = item["BaseInfo"]
@@ -1919,6 +2297,139 @@ def parse_match(item: dict[str, Any]) -> Match:
         asian_line=str(item.get("AsianAvrLet", "0")),
         is_stop_update=bool(item.get("IsStopUpdate", False)),
         raw=item,
+    )
+
+
+def parse_newspdex_match(item: dict[str, Any]) -> Match:
+    event_id = int(item["eventId"])
+    asian_line = normalize_newspdex_line(item.get("handicap", item.get("asianLetLine", "0")))
+    raw = dict(item)
+    raw["_source"] = "newspdex"
+    bf_index = item.get("bfIndex")
+    bf_amounts = item.get("bfAmounts")
+    poly_index = item.get("polyIndex")
+    asian_let = item.get("asianLet")
+    handicap_odds = item.get("handicapOdds")
+    raw.update(
+        {
+            "EventId": event_id,
+            "MatchTime": item.get("matchTime"),
+            "HomeTeam": item.get("homeTeam", ""),
+            "AwayTeam": item.get("awayTeam", ""),
+            "LeagueId": item.get("leagueId"),
+            "SortName": item.get("leagueName", ""),
+            "LeagueName": item.get("leagueName", ""),
+            "MatchPath": item.get("leagueName", ""),
+            "AsianAvrLet": asian_line,
+            "BfIndexHome": amount_to_float(list_get(bf_index, 0)),
+            "BfIndexDraw": amount_to_float(list_get(bf_index, 1)),
+            "BfIndexAway": amount_to_float(list_get(bf_index, 2)),
+            "BfAmountHome": amount_to_float(list_get(bf_amounts, 0)),
+            "BfAmountDraw": amount_to_float(list_get(bf_amounts, 1)),
+            "BfAmountAway": amount_to_float(list_get(bf_amounts, 2)),
+            "BfOddsHome": to_float_or_none(item.get("bfPriceHome")) or 0.0,
+            "BfOddsDraw": to_float_or_none(item.get("bfPriceDraw")) or 0.0,
+            "BfOddsAway": to_float_or_none(item.get("bfPriceAway")) or 0.0,
+            "EuroAvrHome": to_float_or_none(item.get("euroHome")) or 0.0,
+            "EuroAvrDraw": to_float_or_none(item.get("euroDraw")) or 0.0,
+            "EuroAvrAway": to_float_or_none(item.get("euroAway")) or 0.0,
+            "KellyHome": to_float_or_none(item.get("kellyHome")) or 0.0,
+            "KellyDraw": to_float_or_none(item.get("kellyDraw")) or 0.0,
+            "KellyAway": to_float_or_none(item.get("kellyAway")) or 0.0,
+            "AsianAvrHome": to_float_or_none(list_get(asian_let, 0))
+            or to_float_or_none(list_get(handicap_odds, 0))
+            or 0.0,
+            "AsianAvrAway": to_float_or_none(list_get(asian_let, 1))
+            or to_float_or_none(list_get(handicap_odds, 2))
+            or 0.0,
+            "PolyIndexHome": amount_to_float(list_get(poly_index, 0)),
+            "PolyIndexDraw": amount_to_float(list_get(poly_index, 1)),
+            "PolyIndexAway": amount_to_float(list_get(poly_index, 2)),
+        }
+    )
+    return Match(
+        event_id=event_id,
+        match_time=parse_datetime(str(item["matchTime"])),
+        home=str(item.get("homeTeam", "")),
+        away=str(item.get("awayTeam", "")),
+        league_id=to_int_or_none(item.get("leagueId")),
+        league_name=str(item.get("leagueName", "")),
+        asian_line=asian_line,
+        is_stop_update=bool(item.get("isStopUpdate", False)) or str(item.get("status", "")) == "finished",
+        raw=raw,
+    )
+
+
+def newspdex_upcoming_dates(now: datetime | None = None) -> list[str]:
+    now = now or datetime.now(timezone.utc)
+    local = now.astimezone()
+    dates = ["today-window"]
+    for offset in range(3):
+        day = local + timedelta(days=offset)
+        dates.append(day.strftime("%Y-%m-%d"))
+    return list(dict.fromkeys(dates))
+
+
+def detail_rows_by_key(payload: dict[str, Any], section: str) -> dict[str, dict[str, Any]]:
+    rows = payload.get(section)
+    if not isinstance(rows, list):
+        return {}
+    return {str(row.get("key")): row for row in rows if isinstance(row, dict)}
+
+
+def enrich_newspdex_detail_raw(raw: dict[str, Any], payload: dict[str, Any]) -> None:
+    standard = detail_rows_by_key(payload, "standard")
+    key_map = {"home": "Home", "draw": "Draw", "away": "Away"}
+    for row_key, legacy_key in key_map.items():
+        row = standard.get(row_key)
+        if not row:
+            continue
+        raw[f"BfIndex{legacy_key}"] = amount_to_float(row.get("bfIndex", raw.get(f"BfIndex{legacy_key}", 0)))
+        raw[f"BfAmount{legacy_key}"] = amount_to_float(
+            row.get("turnover", raw.get(f"BfAmount{legacy_key}", 0))
+        )
+        raw[f"BfPayout{legacy_key}"] = amount_to_float(row.get("pnl", raw.get(f"BfPayout{legacy_key}", 0)))
+        raw[f"BfOdds{legacy_key}"] = to_float_or_none(row.get("price")) or raw.get(f"BfOdds{legacy_key}", 0)
+        raw[f"EuroAvr{legacy_key}"] = to_float_or_none(row.get("euroAvg")) or raw.get(
+            f"EuroAvr{legacy_key}", 0
+        )
+    handicap = detail_rows_by_key(payload, "handicap")
+    if handicap:
+        home = handicap.get("home")
+        away = handicap.get("away")
+        line = handicap.get("line")
+        if home:
+            raw["AsianAvrHome"] = to_float_or_none(home.get("price")) or raw.get("AsianAvrHome", 0)
+            raw["HandicapBfIndexHome"] = amount_to_float(home.get("bfIndex", 0))
+            raw["HandicapBfAmountHome"] = amount_to_float(home.get("turnover", 0))
+        if away:
+            raw["AsianAvrAway"] = to_float_or_none(away.get("price")) or raw.get("AsianAvrAway", 0)
+            raw["HandicapBfIndexAway"] = amount_to_float(away.get("bfIndex", 0))
+            raw["HandicapBfAmountAway"] = amount_to_float(away.get("turnover", 0))
+        if line and line.get("price") not in (None, ""):
+            raw["AsianAvrLet"] = normalize_newspdex_line(line.get("price"))
+
+
+def merge_match_detail(base: Match, detail: Match) -> Match:
+    raw = dict(base.raw)
+    for key, value in detail.raw.items():
+        old = raw.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, (int, float)) and value == 0 and old not in (None, "", 0):
+            continue
+        raw[key] = value
+    asian_line = detail.asian_line if line_depth(detail.asian_line) > 0 or line_depth(base.asian_line) == 0 else base.asian_line
+    return Match(
+        event_id=base.event_id,
+        match_time=detail.match_time if detail.match_time else base.match_time,
+        home=detail.home or base.home,
+        away=detail.away or base.away,
+        league_id=detail.league_id if detail.league_id is not None else base.league_id,
+        league_name=detail.league_name or base.league_name,
+        asian_line=asian_line,
+        is_stop_update=base.is_stop_update or detail.is_stop_update,
+        raw=raw,
     )
 
 
@@ -1994,6 +2505,55 @@ def to_int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def to_float_or_none(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def list_get(values: Any, index: int, default: Any = 0) -> Any:
+    if isinstance(values, (list, tuple)) and len(values) > index:
+        return values[index]
+    return default
+
+
+def normalize_newspdex_line(value: Any) -> str:
+    if value in (None, ""):
+        return "0"
+    text = str(value).strip()
+    numbers = re.findall(r"[+-]?\d+(?:\.\d+)?", text)
+    if "/" in text and len(numbers) >= 2:
+        try:
+            return normalize_line_for_spdex(str((float(numbers[0]) + float(numbers[1])) / 2))
+        except ValueError:
+            pass
+    if numbers:
+        return normalize_line_for_spdex(numbers[0])
+    return normalize_line_for_spdex(text)
+
+
+def amount_to_float(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "").replace("$", "")
+    multiplier = 1.0
+    if text.upper().endswith("M"):
+        multiplier = 1_000_000.0
+        text = text[:-1]
+    elif text.upper().endswith("K"):
+        multiplier = 1_000.0
+        text = text[:-1]
+    try:
+        return float(text) * multiplier
+    except ValueError:
+        return 0.0
 
 
 def is_ssl_verify_error(exc: BaseException) -> bool:
@@ -2178,23 +2738,192 @@ def score_dispersion(values: list[float]) -> float:
     return math.sqrt(variance)
 
 
-def score_price_volume(points: list[PriceVolumePoint]) -> tuple[float | None, str]:
-    usable = [point for point in points if point.price > 0]
-    if len(usable) < 2:
-        return None, "走势点不足"
+def median_float(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def percentile_nearest(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = int(round(clamp(q, 0.0, 1.0) * (len(ordered) - 1)))
+    return ordered[index]
+
+
+def _volume_log_volume_vs_time_order_trend(points: list[PriceVolumePoint]) -> tuple[float, str, float, float]:
+    """无稳定时间间隔时：用 ``log1p(成交量)`` 对归一化次序 ``0→1`` 做 OLS 斜率，刻画「量随走势推进」的速率。
+
+    返回 ``(trend_clamped, summary_fragment, early_sum, late_sum)``；后两者为按点数切半的合计，仅作文案参考。
+    """
+    n = len(points)
+    if n < 2:
+        return 0.0, "", 0.0, 0.0
+    xs = [i / max(n - 1, 1) for i in range(n)]
+    ys = [math.log1p(max(p.volume, 0.0)) for p in points]
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    var_x = sum((x - mx) ** 2 for x in xs)
+    if var_x <= 1e-15:
+        return 0.0, "时序方差过小", 0.0, 0.0
+    cov_xy = sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
+    beta = cov_xy / var_x
+    trend = clamp(beta / 2.2, -1, 1)
+    mid = max(1, n // 2)
+    early_flow = sum(p.volume for p in points[:mid])
+    late_flow = sum(p.volume for p in points[mid:])
+    frag = (
+        f"log(1+量)~走势次序回归斜率 β={beta:+.3f}（x:首点→末点）；"
+        f"前/后段量合计(参考) {early_flow:,.0f} / {late_flow:,.0f}"
+    )
+    return trend, frag, early_flow, late_flow
+
+
+def _volume_flow_trend_half_series(points: list[PriceVolumePoint]) -> tuple[float, str, float, float]:
+    """成交量时间结构：优先「相邻时点成交速率」曲线 + log(速率)回归；否则 ``log1p(量)`` 对走势次序回归。
+
+    返回 ``(trend_in_minus1_1, summary_fragment, early_sum, late_sum)``。
+    有时间戳且相邻间隔有效时，用区间中点时间轴上 log(量/小时) 的斜率，并与前 40%/后 40% 时间窗内平均速率对比；
+    否则不用粗糙的「按点数对半」，改用 ``_volume_log_volume_vs_time_order_trend``。
+    """
+    n = len(points)
+    if n < 2:
+        return 0.0, "", 0.0, 0.0
+    timed = [p for p in points if p.update_time is not None]
+    if len(timed) >= 3:
+        intervals: list[dict[str, float]] = []
+        for prev, curr in zip(timed, timed[1:]):
+            prev_time = prev.update_time
+            curr_time = curr.update_time
+            if prev_time is None or curr_time is None:
+                continue
+            seconds = (curr_time - prev_time).total_seconds()
+            if seconds <= 0:
+                continue
+            hours = max(seconds / 3600.0, 1 / 60)
+            volume = max(curr.volume, 0.0)
+            midpoint = prev_time + timedelta(seconds=seconds / 2.0)
+            intervals.append(
+                {
+                    "mid_ts": midpoint.timestamp(),
+                    "hours": hours,
+                    "volume": volume,
+                    "rate": volume / hours,
+                }
+            )
+        if len(intervals) >= 2:
+            raw_rates = [item["rate"] for item in intervals]
+            smooth_rates: list[float] = []
+            for index, _rate in enumerate(raw_rates):
+                lo = max(0, index - 1)
+                hi = min(len(raw_rates), index + 2)
+                smooth_rates.append(median_float(raw_rates[lo:hi]))
+            for item, smooth_rate in zip(intervals, smooth_rates):
+                item["smooth_rate"] = smooth_rate
+            start_ts = intervals[0]["mid_ts"]
+            end_ts = intervals[-1]["mid_ts"]
+            span_ts = end_ts - start_ts
+            xs = [0.0 if span_ts <= 0 else (item["mid_ts"] - start_ts) / span_ts for item in intervals]
+            ys = [math.log1p(item["smooth_rate"]) for item in intervals]
+            x_avg = sum(xs) / len(xs)
+            y_avg = sum(ys) / len(ys)
+            variance_x = sum((x - x_avg) ** 2 for x in xs)
+            slope = 0.0 if variance_x <= 0 else sum((x - x_avg) * (y - y_avg) for x, y in zip(xs, ys)) / variance_x
+            slope_score = clamp(slope / 3.2, -1, 1)
+
+            early_items = [item for item, x in zip(intervals, xs) if x <= 0.40]
+            late_items = [item for item, x in zip(intervals, xs) if x >= 0.60]
+            if not early_items or not late_items:
+                mid = max(1, len(intervals) // 2)
+                early_items = intervals[:mid]
+                late_items = intervals[mid:]
+            early_flow = sum(item["volume"] for item in early_items)
+            late_flow = sum(item["volume"] for item in late_items)
+            early_hours = sum(item["hours"] for item in early_items)
+            late_hours = sum(item["hours"] for item in late_items)
+            early_rate = sum(item["smooth_rate"] * item["hours"] for item in early_items) / max(early_hours, 1 / 60)
+            late_rate = sum(item["smooth_rate"] * item["hours"] for item in late_items) / max(late_hours, 1 / 60)
+            denom = early_rate + late_rate
+            if denom <= 0:
+                return 0.0, "各时点成交量接近零", early_flow, late_flow
+            rate_contrast = clamp((late_rate - early_rate) / denom, -1, 1)
+            trend = clamp(0.62 * rate_contrast + 0.38 * slope_score, -1, 1)
+            peak_rate = percentile_nearest(smooth_rates, 0.90)
+            frag = (
+                f"成交速率：前40%时间窗均速 {early_rate:,.0f}/h vs 后40%时间窗 {late_rate:,.0f}/h；"
+                f"log(平滑速率)~归一化时点回归斜率 {slope_score:+.2f}；P90峰值 {peak_rate:,.0f}/h"
+            )
+            return trend, frag, early_flow, late_flow
+
+    return _volume_log_volume_vs_time_order_trend(points)
+
+
+def score_price_volume(points: list[PriceVolumePoint]) -> tuple[float | None, str, dict[str, Any] | None]:
+    """单 selection（主/客）必发价量序列 → [-1,1] 分数与说明。
+
+    第三元 ``meta`` 供 ``_trade_signal`` 在「仅时间趋势、无买/卖」时做跨边对比；点不足时 ``meta`` 为 ``None``。
+    """
+    filtered = [point for point in points if point.price > 0]
+    if len(filtered) < 2:
+        return None, "走势点不足", None
+    usable = sorted(
+        filtered,
+        key=lambda p: p.update_time or datetime.min.replace(tzinfo=timezone.utc),
+    )
+    meta: dict[str, Any] = {"n": len(usable)}
     buy_volume = sum(point.volume for point in usable if point.attr and "买" in point.attr)
     sell_volume = sum(point.volume for point in usable if point.attr and "卖" in point.attr)
-    total_volume = buy_volume + sell_volume
-    volume_score = 0.0 if total_volume <= 0 else (buy_volume - sell_volume) / total_volume
+    labeled = buy_volume + sell_volume
+    total_flow = sum(point.volume for point in usable)
     first_price = usable[0].price
     last_price = usable[-1].price
     price_score = clamp((first_price - last_price) / max(first_price * 0.08, 0.08), -1, 1)
+    raw_trend: float | None = None
+
+    if labeled > 0:
+        branch = "labeled"
+        volume_score = (buy_volume - sell_volume) / labeled
+        reason = (
+            f"买量 {buy_volume:,.0f} / 卖量 {sell_volume:,.0f}，"
+            f"价格 {first_price:.2f}->{last_price:.2f}"
+        )
+    elif total_flow > 0:
+        branch = "trend"
+        raw_trend, trend_frag, _e, _l = _volume_flow_trend_half_series(usable)
+        volume_score = raw_trend
+        n = len(usable)
+        scale = min(1.0, max(0.38, (n - 2) / 5.5))
+        volume_score *= scale
+        concord = (raw_trend or 0.0) * price_score
+        if concord > 0.02:
+            bump = 0.12 * min(abs(raw_trend or 0.0), abs(price_score)) * scale
+            volume_score = clamp(volume_score + math.copysign(bump, raw_trend or 0.0), -1, 1)
+        elif concord < -0.04 and abs(raw_trend or 0.0) > 0.12 and abs(price_score) > 0.08:
+            volume_score *= 0.82
+        reason = (
+            f"成交量时间趋势：{trend_frag}（明细未标注买/卖），"
+            f"价格 {first_price:.2f}->{last_price:.2f}"
+        )
+    else:
+        branch = "flat"
+        volume_score = 0.0
+        reason = (
+            f"买量 {buy_volume:,.0f} / 卖量 {sell_volume:,.0f}，"
+            f"价格 {first_price:.2f}->{last_price:.2f}"
+        )
+
     score = clamp(0.65 * volume_score + 0.35 * price_score, -1, 1)
-    reason = (
-        f"买量 {buy_volume:,.0f} / 卖量 {sell_volume:,.0f}，"
-        f"价格 {first_price:.2f}->{last_price:.2f}"
-    )
-    return score, reason
+    meta["branch"] = branch
+    meta["labeled"] = labeled > 0
+    meta["raw_trend"] = raw_trend
+    meta["volume_score"] = volume_score
+    meta["price_score"] = price_score
+    return score, reason, meta
 
 
 def score_bifa_odds_confirmation(upper_odds: float, lower_odds: float) -> float:
@@ -2381,17 +3110,11 @@ def model_edge_for_water_value(signals: list[Signal]) -> float:
         weight = weights.get(signal.name)
         if weight is None:
             continue
-        if signal.name == "必发成交走势" and is_snapshot_fallback_signal(signal):
-            weight *= 0.45
         total += weight
         weighted += weight * signal.score
     if total <= 0:
         return 0.0
     return clamp(weighted / total, -1, 1)
-
-
-def is_snapshot_fallback_signal(signal: Signal) -> bool:
-    return signal.available and "历史快照兜底" in signal.reason
 
 
 def signal_direction(signal: Signal, threshold: float = 0.08) -> int:
@@ -2981,6 +3704,7 @@ def run_watch(
         f"启动自动快照: 未来 {horizon_hours:g} 小时，检查间隔 {poll_seconds}s，"
         f"状态文件 {store.scheduler_state_path()}"
     )
+    maybe_print_auth_hint(client)
     while True:
         now = datetime.now(timezone.utc)
         try:
@@ -3191,14 +3915,14 @@ def score_snapshot_trade_history(records: list[dict[str, Any]]) -> tuple[float |
 
 def score_snapshot_trade_signal_series(records: list[dict[str, Any]]) -> tuple[float | None, str]:
     series: list[float] = []
-    skipped_fallback = 0
+    skipped_substitute = 0
     for record in records:
         signal = snapshot_signal_map(record).get("必发成交走势")
         if not signal or not signal.get("available"):
             continue
         reason = str(signal.get("reason", ""))
         if "历史快照兜底" in reason:
-            skipped_fallback += 1
+            skipped_substitute += 1
             continue
         series.append(float_or_zero(signal.get("score")))
 
@@ -3207,8 +3931,8 @@ def score_snapshot_trade_signal_series(records: list[dict[str, Any]]) -> tuple[f
     if len(series) == 1:
         evidence = clamp(0.55 * series[0], -1, 1)
         reason = f"真实成交信号历史仅1点 {series[0]:+.2f}，降权证据{evidence:+.2f}"
-        if skipped_fallback:
-            reason += f"，忽略兜底点{skipped_fallback}个"
+        if skipped_substitute:
+            reason += f"，忽略历史替代点{skipped_substitute}个"
         return evidence, reason
 
     total_delta = series[-1] - series[0]
@@ -3227,8 +3951,8 @@ def score_snapshot_trade_signal_series(records: list[dict[str, Any]]) -> tuple[f
         f"真实成交信号历史 {series[0]:+.2f}->{series[-1]:+.2f} "
         f"均值{historical_avg:+.2f} 趋势{score:+.2f}"
     )
-    if skipped_fallback:
-        reason += f"，忽略兜底点{skipped_fallback}个"
+    if skipped_substitute:
+        reason += f"，忽略历史替代点{skipped_substitute}个"
     return score, reason
 
 
@@ -3386,7 +4110,7 @@ PUBLIC_SOURCES = [
         "name": "SPDEX",
         "url": "https://app.spdex.com/pstand/",
         "role": "默认主源：世界杯赛程、必发指数、成交量、盈亏指数、亚盘、欧赔/Kelly",
-        "auth": "公开 Web 接口；非正式 API，结构可能变化",
+        "auth": "公开 Web 接口；可选 .env 中 SPDEX_COOKIE / SPDEX_AUTHORIZATION 附加到 app.spdex.com 请求（见 auth-probe）",
     },
     {
         "name": "The Odds API",
@@ -3452,6 +4176,159 @@ def print_sources() -> None:
         print(f"  鉴权: {source['auth']}")
 
 
+def _match_detail_item_event_id(item: dict[str, Any]) -> int | None:
+    try:
+        if isinstance(item.get("Match"), dict):
+            return int(item["Match"]["EventId"])
+        return int(item["EventId"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def pick_match_detail_item(candidates: list[dict[str, Any]], event_id: int) -> dict[str, Any] | None:
+    for item in candidates:
+        if _match_detail_item_event_id(item) == event_id:
+            return item
+    for item in candidates:
+        try:
+            if parse_match(item).event_id == event_id:
+                return item
+        except (KeyError, TypeError, ValueError):
+            continue
+    return candidates[0] if candidates else None
+
+
+def summarize_match_detail_item(item: dict[str, Any] | None) -> str:
+    if item is None:
+        return "(无可用条目)"
+    lines = [f"IsStopUpdate={bool(item.get('IsStopUpdate', False))}", f"顶层字段数={len(item)}"]
+    bi = item.get("BaseInfo")
+    if isinstance(bi, dict):
+        lines.append(f"BaseInfo 字段数={len(bi)}")
+        for k in ("BfIndexHome", "BfIndexAway", "BfAmountHome", "BfAmountAway", "AsianAvrHome", "AsianAvrAway"):
+            if k in bi:
+                lines.append(f"  {k}={bi.get(k)!r}")
+    return "\n".join(lines)
+
+
+def validate_spdex_auth(client: SpdexClient, event_id: int | None = None) -> str:
+    if event_id is not None:
+        items = client._match_detail_candidates(str(event_id))
+        if not items:
+            raise DataError(f"SPDEX match_detail returned no rows for event_id={event_id}")
+        return f"match_detail JSON OK，event_id={event_id}，条目数={len(items)}"
+    matches = client.world_cup_matches()
+    return f"match_list JSON OK，世界杯比赛数={len(matches)}"
+
+
+def run_auth_cookie(args: argparse.Namespace, env_path: Path) -> int:
+    if args.cookie_stdin:
+        raw_cookie = sys.stdin.read()
+    elif args.cookie:
+        raw_cookie = args.cookie
+    else:
+        raw_cookie = os.environ.get("SPDEX_COOKIE", "")
+
+    cookie = normalize_cookie_value(raw_cookie)
+    if not cookie:
+        print(
+            "没有可验证的 Cookie。请使用 --cookie-stdin 从标准输入读取，或使用 --cookie 传入 Cookie。",
+            file=sys.stderr,
+        )
+        return 2
+
+    client = SpdexClient(
+        timeout=args.timeout,
+        ssl_fallback=not args.no_ssl_fallback,
+        retries=args.retries,
+        curl_fallback=not args.no_curl_fallback,
+        use_env_auth=False,
+        extra_headers={"Cookie": cookie},
+    )
+    try:
+        message = validate_spdex_auth(client, args.event_id)
+    except DataError as exc:
+        print(f"Cookie 验证失败，未更新 {env_path}: {exc}", file=sys.stderr)
+        maybe_print_ssl_warning(client)
+        return 2
+
+    if not args.check:
+        set_env_file_value(env_path, "SPDEX_COOKIE", cookie)
+        os.environ["SPDEX_COOKIE"] = cookie
+        print(f"Cookie 验证通过并已更新 {env_path}: {mask_secret(cookie)}")
+    else:
+        print(f"Cookie 验证通过: {mask_secret(cookie)}")
+    print(message)
+    maybe_print_ssl_warning(client)
+    return 0
+
+
+def run_auth_probe(event_id: int) -> int:
+    """Compare /spdex/match_detail payloads with and without .env auth headers."""
+    plain = SpdexClient(use_env_auth=False)
+    authed = SpdexClient(use_env_auth=True)
+    keyword = str(event_id)
+
+    def fetch_items(client: SpdexClient) -> tuple[list[dict[str, Any]], DataError | None]:
+        try:
+            return client._match_detail_candidates(keyword), None
+        except DataError as exc:
+            return [], exc
+
+    plain_items, plain_error = fetch_items(plain)
+    auth_items, auth_error = fetch_items(authed)
+    print(f"事件 {event_id} | match_detail 无鉴权条目数={len(plain_items)} | 有鉴权条目数={len(auth_items)}")
+    if plain_error:
+        print(f"无鉴权请求失败: {plain_error}", file=sys.stderr)
+    if auth_error:
+        print(f"有鉴权请求失败: {auth_error}", file=sys.stderr)
+    if plain_error and auth_error:
+        maybe_print_ssl_warning(plain)
+        maybe_print_ssl_warning(authed)
+        return 2
+    try:
+        p_item = pick_match_detail_item(plain_items, event_id)
+        a_item = pick_match_detail_item(auth_items, event_id)
+    except DataError as exc:
+        print(f"请求失败: {exc}", file=sys.stderr)
+        return 2
+    if not authed.auth_configured:
+        print(
+            "当前未配置 SPDEX_COOKIE / SPDEX_AUTHORIZATION（或已使用 --no-dotenv），"
+            "下面两栏应一致；配置后若仍一致，说明 app.spdex.com 该接口不区分会员会话。",
+            file=sys.stderr,
+        )
+    print("\n--- 无鉴权 ---")
+    print(summarize_match_detail_item(p_item))
+    print("\n--- 有鉴权（.env 中的 Cookie / Authorization）---")
+    print(summarize_match_detail_item(a_item))
+    if p_item and a_item:
+        pk = set(p_item.keys())
+        ak = set(a_item.keys())
+        only_p = sorted(pk - ak)
+        only_a = sorted(ak - pk)
+        if only_p or only_a:
+            print("\n顶层字段差集:")
+            if only_p:
+                print("  仅无鉴权:", only_p)
+            if only_a:
+                print("  仅有鉴权:", only_a)
+        p_bi = p_item.get("BaseInfo") if isinstance(p_item.get("BaseInfo"), dict) else {}
+        a_bi = a_item.get("BaseInfo") if isinstance(a_item.get("BaseInfo"), dict) else {}
+        if isinstance(p_bi, dict) and isinstance(a_bi, dict):
+            bpk = set(p_bi.keys())
+            bak = set(a_bi.keys())
+            obp = sorted(bpk - bak)
+            oba = sorted(bak - bpk)
+            if obp or oba:
+                print("\nBaseInfo 字段差集:")
+                if obp:
+                    print("  仅无鉴权:", obp)
+                if oba:
+                    print("  仅有鉴权:", oba)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -3475,6 +4352,10 @@ def build_parser() -> argparse.ArgumentParser:
             "      根据本地快照比较 score、必发热度、盈亏压力、盘口/水位变化。\n\n"
             "  python3 worldcup_ah_cli.py watch --limit 20\n"
             "      常驻运行，按 T-24h/T-8h/T-4h/T-3h/T-2h/T-60m/T-30m/T-15m 自动快照并输出预测。\n\n"
+            "  python3 worldcup_ah_cli.py auth-probe --event-id 35035286\n"
+            "      对比无鉴权与 .env 鉴权下 match_detail 返回字段是否不同（会员 Cookie 是否作用于 app.spdex.com）。\n\n"
+            "  python3 worldcup_ah_cli.py auth-cookie --cookie-stdin --event-id 35035286\n"
+            "      从标准输入读取浏览器 Cookie，验证通过后写入 .env 的 SPDEX_COOKIE。\n\n"
             "  python3 worldcup_ah_cli.py sources\n"
             "      查看后续可接入的公开数据源。\n\n"
             "输出说明:\n"
@@ -3499,6 +4380,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-curl-fallback",
         action="store_true",
         help="urllib 请求失败时不使用系统 curl 兜底",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="从该文件加载 KEY=value（不覆盖 shell 已有同名变量）；默认: 与脚本同目录的 .env；不存在则跳过",
+    )
+    parser.add_argument(
+        "--no-dotenv",
+        action="store_true",
+        help="不加载 .env",
     )
     parser.add_argument(
         "--snapshot-dir",
@@ -3568,6 +4461,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch_parser.add_argument("--verbose", action="store_true", help="临场预测窗口显示详细信号")
 
+    auth_probe_parser = subparsers.add_parser(
+        "auth-probe",
+        help="对比鉴权前后 SPDEX match_detail 数据",
+        description=(
+            "各请求一次 /spdex/match_detail（无鉴权 vs 使用 .env 中的 SPDEX_COOKIE / SPDEX_AUTHORIZATION），"
+            "对比条目数、IsStopUpdate、BaseInfo 字段与若干必发/亚盘示例字段。"
+            "若两者始终一致，说明 app.spdex.com 该公开接口可能不识别 new.spdex 登录 Cookie，或需其它请求头。"
+        ),
+    )
+    auth_probe_parser.add_argument("--event-id", type=int, required=True, help="SPDEX EventId")
+
+    auth_cookie_parser = subparsers.add_parser(
+        "auth-cookie",
+        help="更新或验证 .env 中的 SPDEX_COOKIE",
+        description=(
+            "验证浏览器 Cookie 是否能让 app.spdex.com 返回 JSON。"
+            "验证通过后默认写入 .env；加 --check 时只验证不写入。"
+        ),
+    )
+    auth_cookie_group = auth_cookie_parser.add_mutually_exclusive_group()
+    auth_cookie_group.add_argument("--cookie", help="直接传入 Cookie 字符串或完整 Cookie: 请求头")
+    auth_cookie_group.add_argument("--cookie-stdin", action="store_true", help="从标准输入读取 Cookie，避免进入 shell 历史")
+    auth_cookie_parser.add_argument("--check", action="store_true", help="只验证当前 Cookie，不写入 .env")
+    auth_cookie_parser.add_argument(
+        "--event-id",
+        type=int,
+        default=None,
+        help="用指定 event_id 的 match_detail 验证；不填则用 match_list 验证",
+    )
+
     subparsers.add_parser(
         "sources",
         help="列出可后续接入的公开数据源",
@@ -3579,6 +4502,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    env_path = Path(args.env_file) if args.env_file else default_env_file_path()
+    if not args.no_dotenv:
+        load_dotenv_file(env_path)
+
+    if args.command == "auth-cookie":
+        return run_auth_cookie(args, env_path)
+
+    warn_if_credentials_without_cookie()
+
+    if args.command == "auth-probe":
+        return run_auth_probe(args.event_id)
+
     client = SpdexClient(
         timeout=args.timeout,
         ssl_fallback=not args.no_ssl_fallback,
@@ -3597,10 +4532,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"数据获取失败: {exc}", file=sys.stderr)
             return 2
         maybe_print_ssl_warning(client)
+        maybe_print_auth_hint(client)
         return 0
 
     if args.command == "predict":
-        predictor = Predictor(client, SnapshotStore(args.snapshot_dir))
+        store = SnapshotStore(args.snapshot_dir)
+        predictor = Predictor(client, store)
         try:
             if args.all:
                 matches = upcoming_matches(client)[: args.limit]
@@ -3619,6 +4556,7 @@ def main(argv: list[str] | None = None) -> int:
                     print()
                 print_analysis(result, verbose=args.verbose)
         maybe_print_ssl_warning(client)
+        maybe_print_auth_hint(client)
         return 0
 
     if args.command == "snapshot":
@@ -3675,6 +4613,15 @@ def maybe_print_ssl_warning(client: SpdexClient) -> None:
     if client.curl_fallback_used:
         print(
             "提示: 部分 SPDEX 请求已使用系统 curl 兜底完成。",
+            file=sys.stderr,
+        )
+
+
+def maybe_print_auth_hint(client: SpdexClient) -> None:
+    if not client.auth_configured:
+        print(
+            "提示: 如果 SPDEX 返回登录页，请在浏览器登录后把 Cookie 写入 .env 的 "
+            "SPDEX_COOKIE=...；USERNAME/PASSWORD 本身不能绕过验证码登录。",
             file=sys.stderr,
         )
 

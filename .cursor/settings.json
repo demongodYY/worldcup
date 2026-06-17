@@ -1,0 +1,7 @@
+{
+  "plugins": {
+    "browse": {
+      "enabled": true
+    }
+  }
+}
