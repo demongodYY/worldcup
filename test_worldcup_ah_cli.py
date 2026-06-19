@@ -18,9 +18,13 @@ from worldcup_ah_cli import (
     SpdexClient,
     build_scheduled_tasks,
     build_parser,
+    chuqi_trade_points_from_raw,
     current_score_momentum_signal,
+    merge_chuqi_bifa_detail,
     normalize_cookie_value,
     normalize_line_for_spdex,
+    parse_chuqi_bifa_detail,
+    parse_chuqi_match_refs,
     parse_match,
     purchase_decision_from_signals,
     purchase_display_text,
@@ -34,6 +38,7 @@ from worldcup_ah_cli import (
     score_price_volume,
     score_snapshot_signal_history,
     set_env_file_value,
+    signal_summary_text,
     upper_lower_teams,
 )
 from okooo_ah_cli import detail_rows_to_points
@@ -143,6 +148,89 @@ class LoginPageClient(SpdexClient):
 
 
 class WorldCupAhCliTests(unittest.TestCase):
+    def test_parse_chuqi_live_bifa_detail_maps_summary_and_series(self):
+        html = """
+        <html><head><title>英格兰 VS 克罗地亚 - 必发</title></head>
+        <script>
+        window.__state = {
+          allData: [
+            {name:"主",summary:{odds:1.7,amount:34901000,per:"82%",profit:-17687863,payout:-42,hot:.48},
+             echart:[{amount:1000,time:1781701694000},{amount:34901000,time:1781705294000}],detail:[]},
+            {name:"和",summary:{odds:3.95,amount:3820400,per:"9%",profit:27205497,payout:64,hot:.28},
+             echart:[{amount:500,time:1781701694000},{amount:3820400,time:1781705294000}],detail:[]},
+            {name:"客",summary:{odds:6.2,amount:3751200,per:"9%",profit:20298362,payout:48,hot:11.26},
+             echart:[{amount:400,time:1781701694000},{amount:3751200,time:1781705294000}],detail:[]}
+          ]
+        };
+        </script></html>
+        """
+
+        match = parse_chuqi_bifa_detail(13870086, html)
+        home_points = chuqi_trade_points_from_raw(match.raw, "home")
+
+        self.assertEqual(match.event_id, 13870086)
+        self.assertEqual(match.home, "英格兰")
+        self.assertEqual(match.away, "克罗地亚")
+        self.assertEqual(match.raw["BfIndexHome"], 82.0)
+        self.assertEqual(match.raw["BfAmountHome"], 34_901_000)
+        self.assertEqual(match.raw["BfPayoutHome"], -42)
+        self.assertEqual(match.raw["BfHotAway"], 11.26)
+        self.assertEqual(len(home_points), 2)
+        self.assertEqual(home_points[-1].volume, 34_901_000)
+
+    def test_merge_chuqi_bifa_preserves_primary_match_identity(self):
+        base = sample_match(
+            event_id=35035288,
+            asian_line="-0.75",
+            raw={
+                "_source": "newspdex",
+                "AsianAvrLet": "-0.75",
+                "BfIndexHome": 10.0,
+                "BfIndexAway": 20.0,
+            },
+        )
+        detail = parse_chuqi_bifa_detail(
+            13870086,
+            """
+            <title>主队 VS 客队</title>
+            <script>var x={allData:[
+            {name:"主",summary:{odds:1.8,amount:9000,per:"65%",payout:-20},echart:[]},
+            {name:"和",summary:{odds:3.5,amount:1000,per:"10%",payout:30},echart:[]},
+            {name:"客",summary:{odds:4.5,amount:4000,per:"25%",payout:10},echart:[]}
+            ]}</script>
+            """,
+        )
+
+        merged = merge_chuqi_bifa_detail(base, detail)
+
+        self.assertEqual(merged.event_id, 35035288)
+        self.assertEqual(merged.asian_line, "-0.75")
+        self.assertEqual(merged.raw["_source"], "newspdex")
+        self.assertEqual(merged.raw["_bifa_source"], "chuqi")
+        self.assertEqual(merged.raw["_chuqi_id"], 13870086)
+        self.assertEqual(merged.raw["BfIndexHome"], 65.0)
+
+    def test_parse_chuqi_match_refs_from_listing(self):
+        html = """
+        <li class="channel-item" data-status="0">
+          <a href="/football/live-bifa/13870086/">
+            <span class="type">世界杯</span>
+            <span class="date">20:00</span>
+            <p class="name ellipsis">英格兰</p>
+            <p class="name ellipsis">克罗地亚</p>
+            <p class="status">未开赛</p>
+          </a>
+        </li>
+        """
+
+        refs = parse_chuqi_match_refs(html, datetime(2026, 6, 18, tzinfo=timezone.utc))
+
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0].match_id, 13870086)
+        self.assertEqual(refs[0].league_name, "世界杯")
+        self.assertEqual(refs[0].home, "英格兰")
+        self.assertFalse(refs[0].is_finished)
+
     def test_parse_spdex_match_detail_shape(self):
         match = parse_match(
             {
@@ -537,12 +625,32 @@ class WorldCupAhCliTests(unittest.TestCase):
     def test_result_always_exposes_lean_even_when_watch(self):
         predictor = Predictor(FakeClient(handicap_rows=[]))
         result = predictor.analyze(sample_match())
+        data = result.to_dict()
         self.assertIn(result.lean, {"上盘", "下盘", "无明显倾向"})
-        self.assertIn("lean", result.to_dict())
-        self.assertIn("lean_team", result.to_dict())
-        self.assertIn("purchase_side", result.to_dict())
-        self.assertIn("purchase_score", result.to_dict())
+        self.assertIn("lean", data)
+        self.assertIn("lean_team", data)
+        self.assertIn("purchase_side", data)
+        self.assertIn("purchase_score", data)
+        self.assertIn("summary", data["signals"][0])
+        self.assertIn("总结", data["signals"][0]["summary"])
         self.assertIn(result.purchase_side, {"上盘", "下盘", "观望"})
+
+    def test_signal_summary_explains_direction_without_mixing_risk_signals(self):
+        trade_summary = signal_summary_text(
+            Signal("必发成交走势", -0.33, 0.08, True, "成交"),
+            "加纳",
+            "巴拿马",
+        )
+        risk_summary = signal_summary_text(
+            Signal("赢盘门槛风险", -0.60, 0.05, True, "风险高"),
+            "加纳",
+            "巴拿马",
+        )
+
+        self.assertIn("偏下盘(巴拿马)", trade_summary)
+        self.assertIn("临场成交速率", trade_summary)
+        self.assertIn("压制上盘(加纳)", risk_summary)
+        self.assertNotIn("偏下盘", risk_summary)
 
     def test_tiny_score_has_no_clear_lean(self):
         match = sample_match()
@@ -917,6 +1025,48 @@ class WorldCupAhCliTests(unittest.TestCase):
 
         self.assertLess(elasticity_signal.score, 0)
         self.assertIn("水位上升", elasticity_signal.reason)
+
+    def test_market_elasticity_smooths_moderate_water_drop(self):
+        hot_raw = {
+            "BfIndexHome": 50.8,
+            "BfIndexAway": 25.7,
+            "BfAmountHome": 1_691_012.0,
+            "BfAmountAway": 854_161.0,
+            "BfPayoutHome": -798_903.0,
+            "BfPayoutAway": 380_311.0,
+            "BfOddsHome": 2.44,
+            "BfOddsAway": 3.45,
+        }
+        rows = [
+            HandicapRow(51007, "Bet365", 1.93, 1.95, 2.01, 1.88, 0.98, None),
+            HandicapRow(51003, "Ysb88", 1.94, 1.94, 2.01, 1.89, 0.96, None),
+        ]
+        predictor = Predictor(FakeClient(handicap_rows=rows))
+        result = predictor.analyze(sample_match(raw=hot_raw, asian_line="-0.25"))
+        elasticity_signal = next(signal for signal in result.signals if signal.name == "资金/盘口弹性")
+
+        self.assertGreater(elasticity_signal.score, 0.15)
+        self.assertLess(elasticity_signal.score, 0.35)
+        self.assertIn("弹性加分", elasticity_signal.reason)
+
+    def test_purchase_gate_dampens_elasticity_when_trade_and_kelly_conflict(self):
+        decision = purchase_decision_from_signals(
+            match=sample_match(asian_line="-0.25"),
+            weighted_score=-0.005,
+            completeness=100,
+            available_weight=0.95,
+            model_recommendation="观望",
+            signals=[
+                Signal("资金/盘口弹性", 0.42, 0.05, True, "热门方降水"),
+                Signal("必发成交走势", -0.33, 0.08, True, "成交反向"),
+                Signal("欧赔/Kelly", -0.55, 0.07, True, "Kelly反向"),
+                Signal("市场平衡/背离", -0.28, 0.07, True, "背离"),
+                Signal("平局风险", -0.12, 0.07, True, "平局风险"),
+            ],
+        )
+
+        self.assertIn("资金/盘口弹性与成交/Kelly冲突，修正降权", decision.reason)
+        self.assertLess(decision.score, 0.03)
 
     def test_high_water_without_model_value_is_penalized(self):
         raw = {

@@ -9,6 +9,8 @@ commercial or official data providers can be added later.
 from __future__ import annotations
 
 import argparse
+from difflib import SequenceMatcher
+import html as html_lib
 import http.client
 import json
 import math
@@ -30,6 +32,9 @@ from typing import Any
 
 SPDEX_BASE_URL = "https://app.spdex.com/spdexapi"
 SPDEX_WEB_BASE_URL = "https://app.spdex.com"
+CHUQI_BIFA_LIST_URL = "https://www.chuqi.com/data_channel/bifa/"
+CHUQI_BIFA_DETAIL_URL = "https://live.chuqi.com/football/live-bifa/{match_id}/"
+CHINA_TZ = timezone(timedelta(hours=8))
 WORLD_CUP_LEAGUE_ID = 911
 _ENV_VAR_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _COOKIE_HEADER_RE = re.compile(r"cookie\s*:\s*([^'\r\n]+)", re.IGNORECASE)
@@ -325,6 +330,17 @@ class PriceVolumePoint:
 
 
 @dataclass(frozen=True)
+class ChuqiMatchRef:
+    match_id: int
+    match_time: datetime
+    home: str
+    away: str
+    league_name: str
+    status: str = ""
+    is_finished: bool = False
+
+
+@dataclass(frozen=True)
 class EuroTrendPoint:
     refresh_time: datetime | None
     home_price: float
@@ -342,6 +358,77 @@ class Signal:
     weight: float
     available: bool
     reason: str
+
+
+SIGNAL_SUMMARY_FOCUS = {
+    "必发指数": "必发静态热度、成交额、盈亏和价格是否互相确认",
+    "必发成交走势": "临场成交速率、价量变化和两边资金节奏",
+    "亚盘水位": "盘口公司是否用降水、升水或分歧来防守某一边",
+    "欧赔/Kelly": "欧赔变化和 Kelly 风险是否确认同一方向",
+    "市场平衡/背离": "必发热度、盘口、欧赔、成交等信号是否同向",
+    "平局风险": "平局或小胜对上盘赢盘的拖累",
+    "盘口合理性": "实际盘口相对赔率估算盘口是否过深或偏浅",
+    "公司一致性": "主流公司盘口水位是否形成共识",
+    "盘口深度/打穿能力": "当前盘口深度下，上盘是否具备打穿条件",
+    "赢盘门槛风险": "上盘打穿盘口所需确认是否不足",
+    "快照趋势": "本地滚动快照里的 score、热度、水位和盘口变化",
+    "资金/盘口弹性": "资金热度出现后，盘口和水位是否有对应反应",
+    "外部赔率/实力校验": "外部赔率、合理盘口或实力模型是否提供校验",
+    "高低水价值": "当前水位相对模型概率是否有赔率补偿",
+    "临场score变化": "本轮综合分相对历史快照的临场动能",
+    "数据质量": "可用信号覆盖度对置信度的支撑程度",
+}
+
+
+def signal_strength_label(score: float) -> str:
+    abs_score = abs(score)
+    if abs_score >= 0.55:
+        return "强烈"
+    if abs_score >= 0.30:
+        return "中等"
+    if abs_score >= 0.12:
+        return "轻微"
+    return "非常轻微"
+
+
+def signal_summary_text(signal: Signal, upper_team: str, lower_team: str) -> str:
+    focus = SIGNAL_SUMMARY_FOCUS.get(signal.name, "综合评分方向")
+    if not signal.available:
+        return f"总结：数据不可用，本项不参与加权；看点：{focus}。"
+
+    if signal.name == "数据质量":
+        coverage = abs(signal.score)
+        if coverage >= 0.85:
+            quality = "覆盖度较高"
+        elif coverage >= 0.65:
+            quality = "覆盖度基本可用"
+        else:
+            quality = "覆盖度偏低"
+        return f"总结：{quality}，主要影响置信度稳定性，不单独代表上下盘价值；看点：{focus}。"
+
+    if signal.name == "平局风险":
+        if abs(signal.score) < 0.05:
+            return f"总结：平局拖累不明显，对上下盘没有明显推动；看点：{focus}。"
+        strength = signal_strength_label(signal.score)
+        if signal.score < 0:
+            return f"总结：{strength}压制上盘({upper_team})，平局或小胜会削弱赢盘确定性；看点：{focus}。"
+        return f"总结：{strength}缓解上盘({upper_team})风险，胜率缓冲相对足；看点：{focus}。"
+
+    if signal.name == "赢盘门槛风险":
+        if abs(signal.score) < 0.05:
+            return f"总结：赢盘门槛风险不明显，对上下盘没有明显推动；看点：{focus}。"
+        strength = signal_strength_label(signal.score)
+        if signal.score < 0:
+            return f"总结：{strength}压制上盘({upper_team})，说明打穿盘口所需确认不足或风险堆积；看点：{focus}。"
+        return f"总结：{strength}支持上盘({upper_team})，打穿门槛风险暂不突出；看点：{focus}。"
+
+    if abs(signal.score) < 0.05:
+        return f"总结：基本中性，对上下盘没有明显推动；看点：{focus}。"
+
+    strength = signal_strength_label(signal.score)
+    direction = "上盘" if signal.score > 0 else "下盘"
+    team = upper_team if signal.score > 0 else lower_team
+    return f"总结：{strength}偏{direction}({team})，该指标正在向{direction}提供证据；看点：{focus}。"
 
 
 @dataclass(frozen=True)
@@ -466,6 +553,7 @@ class AnalysisResult:
                     "weight": signal.weight,
                     "available": signal.available,
                     "reason": signal.reason,
+                    "summary": signal_summary_text(signal, self.upper_team, self.lower_team),
                 }
                 for signal in self.signals
             ],
@@ -482,6 +570,526 @@ class PurchaseDecision:
     is_reversed: bool
 
 
+def strip_html_tags(value: str) -> str:
+    return html_lib.unescape(re.sub(r"<[^>]+>", "", value or "")).strip()
+
+
+def normalize_match_name(value: str) -> str:
+    text = strip_html_tags(value)
+    text = re.sub(r"\([^)]*\)|（[^）]*）", "", text)
+    text = re.sub(r"[\s·\-._/]+", "", text)
+    return text.strip().lower()
+
+
+def team_similarity(left: str, right: str) -> float:
+    a = normalize_match_name(left)
+    b = normalize_match_name(right)
+    if not a or not b:
+        return 0.0
+    if a in b or b in a:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def parse_percent_value(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if text.endswith("%"):
+        text = text[:-1]
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def extract_js_array_after(text: str, marker: str) -> str | None:
+    marker_pos = text.find(marker)
+    if marker_pos < 0:
+        return None
+    start = text.find("[", marker_pos)
+    if start < 0:
+        return None
+    depth = 0
+    in_string: str | None = None
+    escaped = False
+    for index in range(start, len(text)):
+        ch = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = None
+            continue
+        if ch in ("'", '"'):
+            in_string = ch
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def js_literal_to_json_text(value: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", value, flags=re.S)
+    text = re.sub(r"(^|[\s:\[,])(-?)\.(\d+)", r"\1\g<2>0.\3", text)
+    text = re.sub(r"(?<=[{,])\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", r'"\1":', text)
+    text = re.sub(r"\b(undefined|NaN)\b", "null", text)
+
+    def single_quote_repl(match: re.Match[str]) -> str:
+        inner = match.group(1).replace("\\'", "'")
+        return json.dumps(inner, ensure_ascii=False)
+
+    text = re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", single_quote_repl, text)
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    return text
+
+
+def loads_js_literal(value: str) -> Any:
+    return json.loads(js_literal_to_json_text(value))
+
+
+def parse_chuqi_timestamp(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+    else:
+        text = str(value).strip()
+        try:
+            timestamp = float(text)
+        except ValueError:
+            return parse_datetime_or_none(text)
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000.0
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def parse_chuqi_match_time_from_md(day: datetime, hhmm: str) -> datetime | None:
+    match = re.match(r"^(\d{2}):(\d{2})$", hhmm.strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=CHINA_TZ).astimezone(timezone.utc)
+
+
+def parse_chuqi_match_refs(page_html: str, day: datetime) -> list[ChuqiMatchRef]:
+    blocks = [
+        match.group(0)
+        for match in re.finditer(
+            r"<li\b[^>]*class=[\"'][^\"']*channel-item[^\"']*[\"'][^>]*>.*?</li>",
+            page_html,
+            flags=re.S | re.I,
+        )
+    ]
+    if not blocks:
+        seen_windows: set[int] = set()
+        for match in re.finditer(r"/football/live-bifa/(\d+)/?", page_html):
+            start = max(0, match.start() - 1800)
+            end = min(len(page_html), match.end() + 2400)
+            if start in seen_windows:
+                continue
+            seen_windows.add(start)
+            blocks.append(page_html[start:end])
+
+    refs: list[ChuqiMatchRef] = []
+    seen_ids: set[int] = set()
+    for block in blocks:
+        id_match = re.search(r"/football/live-bifa/(\d+)/?", block)
+        if not id_match:
+            continue
+        match_id = int(id_match.group(1))
+        if match_id in seen_ids:
+            continue
+        names = [
+            strip_html_tags(item)
+            for item in re.findall(
+                r"<p\b[^>]*class=[\"'][^\"']*name\s+ellipsis[^\"']*[\"'][^>]*>(.*?)</p>",
+                block,
+                flags=re.S | re.I,
+            )
+        ]
+        if len(names) < 2:
+            names = [
+                strip_html_tags(item)
+                for item in re.findall(
+                    r"<(?:p|span|div)\b[^>]*class=[\"'][^\"']*(?:team|name)[^\"']*[\"'][^>]*>(.*?)</(?:p|span|div)>",
+                    block,
+                    flags=re.S | re.I,
+                )
+                if strip_html_tags(item)
+            ]
+        if len(names) < 2:
+            continue
+        time_match = re.search(
+            r"<span\b[^>]*class=[\"'][^\"']*date[^\"']*[\"'][^>]*>(\d{2}:\d{2})</span>",
+            block,
+            flags=re.S | re.I,
+        )
+        if not time_match:
+            time_match = re.search(r"(\d{2}:\d{2})", strip_html_tags(block))
+        match_time = parse_chuqi_match_time_from_md(day, time_match.group(1)) if time_match else None
+        if match_time is None:
+            continue
+        league_match = re.search(
+            r"<span\b[^>]*class=[\"'][^\"']*type[^\"']*[\"'][^>]*>(.*?)</span>",
+            block,
+            flags=re.S | re.I,
+        )
+        league_name = strip_html_tags(league_match.group(1)) if league_match else ""
+        status_match = re.search(
+            r"<p\b[^>]*class=[\"'][^\"']*status[^\"']*[\"'][^>]*>(.*?)</p>",
+            block,
+            flags=re.S | re.I,
+        )
+        status = strip_html_tags(status_match.group(1)) if status_match else ""
+        data_status_match = re.search(r"data-status=[\"']?([^\"'\s>]+)", block, flags=re.I)
+        data_status = data_status_match.group(1) if data_status_match else ""
+        is_finished = data_status in {"30", "finished", "end"} or any(
+            marker in status for marker in ("完", "结束", "赛果")
+        )
+        refs.append(
+            ChuqiMatchRef(
+                match_id=match_id,
+                match_time=match_time,
+                home=names[0],
+                away=names[1],
+                league_name=league_name,
+                status=status,
+                is_finished=is_finished,
+            )
+        )
+        seen_ids.add(match_id)
+    return refs
+
+
+def parse_chuqi_all_data(page_html: str) -> list[dict[str, Any]]:
+    array_text = extract_js_array_after(page_html, "allData")
+    if not array_text:
+        raise DataError("Chuqi live-bifa page does not contain allData")
+    data = loads_js_literal(array_text)
+    if not isinstance(data, list):
+        raise DataError("Chuqi allData is not a list")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def _chuqi_detail_teams(page_html: str, fallback: ChuqiMatchRef | None) -> tuple[str, str]:
+    if fallback:
+        return fallback.home, fallback.away
+    title_tag = re.search(r"<title>(.*?)</title>", page_html, flags=re.S | re.I)
+    if title_tag:
+        title = strip_html_tags(title_tag.group(1))
+        title_match = re.search(
+            r"(?:^|[-_|])\s*([^_\-|]+?)\s+(?:VS|vs|v)\s+([^_\-|]+?)(?:\s*[-_|]|$)",
+            title,
+        )
+        if title_match:
+            return strip_html_tags(title_match.group(1)), strip_html_tags(title_match.group(2))
+        title_match = re.search(r"^(.+?)\s+(?:VS|vs|v)\s+(.+?)(?:\s*[-_|]|$)", title)
+        if title_match:
+            return strip_html_tags(title_match.group(1)), strip_html_tags(title_match.group(2))
+    names = [
+        strip_html_tags(item)
+        for item in re.findall(
+            r"<p\b[^>]*class=[\"'][^\"']*team-name[^\"']*[\"'][^>]*>.*?<a\b[^>]*>(.*?)</a>",
+            page_html,
+            flags=re.S | re.I,
+        )
+        if strip_html_tags(item) and not re.match(r"^\[[^\]]+\]$", strip_html_tags(item))
+    ]
+    if len(names) >= 2:
+        return names[0], names[1]
+    return "", ""
+
+
+def chuqi_series_rows(row: dict[str, Any], summary_price: float) -> list[dict[str, Any]]:
+    source = row.get("echart")
+    if not isinstance(source, list) or len(source) < 2:
+        source = row.get("detail")
+    if not isinstance(source, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in source:
+        if not isinstance(item, dict):
+            continue
+        update_time = parse_chuqi_timestamp(item.get("time"))
+        amount = amount_to_float(item.get("amount"))
+        price = to_float_or_none(item.get("odds")) or summary_price
+        if amount <= 0:
+            continue
+        rows.append(
+            {
+                "price": price,
+                "volume": amount,
+                "time": update_time.isoformat() if update_time else None,
+            }
+        )
+    return rows
+
+
+def parse_chuqi_bifa_detail(match_id: int, page_html: str, ref: ChuqiMatchRef | None = None) -> Match:
+    rows = parse_chuqi_all_data(page_html)
+    home, away = _chuqi_detail_teams(page_html, ref)
+    match_time = ref.match_time if ref else datetime.now(timezone.utc)
+    league_name = ref.league_name if ref else "世界杯"
+    is_finished = ref.is_finished if ref else False
+    raw: dict[str, Any] = {
+        "_source": "chuqi",
+        "_bifa_source": "chuqi",
+        "_chuqi_id": match_id,
+        "EventId": match_id,
+        "MatchTime": match_time.isoformat(),
+        "HomeTeam": home,
+        "AwayTeam": away,
+        "SortName": league_name,
+        "LeagueName": league_name,
+        "MatchPath": league_name,
+        "AsianAvrLet": "0",
+    }
+    trade_series: dict[str, list[dict[str, Any]]] = {}
+    label_map = {
+        "主": ("Home", "home"),
+        "主胜": ("Home", "home"),
+        "和": ("Draw", "draw"),
+        "平": ("Draw", "draw"),
+        "平局": ("Draw", "draw"),
+        "客": ("Away", "away"),
+        "客胜": ("Away", "away"),
+    }
+    for row in rows:
+        label = str(row.get("name", "")).strip()
+        mapped = label_map.get(label)
+        if not mapped:
+            continue
+        legacy_key, selection = mapped
+        summary = row.get("summary")
+        if not isinstance(summary, dict):
+            summary = {}
+        odds = to_float_or_none(summary.get("odds")) or 0.0
+        raw[f"BfOdds{legacy_key}"] = odds
+        raw[f"BfAmount{legacy_key}"] = amount_to_float(summary.get("amount"))
+        raw[f"BfIndex{legacy_key}"] = parse_percent_value(summary.get("per"))
+        raw[f"BfPayout{legacy_key}"] = to_float_or_none(summary.get("payout")) or 0.0
+        raw[f"BfProfit{legacy_key}"] = amount_to_float(summary.get("profit"))
+        raw[f"BfHot{legacy_key}"] = to_float_or_none(summary.get("hot")) or 0.0
+        series = chuqi_series_rows(row, odds)
+        if series:
+            trade_series[selection] = series
+    if "BfIndexHome" not in raw or "BfIndexAway" not in raw:
+        raise DataError("Chuqi live-bifa allData does not include home/away summary")
+    raw["_chuqi_trade_series"] = trade_series
+    raw["_chuqi_trade_point_count"] = sum(len(value) for value in trade_series.values())
+    return Match(
+        event_id=match_id,
+        match_time=match_time,
+        home=home,
+        away=away,
+        league_id=None,
+        league_name=league_name,
+        asian_line="0",
+        is_stop_update=is_finished,
+        raw=raw,
+    )
+
+
+def merge_chuqi_bifa_detail(base: Match, detail: Match) -> Match:
+    raw = dict(base.raw)
+    for key, value in detail.raw.items():
+        if key == "_source" and raw.get("_source"):
+            continue
+        if key.startswith("Bf") or key.startswith("_chuqi") or key == "_bifa_source":
+            if value not in (None, ""):
+                raw[key] = value
+    raw["_bifa_source"] = "chuqi"
+    return replace(base, raw=raw)
+
+
+def attach_chuqi_id(match: Match, chuqi_id: int) -> Match:
+    raw = dict(match.raw)
+    raw["_chuqi_id"] = int(chuqi_id)
+    return replace(match, raw=raw)
+
+
+def chuqi_trade_points_from_raw(raw: dict[str, Any], selection: str) -> list[PriceVolumePoint]:
+    series = raw.get("_chuqi_trade_series")
+    if not isinstance(series, dict):
+        return []
+    rows = series.get(selection)
+    if not isinstance(rows, list):
+        return []
+    points: list[PriceVolumePoint] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        points.append(
+            PriceVolumePoint(
+                price=to_float_or_none(row.get("price")) or 0.0,
+                volume=amount_to_float(row.get("volume")),
+                update_time=parse_datetime_or_none(row.get("time")),
+                attr="chuqi",
+            )
+        )
+    return points
+
+
+class ChuqiBifaClient:
+    """No-login Chuqi live-bifa reader used as a Betfair/必发 fallback source."""
+
+    def __init__(self, timeout: float = 8.0, curl_fallback: bool = True):
+        self.timeout = timeout
+        self.curl_fallback = curl_fallback
+        self.curl_fallback_used = False
+
+    def _request_headers(self) -> dict[str, str]:
+        return {
+            "User-Agent": "worldcup-ah-cli/1.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+        }
+
+    def _get_text(self, url: str) -> str:
+        request = urllib.request.Request(url, headers=self._request_headers())
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+                raw = resp.read()
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+            if not self.curl_fallback:
+                raise DataError(f"Chuqi request failed: {url}: {exc}") from exc
+            raw = self._curl_bytes(url)
+        for encoding in ("utf-8", "gb18030", "gbk"):
+            try:
+                return raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+    def _curl_bytes(self, url: str) -> bytes:
+        curl = shutil.which("curl")
+        if not curl:
+            raise DataError("curl is not installed")
+        command = [
+            curl,
+            "-L",
+            "--compressed",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            str(max(1, int(self.timeout))),
+            "-A",
+            self._request_headers()["User-Agent"],
+            url,
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, check=True)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            stderr = getattr(exc, "stderr", b"") or str(exc).encode()
+            raise DataError(stderr.decode("utf-8", errors="replace").strip()) from exc
+        self.curl_fallback_used = True
+        return result.stdout
+
+    def matches_for_date(self, day: datetime) -> list[ChuqiMatchRef]:
+        local = day.astimezone(CHINA_TZ)
+        url = f"{CHUQI_BIFA_LIST_URL}?type=0&kind=1&isHome&datetime={local.strftime('%m-%d')}"
+        return parse_chuqi_match_refs(self._get_text(url), local)
+
+    def world_cup_matches(self, now: datetime | None = None) -> list[Match]:
+        now = now or datetime.now(timezone.utc)
+        seen: set[int] = set()
+        matches: list[Match] = []
+        for offset in range(-1, 4):
+            try:
+                refs = self.matches_for_date(now + timedelta(days=offset))
+            except DataError:
+                continue
+            for ref in refs:
+                if ref.match_id in seen or "世界杯" not in ref.league_name:
+                    continue
+                seen.add(ref.match_id)
+                matches.append(
+                    Match(
+                        event_id=ref.match_id,
+                        match_time=ref.match_time,
+                        home=ref.home,
+                        away=ref.away,
+                        league_id=None,
+                        league_name=ref.league_name,
+                        asian_line="0",
+                        is_stop_update=ref.is_finished,
+                        raw={
+                            "_source": "chuqi",
+                            "_bifa_source": "chuqi",
+                            "_chuqi_id": ref.match_id,
+                            "EventId": ref.match_id,
+                            "MatchTime": ref.match_time.isoformat(),
+                            "HomeTeam": ref.home,
+                            "AwayTeam": ref.away,
+                            "SortName": ref.league_name,
+                            "LeagueName": ref.league_name,
+                            "MatchPath": ref.league_name,
+                            "AsianAvrLet": "0",
+                        },
+                    )
+                )
+        return sorted(matches, key=lambda item: item.match_time)
+
+    def find_best_ref(self, match: Match) -> ChuqiMatchRef | None:
+        local_day = match.match_time.astimezone(CHINA_TZ)
+        best: tuple[float, ChuqiMatchRef] | None = None
+        for offset in range(-1, 2):
+            try:
+                refs = self.matches_for_date(local_day + timedelta(days=offset))
+            except DataError:
+                continue
+            for ref in refs:
+                if "世界杯" not in ref.league_name:
+                    continue
+                direct = min(team_similarity(match.home, ref.home), team_similarity(match.away, ref.away))
+                swapped = min(team_similarity(match.home, ref.away), team_similarity(match.away, ref.home))
+                name_score = max(direct, swapped)
+                if name_score < 0.58:
+                    continue
+                hours_delta = abs((match.match_time - ref.match_time).total_seconds()) / 3600
+                if hours_delta > 18:
+                    continue
+                score = 0.82 * name_score + 0.18 * max(0.0, 1 - hours_delta / 18)
+                if best is None or score > best[0]:
+                    best = (score, ref)
+        return best[1] if best else None
+
+    def match_detail(self, match_id: int, ref: ChuqiMatchRef | None = None) -> Match:
+        url = CHUQI_BIFA_DETAIL_URL.format(match_id=match_id)
+        return parse_chuqi_bifa_detail(match_id, self._get_text(url), ref)
+
+    def enrich_match(self, match: Match) -> Match | None:
+        ref: ChuqiMatchRef | None = None
+        chuqi_id = to_int_or_none(match.raw.get("_chuqi_id"))
+        if chuqi_id is None:
+            ref = self.find_best_ref(match)
+            if ref is None:
+                return None
+            chuqi_id = ref.match_id
+        detail = self.match_detail(chuqi_id, ref)
+        if match.home and match.away and detail.home and detail.away:
+            direct = min(team_similarity(match.home, detail.home), team_similarity(match.away, detail.away))
+            if direct < 0.58:
+                raise DataError(
+                    f"楚旗必发详情与 SPDEX 队名不匹配: "
+                    f"SPDEX={match.home} vs {match.away}; Chuqi={detail.home} vs {detail.away}"
+                )
+        return merge_chuqi_bifa_detail(match, detail)
+
+
 class SpdexClient:
     """Small public SPDEX client using only the Python standard library."""
 
@@ -495,6 +1103,7 @@ class SpdexClient:
         *,
         use_env_auth: bool = True,
         extra_headers: dict[str, str] | None = None,
+        chuqi_bifa: bool = True,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -505,6 +1114,9 @@ class SpdexClient:
         self.curl_fallback_used = False
         self.login_required_detected = False
         self.login_required_url: str | None = None
+        self.chuqi = ChuqiBifaClient(timeout=timeout, curl_fallback=curl_fallback) if chuqi_bifa else None
+        self._chuqi_trade_cache: dict[int, dict[str, list[PriceVolumePoint]]] = {}
+        self._chuqi_enriched_cache: dict[int, Match] = {}
         self._extra_headers: dict[str, str] = {}
         if use_env_auth:
             apply_spdex_auth_headers(self._extra_headers)
@@ -743,6 +1355,11 @@ class SpdexClient:
                 return detail
         except DataError as exc:
             errors.append(exc)
+        if self.chuqi is not None:
+            try:
+                return self.chuqi.match_detail(event_id)
+            except DataError as exc:
+                errors.append(exc)
         if errors:
             raise errors[-1]
         raise DataError(f"cannot find event_id={event_id} in SPDEX")
@@ -778,11 +1395,39 @@ class SpdexClient:
                     continue
                 seen.add(match.event_id)
                 matches.append(match)
+        if matches:
+            return sorted(matches, key=lambda item: item.match_time)
+        if self.chuqi is not None:
+            try:
+                chuqi_matches = self.chuqi.world_cup_matches()
+                if chuqi_matches:
+                    return chuqi_matches
+            except DataError as exc:
+                last_error = exc
         if successful_requests == 0:
             if last_error:
                 raise last_error
             raise DataError("SPDEX match list is unavailable")
         return sorted(matches, key=lambda item: item.match_time)
+
+    def enrich_with_chuqi_bifa(self, match: Match) -> Match:
+        if self.chuqi is None:
+            return match
+        cached = self._chuqi_enriched_cache.get(match.event_id)
+        if cached is not None:
+            return merge_chuqi_bifa_detail(match, cached)
+        enriched = self.chuqi.enrich_match(match)
+        if enriched is None:
+            return match
+        self._chuqi_enriched_cache[match.event_id] = enriched
+        selection_points: dict[str, list[PriceVolumePoint]] = {}
+        for selection in ("home", "draw", "away"):
+            points = chuqi_trade_points_from_raw(enriched.raw, selection)
+            if points:
+                selection_points[selection] = points
+        if selection_points:
+            self._chuqi_trade_cache[match.event_id] = selection_points
+        return enriched
 
     def handicap_list(self, event_id: int, asian_line: str) -> list[HandicapRow]:
         data = self._get_json(
@@ -812,6 +1457,9 @@ class SpdexClient:
         return [parse_handicap(item, bookmaker_id=bookmaker_id) for item in rows if isinstance(item, dict)]
 
     def price_volume(self, event_id: int, selection: str) -> list[PriceVolumePoint]:
+        cached = self._chuqi_trade_cache.get(event_id, {}).get(selection)
+        if cached:
+            return cached
         try:
             return self.newspdex_tradeflow(event_id, selection)
         except DataError:
@@ -950,6 +1598,7 @@ class Predictor:
     def analyze(self, match: Match) -> AnalysisResult:
         warnings: list[str] = []
         match = self._refresh_newspdex_detail(match, warnings)
+        match = self._refresh_chuqi_bifa_detail(match, warnings)
         upper_team, lower_team = upper_lower_teams(match)
 
         snapshot_context = self._snapshot_context(match)
@@ -1116,8 +1765,20 @@ class Predictor:
             warnings.append(f"新版详情刷新失败，使用列表实时字段: {exc}")
             return match
 
+    def _refresh_chuqi_bifa_detail(self, match: Match, warnings: list[str]) -> Match:
+        if not hasattr(self.client, "enrich_with_chuqi_bifa"):
+            return match
+        try:
+            enriched = self.client.enrich_with_chuqi_bifa(match)
+        except DataError as exc:
+            warnings.append(f"楚旗必发补充失败: {exc}")
+            return match
+        if enriched.raw.get("_bifa_source") == "chuqi" and match.raw.get("_bifa_source") != "chuqi":
+            warnings.append("已使用楚旗必发数据补充必发指数/成交走势")
+        return enriched
+
     def _handicap_rows(self, match: Match, warnings: list[str]) -> list[HandicapRow]:
-        if match.raw.get("_source") == "newspdex":
+        if match.raw.get("_source") in ("newspdex", "chuqi"):
             return sorted(fallback_handicap_rows_from_base(match), key=bookmaker_priority)
         try:
             rows = self.client.handicap_list(match.event_id, match.asian_line)
@@ -1210,12 +1871,8 @@ class Predictor:
         try:
             upper_selection = selection_for_team(match, upper_team)
             lower_selection = selection_for_team(match, lower_team)
-            if match.raw.get("_source") == "newspdex":
-                upper_points = self.client.newspdex_tradeflow(match.event_id, upper_selection)
-                lower_points = self.client.newspdex_tradeflow(match.event_id, lower_selection)
-            else:
-                upper_points = self.client.price_volume(match.event_id, upper_selection)
-                lower_points = self.client.price_volume(match.event_id, lower_selection)
+            upper_points = self.client.price_volume(match.event_id, upper_selection)
+            lower_points = self.client.price_volume(match.event_id, lower_selection)
         except DataError as exc:
             warnings.append(str(exc))
             return unavailable_signal("必发成交走势", WEIGHTS["bifa_trade"], "成交走势接口不可用")
@@ -1317,7 +1974,7 @@ class Predictor:
     def _euro_kelly_signal(
         self, match: Match, upper_team: str, lower_team: str, warnings: list[str]
     ) -> Signal:
-        if match.raw.get("_source") == "newspdex":
+        if match.raw.get("_source") in ("newspdex", "chuqi"):
             return fallback_euro_kelly_signal(match, upper_team, lower_team)
         try:
             points = self.client.euro_trend(match.event_id)
@@ -1807,12 +2464,17 @@ class Predictor:
             reaction -= 0.24
             reasons.append("必发价格未确认")
 
-        if hot_water_move < -0.035:
-            reaction += 0.34
-            reasons.append(f"{hot_team}水位下降 {hot_water_move:+.3f}")
-        elif hot_water_move > 0.035:
-            reaction -= 0.42
-            reasons.append(f"{hot_team}水位上升 {hot_water_move:+.3f}")
+        water_threshold = 0.035
+        if hot_water_move < -water_threshold:
+            water_scale = clamp((abs(hot_water_move) - water_threshold) / 0.11, 0, 1)
+            water_bonus = 0.16 + 0.14 * water_scale
+            reaction += water_bonus
+            reasons.append(f"{hot_team}水位下降 {hot_water_move:+.3f}，弹性加分 {water_bonus:.2f}")
+        elif hot_water_move > water_threshold:
+            water_scale = clamp((hot_water_move - water_threshold) / 0.11, 0, 1)
+            water_penalty = 0.24 + 0.18 * water_scale
+            reaction -= water_penalty
+            reasons.append(f"{hot_team}水位上升 {hot_water_move:+.3f}，弹性扣分 {water_penalty:.2f}")
         elif rows:
             reaction -= 0.10
             reasons.append("盘口水位反应偏弱")
@@ -2138,11 +2800,21 @@ class Predictor:
 
             if market_elasticity_signal.available:
                 if elasticity_confirm >= 0.12:
-                    components.append(0.16 * hot_direction)
-                    reasons.append("资金/盘口弹性确认热门方")
+                    weight = 0.16
+                    if trade_confirm <= -0.10 and euro_confirm <= -0.10:
+                        weight = 0.06
+                        reasons.append("资金/盘口弹性确认热门方但成交/Kelly仍背离，降权")
+                    else:
+                        reasons.append("资金/盘口弹性确认热门方")
+                    components.append(weight * hot_direction)
                 elif elasticity_confirm <= -0.12:
-                    components.append(-0.20 * hot_direction)
-                    reasons.append("资金/盘口弹性背离热门方")
+                    weight = 0.20
+                    if trade_confirm >= 0.10 and euro_confirm >= 0.10:
+                        weight = 0.08
+                        reasons.append("资金/盘口弹性背离热门方但成交/Kelly同步，降权")
+                    else:
+                        reasons.append("资金/盘口弹性背离热门方")
+                    components.append(-weight * hot_direction)
 
             if external_consensus_signal.available:
                 if external_confirm >= 0.12:
@@ -3322,6 +3994,15 @@ def purchase_decision_from_signals(
     market_elasticity = lookup.get("资金/盘口弹性")
     if secondary_enabled and market_elasticity and market_elasticity.available and abs(market_elasticity.score) >= 0.12:
         elasticity_shift = 0.12 * market_elasticity.score
+        elasticity_direction = math.copysign(1.0, market_elasticity.score)
+        conflict_count = 0
+        for core_name in ("必发成交走势", "欧赔/Kelly"):
+            core_signal = lookup.get(core_name)
+            if core_signal and core_signal.available and elasticity_direction * core_signal.score <= -0.10:
+                conflict_count += 1
+        if conflict_count >= 2:
+            elasticity_shift *= 0.45
+            reasons.append("资金/盘口弹性与成交/Kelly冲突，修正降权")
         adjusted_score += elasticity_shift
         reasons.append(f"资金/盘口弹性修正 {elasticity_shift:+.2f}")
 
@@ -3569,7 +4250,8 @@ def print_analysis(result: AnalysisResult, verbose: bool = False) -> None:
     for signal in result.signals:
         if verbose or signal.available:
             mark = "OK" if signal.available else "NA"
-            print(f"  [{mark}] {signal.name}: {signal.score:+.3f} - {signal.reason}")
+            summary = signal_summary_text(signal, result.upper_team, result.lower_team)
+            print(f"  [{mark}] {signal.name}: {signal.score:+.3f} - {signal.reason}；{summary}")
     for warning in result.warnings:
         print(f"  [WARN] {warning}")
 
@@ -4113,6 +4795,12 @@ PUBLIC_SOURCES = [
         "auth": "公开 Web 接口；可选 .env 中 SPDEX_COOKIE / SPDEX_AUTHORIZATION 附加到 app.spdex.com 请求（见 auth-probe）",
     },
     {
+        "name": "楚旗 live-bifa",
+        "url": "https://www.chuqi.com/data_channel/bifa/",
+        "role": "默认补充源：匿名页面解析必发指数、成交额、盈亏、必发赔率和成交曲线；可在 SPDEX tradeflow 不可用时补趋势",
+        "auth": "公开网页，无 API Key；只作为必发补充，不提供完整亚盘公司水位",
+    },
+    {
         "name": "The Odds API",
         "url": "https://the-odds-api.com/liveapi/guides/v4/",
         "role": "赔率校验：h2h、spreads、totals，可交叉验证让球方向",
@@ -4244,6 +4932,7 @@ def run_auth_cookie(args: argparse.Namespace, env_path: Path) -> int:
         curl_fallback=not args.no_curl_fallback,
         use_env_auth=False,
         extra_headers={"Cookie": cookie},
+        chuqi_bifa=False,
     )
     try:
         message = validate_spdex_auth(client, args.event_id)
@@ -4265,8 +4954,8 @@ def run_auth_cookie(args: argparse.Namespace, env_path: Path) -> int:
 
 def run_auth_probe(event_id: int) -> int:
     """Compare /spdex/match_detail payloads with and without .env auth headers."""
-    plain = SpdexClient(use_env_auth=False)
-    authed = SpdexClient(use_env_auth=True)
+    plain = SpdexClient(use_env_auth=False, chuqi_bifa=False)
+    authed = SpdexClient(use_env_auth=True, chuqi_bifa=False)
     keyword = str(event_id)
 
     def fetch_items(client: SpdexClient) -> tuple[list[dict[str, Any]], DataError | None]:
@@ -4342,6 +5031,8 @@ def build_parser() -> argparse.ArgumentParser:
             "      列出最近 5 场未开赛世界杯比赛和建议拉取时间。\n\n"
             "  python3 worldcup_ah_cli.py predict --event-id 35035283 --verbose\n"
             "      分析单场比赛，显示推荐、倾向、置信度和各信号理由。\n\n"
+            "  python3 worldcup_ah_cli.py predict --event-id 35035283 --chuqi-id 13870086 --verbose\n"
+            "      手动指定楚旗 live-bifa 详情 ID，用其补充必发成交曲线（会校验队名）。\n\n"
             "  python3 worldcup_ah_cli.py predict --all --limit 10\n"
             "      批量分析未开赛世界杯比赛。\n\n"
             "  python3 worldcup_ah_cli.py predict --event-id 35035283 --json\n"
@@ -4359,6 +5050,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python3 worldcup_ah_cli.py sources\n"
             "      查看后续可接入的公开数据源。\n\n"
             "输出说明:\n"
+            "  默认会用楚旗 live-bifa 页面补充必发指数/成交走势；如需只看 SPDEX，请加 --no-chuqi。\n"
             "  推荐 上盘/下盘: 分数超过购买阈值，给出购买方。\n"
             "  推荐 观望(倾向...): 有方向倾向，但置信度或信号一致性不足。\n"
             "  推荐 观望(无明显倾向): |score| < 0.05，方向信号太弱。\n"
@@ -4398,6 +5090,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=SNAPSHOT_DIR_NAME,
         help=f"本地快照目录，默认 {SNAPSHOT_DIR_NAME}；建议保持在 .gitignore 中",
     )
+    parser.add_argument(
+        "--no-chuqi",
+        action="store_true",
+        help="禁用楚旗 live-bifa 必发指数/成交走势补充源",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     upcoming_parser = subparsers.add_parser(
@@ -4420,6 +5117,12 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--limit", type=int, default=20, help="--all 时最多分析多少场")
     predict_parser.add_argument("--json", action="store_true", help="输出 JSON")
     predict_parser.add_argument("--verbose", action="store_true", help="显示所有信号细节")
+    predict_parser.add_argument(
+        "--chuqi-id",
+        type=int,
+        default=None,
+        help="单场预测时手动指定楚旗 live-bifa 详情 ID，补充必发指数和成交曲线",
+    )
 
     snapshot_parser = subparsers.add_parser(
         "snapshot",
@@ -4434,6 +5137,12 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot_group.add_argument("--all", action="store_true", help="保存所有未开赛世界杯比赛快照")
     snapshot_parser.add_argument("--limit", type=int, default=20, help="--all 时最多保存多少场")
     snapshot_parser.add_argument("--verbose", action="store_true", help="保存后同时显示详细分析")
+    snapshot_parser.add_argument(
+        "--chuqi-id",
+        type=int,
+        default=None,
+        help="单场快照时手动指定楚旗 live-bifa 详情 ID，补充必发指数和成交曲线",
+    )
 
     trend_parser = subparsers.add_parser(
         "trend",
@@ -4519,6 +5228,7 @@ def main(argv: list[str] | None = None) -> int:
         ssl_fallback=not args.no_ssl_fallback,
         retries=args.retries,
         curl_fallback=not args.no_curl_fallback,
+        chuqi_bifa=not args.no_chuqi,
     )
 
     if args.command == "sources":
@@ -4538,11 +5248,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "predict":
         store = SnapshotStore(args.snapshot_dir)
         predictor = Predictor(client, store)
+        if args.all and args.chuqi_id is not None:
+            print("--chuqi-id 只能和单场 --event-id 一起使用，不能用于 --all", file=sys.stderr)
+            return 2
         try:
             if args.all:
                 matches = upcoming_matches(client)[: args.limit]
             else:
-                matches = [client.find_match(args.event_id)]
+                match = client.find_match(args.event_id)
+                if args.chuqi_id is not None:
+                    match = attach_chuqi_id(match, args.chuqi_id)
+                matches = [match]
         except DataError as exc:
             print(f"数据获取失败: {exc}", file=sys.stderr)
             return 2
@@ -4562,11 +5278,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "snapshot":
         store = SnapshotStore(args.snapshot_dir)
         predictor = Predictor(client, store)
+        if args.all and args.chuqi_id is not None:
+            print("--chuqi-id 只能和单场 --event-id 一起使用，不能用于 --all", file=sys.stderr)
+            return 2
         try:
             if args.all:
                 matches = upcoming_matches(client)[: args.limit]
             else:
-                matches = [client.find_match(args.event_id)]
+                match = client.find_match(args.event_id)
+                if args.chuqi_id is not None:
+                    match = attach_chuqi_id(match, args.chuqi_id)
+                matches = [match]
         except DataError as exc:
             print(f"数据获取失败: {exc}", file=sys.stderr)
             return 2
