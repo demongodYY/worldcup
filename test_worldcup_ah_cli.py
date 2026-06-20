@@ -9,6 +9,7 @@ from worldcup_ah_cli import (
     EuroTrendPoint,
     HandicapRow,
     Match,
+    OkoooSnapshotReplayClient,
     PriceVolumePoint,
     Predictor,
     ScheduledTask,
@@ -20,12 +21,19 @@ from worldcup_ah_cli import (
     build_parser,
     chuqi_trade_points_from_raw,
     current_score_momentum_signal,
+    euro_trend_point_to_dict,
+    handicap_row_to_dict,
     merge_chuqi_bifa_detail,
     normalize_cookie_value,
     normalize_line_for_spdex,
+    okooo_draw_implied_prob_from_raw,
+    okooo_replay_chain_weak,
+    okooo_static_snapshot_score_adjustment,
     parse_chuqi_bifa_detail,
     parse_chuqi_match_refs,
     parse_match,
+    match_from_dict,
+    price_volume_point_to_dict,
     purchase_decision_from_signals,
     purchase_display_text,
     recommendation_from_score,
@@ -145,6 +153,145 @@ class LoginPageClient(SpdexClient):
     def _open_text(self, request, context=None):
         self.open_calls += 1
         return "<!DOCTYPE html><main class='login-page'>会员登录</main>"
+
+
+class OkoooReplayHeuristicTests(unittest.TestCase):
+    """澳客单条 jsonl 重放：README 多源互证链断裂时的保守回撤与边际补强门控。"""
+
+    def test_snapshot_replay_client_uses_saved_okooo_inputs(self):
+        row = HandicapRow(
+            bookmaker_id=7,
+            name="皇冠",
+            sec_a=1.86,
+            sec_b=2.03,
+            init_sec_a=1.85,
+            init_sec_b=1.97,
+            payout=0.97,
+            update_time=datetime(2026, 6, 20, 16, 30, tzinfo=timezone.utc),
+            source="okooo",
+            init_line=-0.75,
+            latest_line=-0.75,
+            priority_hint=2,
+        )
+        euro_point = EuroTrendPoint(
+            refresh_time=datetime(2026, 6, 20, 16, 30, tzinfo=timezone.utc),
+            home_price=1.77,
+            draw_price=3.75,
+            away_price=5.10,
+            home_kelly=0.91,
+            draw_kelly=0.92,
+            away_kelly=0.94,
+        )
+        trade_point = PriceVolumePoint(
+            price=1.78,
+            volume=12000.0,
+            update_time=datetime(2026, 6, 20, 16, 31, tzinfo=timezone.utc),
+            attr="买",
+        )
+        records = [
+            {
+                "fetched_at": "2026-06-20T16:31:19+00:00",
+                "match": {
+                    "raw": {
+                        "_okooo_handicap_row_data": [handicap_row_to_dict(row)],
+                        "_okooo_euro_trend_points": [euro_trend_point_to_dict(euro_point)],
+                        "_okooo_price_volume_points": {"home": [price_volume_point_to_dict(trade_point)]},
+                    }
+                },
+            }
+        ]
+        client = OkoooSnapshotReplayClient(records)
+
+        rows = client.handicap_list(1315877, "-0.75")
+        euro_points = client.euro_trend(1315877)
+        trade_points = client.price_volume(1315877, "home")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].name, "皇冠")
+        self.assertAlmostEqual(rows[0].latest_line, -0.75)
+        self.assertEqual(rows[0].priority_hint, 2)
+        self.assertEqual(len(euro_points), 1)
+        self.assertAlmostEqual(euro_points[0].away_price, 5.10)
+        self.assertEqual(len(trade_points), 1)
+        self.assertAlmostEqual(trade_points[0].volume, 12000.0)
+
+    def test_okooo_draw_implied_prob_from_percent_field(self):
+        self.assertAlmostEqual(okooo_draw_implied_prob_from_raw({"_okooo_euro_prob_draw": 22.84}), 0.2284, places=4)
+
+    def test_okooo_static_snapshot_score_adjustment(self):
+        m = sample_match(raw={"_source": "okooo"})
+        trade_unavail = Signal("必发成交走势", 0.0, 0.08, False, "无成交")
+        euro_neutral = Signal("欧赔/Kelly", 0.0, 0.07, True, "无走势")
+        adj, note = okooo_static_snapshot_score_adjustment(m, 0.22, trade_unavail, euro_neutral, None)
+        self.assertLess(adj, 0.12)
+        self.assertIsNotNone(note)
+        self.assertIn("保守回撤", note)
+
+    def test_okooo_replay_chain_weak_true_for_single_line_client(self):
+        import json
+
+        raw = {"_source": "okooo", "EuroAvrHome": 1.5, "EuroAvrDraw": 4.0, "EuroAvrAway": 6.0, "KellyHome": 0.9, "KellyDraw": 0.9, "KellyAway": 0.9}
+        line = {
+            "fetched_at": "2026-06-20T00:00:00+00:00",
+            "match": {
+                "event_id": 9990103,
+                "home": "A",
+                "away": "B",
+                "asian_line": "-1",
+                "match_time": "2026-06-22T12:00:00+00:00",
+                "league_id": 911,
+                "league_name": "世界杯",
+                "is_stop_update": False,
+                "raw": raw,
+            },
+        }
+        lines = [json.loads(json.dumps(line))]
+        m = match_from_dict(lines[-1]["match"])
+        client = OkoooSnapshotReplayClient(lines)
+        trade = Predictor(client, None)._trade_signal(m, m.home, m.away, [], None)
+        euro = Predictor(client, None)._euro_kelly_signal(m, m.home, m.away, [])
+        self.assertFalse(trade.available)
+        self.assertTrue(okooo_replay_chain_weak(m, trade, euro, None))
+
+    def test_marginal_mid_lift_skipped_when_okooo_chain_weak(self):
+        from worldcup_ah_cli import UPPER_THRESHOLD, marginal_model_score_lift_for_mid_deep_upper
+
+        m = sample_match(raw={"_source": "okooo"}, asian_line="-1")
+        trade = Signal("必发成交走势", 0.0, 0.08, False, "")
+        euro = Signal("欧赔/Kelly", 0.0, 0.07, True, "")
+        mb = Signal("市场平衡/背离", 0.5, 0.07, True, "")
+        dr = Signal("平局风险", -0.1, 0.07, True, "")
+        out, note = marginal_model_score_lift_for_mid_deep_upper(
+            m, 0.10, 0.70, euro, mb, dr, trade, None
+        )
+        self.assertAlmostEqual(out, 0.10)
+        self.assertIsNone(note)
+        bumped, note2 = marginal_model_score_lift_for_mid_deep_upper(
+            sample_match(asian_line="-1"),
+            0.10,
+            0.70,
+            Signal("欧赔/Kelly", 0.5, 0.07, True, ""),
+            mb,
+            dr,
+            Signal("必发成交走势", 0.2, 0.08, True, ""),
+            SnapshotContext(records=[{}, {}], first_metrics={}, last_metrics={}, signal_history_score=0.0, signal_history_reason=""),
+        )
+        self.assertGreaterEqual(bumped, 0.10)
+        self.assertIsNotNone(note2)
+
+    def test_okooo_belgium_style_single_jsonl_becomes_lower_model(self):
+        import json
+
+        root = Path(__file__).resolve().parent
+        path = root / ".okooo_snapshots" / "1315887.jsonl"
+        if not path.is_file():
+            self.skipTest("missing .okooo_snapshots/1315887.jsonl")
+        lines = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        with TemporaryDirectory() as td:
+            store = SnapshotStore(Path(td))
+            res = Predictor(OkoooSnapshotReplayClient(lines), store).analyze(match_from_dict(lines[-1]["match"]))
+        self.assertLess(res.score, -0.12)
+        self.assertEqual(res.model_recommendation, "下盘")
 
 
 class WorldCupAhCliTests(unittest.TestCase):
@@ -752,6 +899,24 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertLessEqual(signal.score, 0.20)
         self.assertIn("当前score仍弱", signal.reason)
 
+    def test_recent_snapshot_damps_live_score_momentum(self):
+        now = datetime.now(timezone.utc)
+        context = SnapshotContext(
+            records=[
+                {"fetched_at": (now - timedelta(hours=1)).isoformat(), "result": {"score": -0.103}},
+                {"fetched_at": now.isoformat(), "result": {"score": -0.230}},
+            ],
+            first_metrics={"score": -0.103},
+            last_metrics={"score": -0.230},
+            signal_history_score=0.0,
+            signal_history_reason="",
+        )
+
+        signal = current_score_momentum_signal(0.113, context)
+
+        self.assertLess(signal.score, 0.35)
+        self.assertIn("上一快照仅", signal.reason)
+
     def test_live_score_momentum_reduces_stale_snapshot_boost(self):
         decision = purchase_decision_from_signals(
             match=sample_match(asian_line="-0.5"),
@@ -809,7 +974,10 @@ class WorldCupAhCliTests(unittest.TestCase):
 
         self.assertEqual(decision.side, "观望")
         self.assertFalse(decision.is_reversed)
-        self.assertIn("观望不买", decision.reason)
+        self.assertRegex(
+            decision.reason,
+            r"(观望不买|未同向确认或购买优势不足|方向和购买优势都不足)",
+        )
 
     def test_near_zero_purchase_score_does_not_default_to_lower(self):
         decision = purchase_decision_from_signals(
@@ -823,6 +991,50 @@ class WorldCupAhCliTests(unittest.TestCase):
 
         self.assertEqual(decision.side, "观望")
         self.assertIn("方向和购买优势都不足", decision.reason)
+
+    def test_model_wait_can_buy_upper_with_multi_source_confirmation(self):
+        decision = purchase_decision_from_signals(
+            match=sample_match(asian_line="-1"),
+            weighted_score=0.058,
+            completeness=92,
+            available_weight=0.87,
+            model_recommendation="观望",
+            signals=[
+                Signal("亚盘水位", -0.01, 0.13, True, "静态亚盘均值兜底，已降权"),
+                Signal("欧赔/Kelly", 0.55, 0.07, True, "欧赔强确认上盘"),
+                Signal("市场平衡/背离", 0.16, 0.07, True, "多信号同向偏上盘"),
+                Signal("平局风险", -0.15, 0.07, True, "一球盘附近平局输盘风险"),
+                Signal("盘口深度/打穿能力", 0.24, 0.03, True, "中盘打穿条件改善"),
+                Signal("赢盘门槛风险", -0.27, 0.05, True, "中盘存在平局/小胜风险"),
+                Signal("快照趋势", 0.19, 0.06, True, "本地快照趋势偏上盘"),
+                Signal("外部赔率/实力校验", 0.16, 0.04, True, "外部实力差确认上盘"),
+                Signal("临场score变化", 0.40, 0.0, True, "临场score回升"),
+            ],
+        )
+
+        self.assertEqual(decision.side, "上盘")
+        self.assertIn("低优势上盘可投资", decision.reason)
+        self.assertNotIn("未同向确认或购买优势不足，不买", decision.reason)
+
+    def test_positive_one_ball_guest_favorite_can_reverse_to_lower_bet(self):
+        """+1、上盘为客队时净胜 1 易走水：陷阱信号明确时购买侧可反向下盘。"""
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent
+        snap = root / "fixtures" / "okooo_positive_one_ball_gate.jsonl"
+        if not snap.is_file():
+            self.skipTest("missing fixtures/okooo_positive_one_ball_gate.jsonl")
+        from worldcup_ah_cli import OkoooSnapshotReplayClient, Predictor, SnapshotStore, match_from_dict
+
+        import json
+
+        lines = [json.loads(ln) for ln in snap.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        match = match_from_dict(lines[-1]["match"])
+        result = Predictor(OkoooSnapshotReplayClient(lines), SnapshotStore(root / ".okooo_snapshots")).analyze(
+            match
+        )
+        self.assertEqual(result.recommendation, "下盘")
+        self.assertIn("最终购买方向保持下盘", result.decision_reason)
 
     def test_new_optimization_signals_are_added(self):
         raw = {
@@ -1180,7 +1392,7 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertGreater(external_signal.score, 0.25)
         self.assertIn("外部让球赔率", external_signal.reason)
 
-    def test_middle_line_cover_risk_downgrades_stale_upper_pick(self):
+    def test_middle_line_cover_risk_downgrades_stale_upper_pick_to_watch(self):
         raw = {
             "BfIndexHome": 41.7,
             "BfIndexAway": 39.1,
@@ -1229,11 +1441,13 @@ class WorldCupAhCliTests(unittest.TestCase):
         predictor = Predictor(MissingTradeEuroClient(handicap_rows=rows), StaticSnapshotStore(records))
         result = predictor.analyze(sample_match(raw=raw, asian_line="-0.75"))
 
-        self.assertEqual(result.recommendation, "上盘")
-        self.assertEqual(result.purchase_side, "上盘")
+        self.assertEqual(result.model_recommendation, "观望")
+        self.assertEqual(result.recommendation, "观望")
+        self.assertEqual(result.purchase_side, "观望")
         self.assertFalse(result.is_reversed)
-        self.assertAlmostEqual(result.purchase_score, result.score)
-        self.assertNotIn("门槛风险向下修正", result.decision_reason)
+        self.assertLess(result.purchase_score, result.score)
+        self.assertIn("门槛风险向下修正", result.decision_reason)
+        self.assertIn("未同向确认", result.decision_reason)
         self.assertNotIn("风险优先反向", result.decision_reason)
         cover_signal = next(signal for signal in result.signals if signal.name == "赢盘门槛风险")
         market_signal = next(signal for signal in result.signals if signal.name == "市场平衡/背离")

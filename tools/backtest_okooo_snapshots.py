@@ -6,7 +6,7 @@
   python tools/backtest_okooo_snapshots.py
   python tools/backtest_okooo_snapshots.py --scores-json path/to.json
   python tools/backtest_okooo_snapshots.py --list-all
-  python tools/backtest_okooo_snapshots.py --replay
+  python tools/backtest_okooo_snapshots.py --replay [--allow-miss]
 
 `--scores-json` 格式: { "1315857": [2, 0], "1316320": [1, 0] }  （主队进球, 客队进球）
 不传则读取 ``tools/okooo_validate_scores.json``（与 ``okooo_ah_cli.py validate-snapshots`` 默认一致）。
@@ -69,9 +69,9 @@ def last_snapshot(path: Path) -> dict | None:
     return json.loads(lines[-1])
 
 
-def run_replay_predict(snap_dir: Path, scores: dict[int, tuple[int, int]]) -> int:
+def run_replay_predict(snap_dir: Path, scores: dict[int, tuple[int, int]], *, allow_miss: bool) -> int:
     """委托 ``okooo_ah_cli.run_validate_snapshots_from_dir``（与 ``validate-snapshots`` 子命令一致）。"""
-    return run_validate_snapshots_from_dir(snap_dir, scores)
+    return run_validate_snapshots_from_dir(snap_dir, scores, fail_on_miss=not allow_miss)
 
 
 def main() -> int:
@@ -93,6 +93,11 @@ def main() -> int:
         action="store_true",
         help="用快照 jsonl 基础数据 + 当前 Predictor 重放（非磁盘上旧的 result 字段）",
     )
+    ap.add_argument(
+        "--allow-miss",
+        action="store_true",
+        help="与 okooo_ah_cli validate-snapshots --allow-miss 一致：存在未中方向时仍退出 0",
+    )
     args = ap.parse_args()
 
     try:
@@ -104,7 +109,7 @@ def main() -> int:
         if not args.snapshot_dir.is_dir():
             print(f"error: not a directory: {args.snapshot_dir}", file=sys.stderr)
             return 1
-        return run_replay_predict(args.snapshot_dir, scores)
+        return run_replay_predict(args.snapshot_dir, scores, allow_miss=args.allow_miss)
     snap_dir: Path = args.snapshot_dir
     if not snap_dir.is_dir():
         print(f"error: not a directory: {snap_dir}", file=sys.stderr)

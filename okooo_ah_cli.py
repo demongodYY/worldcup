@@ -18,6 +18,7 @@ import os
 import re
 import ssl
 import sys
+import unicodedata
 import time
 import urllib.error
 import urllib.parse
@@ -28,6 +29,9 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 from zoneinfo import ZoneInfo
+
+# 本脚本所在目录即仓库根；默认快照与比分表相对此目录解析，避免当前工作目录不在仓库根时找不到路径。
+_REPO_ROOT = Path(__file__).resolve().parent
 
 from worldcup_ah_cli import (
     DataError,
@@ -42,13 +46,16 @@ from worldcup_ah_cli import (
     SnapshotStore,
     clamp,
     default_env_file_path,
+    euro_trend_point_to_dict,
     format_local,
+    handicap_row_to_dict,
     is_ssl_verify_error,
     line_depth,
     line_value,
     load_dotenv_file,
     match_from_dict,
     normalize_line_for_spdex,
+    price_volume_point_to_dict,
     print_analysis,
     print_snapshot_saved,
     print_snapshot_trend,
@@ -60,10 +67,10 @@ from worldcup_ah_cli import (
 OKOOO_BASE_URL = "https://www.okooo.cn"
 OKOOO_DEFAULT_ISSUE = "dqjc"
 OKOOO_TZ = ZoneInfo("Asia/Shanghai")
-OKOOO_SNAPSHOT_DIR = ".okooo_snapshots"
+OKOOO_SNAPSHOT_DIR = str(_REPO_ROOT / ".okooo_snapshots")
 
-# 默认复盘比分表（与仓库根相对路径）；编辑该 JSON 即可增删赛果，无需改代码
-DEFAULT_OKOOO_VALIDATE_SCORES_PATH = Path(__file__).resolve().parent / "tools" / "okooo_validate_scores.json"
+# 默认复盘比分表；编辑该 JSON 即可增删赛果，无需改代码
+DEFAULT_OKOOO_VALIDATE_SCORES_PATH = _REPO_ROOT / "tools" / "okooo_validate_scores.json"
 
 
 def load_okooo_validate_scores(path: Path | None) -> dict[int, tuple[int, int]]:
@@ -113,15 +120,102 @@ def _replay_recommendation_outcome(
     return "na", m
 
 
-def run_validate_snapshots_from_dir(snapshot_root: Path, scores: dict[int, tuple[int, int]]) -> int:
+def _text_display_width(s: str) -> int:
+    """终端常见等宽字体下的大致显示宽度（中日韩等宽为 2）。
+
+    对 east_asian_width 为 A（模糊）的字符按 2 计，贴近多数中文环境下终端对「·、」等符号的实际占位。
+    """
+    w = 0
+    for ch in s:
+        ea = unicodedata.east_asian_width(ch)
+        if ea in ("F", "W"):
+            w += 2
+        elif ea == "A":
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def _pad_display_cell(s: str, width: int, *, align: str = "left") -> str:
+    pad = max(0, width - _text_display_width(s))
+    if align == "right":
+        return " " * pad + s
+    return s + " " * pad
+
+
+def _truncate_display(s: str, max_width: int) -> str:
+    if _text_display_width(s) <= max_width:
+        return s
+    out: list[str] = []
+    w = 0
+    for ch in s:
+        ea = unicodedata.east_asian_width(ch)
+        if ea in ("F", "W"):
+            cw = 2
+        elif ea == "A":
+            cw = 2
+        else:
+            cw = 1
+        if w + cw > max_width - 1:
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out) + "…"
+
+
+# (列内容显示宽度, 数据对齐)；表头左对齐垫满列宽。列间用 | 便于扫读。
+_VALIDATE_SNAPSHOT_ROWSPEC: tuple[tuple[int, str], ...] = (
+    (10, "right"),  # event_id
+    (54, "left"),  # match
+    (8, "right"),  # line
+    (6, "left"),  # rec
+    (6, "left"),  # model
+    (10, "right"),  # score
+    (9, "right"),  # scoreline
+    (6, "left"),  # out
+)
+_VALIDATE_SNAPSHOT_COL_SEP = " | "
+
+
+def _validate_snapshot_rule_line() -> str:
+    """与表体同总显示宽度的一条横线（仅 ASCII，宽度与表一致）。"""
+    tw = sum(w for w, _ in _VALIDATE_SNAPSHOT_ROWSPEC)
+    n = len(_VALIDATE_SNAPSHOT_ROWSPEC)
+    # 与 ``| `` + (cell + `` | ``) * … + `` |`` 的布局一致：首尾各 2，列间 `` | `` 为 3 宽。
+    return "-" * (tw + 3 * (n - 1) + 4)
+
+
+def _format_validate_snapshot_header() -> str:
+    titles = ("event_id", "match", "line", "rec", "model", "score", "scoreline", "out")
+    cells = [_pad_display_cell(t, w, align="left") for t, (w, _) in zip(titles, _VALIDATE_SNAPSHOT_ROWSPEC)]
+    return "| " + _VALIDATE_SNAPSHOT_COL_SEP.join(cells) + " |"
+
+
+def _format_validate_snapshot_row(values: tuple[str, ...]) -> str:
+    cells: list[str] = []
+    for i, (v, (w, a)) in enumerate(zip(values, _VALIDATE_SNAPSHOT_ROWSPEC)):
+        s = _truncate_display(v, w) if i == 1 and _text_display_width(v) > w else v
+        cells.append(_pad_display_cell(s, w, align=a))
+    return "| " + _VALIDATE_SNAPSHOT_COL_SEP.join(cells) + " |"
+
+
+def run_validate_snapshots_from_dir(
+    snapshot_root: Path, scores: dict[int, tuple[int, int]], *, fail_on_miss: bool = True
+) -> int:
     """仅用 ``snapshot_root`` 下各场 jsonl 的 match 基础数据 + ``Predictor`` 重放，对照已知比分（不访问澳客网）。"""
     store = SnapshotStore(snapshot_root)
     hit = miss = na = 0
-    print("event_id\tmatch\tline\trec\tmodel\tscore\tscoreline\tout")
+    print(_format_validate_snapshot_header())
+    print(_validate_snapshot_rule_line())
     for eid, (hg, ag) in sorted(scores.items()):
         path = snapshot_root / f"{eid}.jsonl"
         if not path.is_file():
-            print(f"{eid}\t(missing {path.name})\t\t\t\t\t\t")
+            print(
+                _format_validate_snapshot_row(
+                    (str(eid), f"(missing {path.name})", "", "", "", "", "", "")
+                )
+            )
             continue
         lines = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
         if not lines:
@@ -146,8 +240,18 @@ def run_validate_snapshots_from_dir(snapshot_root: Path, scores: dict[int, tuple
         else:
             na += 1
         print(
-            f"{eid}\t{match.home} vs {match.away}\t{match.asian_line}\t{res.recommendation}\t"
-            f"{res.model_recommendation}\t{res.score:+.3f}\t{hg}-{ag}\t{out}"
+            _format_validate_snapshot_row(
+                (
+                    str(eid),
+                    f"{match.home} vs {match.away}",
+                    str(match.asian_line),
+                    res.recommendation,
+                    res.model_recommendation,
+                    f"{res.score:+.3f}",
+                    f"{hg}-{ag}",
+                    out,
+                )
+            )
         )
     denom = hit + miss
     if denom:
@@ -156,7 +260,7 @@ def run_validate_snapshots_from_dir(snapshot_root: Path, scores: dict[int, tuple
         )
     else:
         print("\n重放：无有效方向场次")
-    return 0 if miss == 0 else 1
+    return 0 if (not fail_on_miss or miss == 0) else 1
 
 
 PAGE_KINDS = {
@@ -198,7 +302,7 @@ DETAIL_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-TOP_HANDICAP_BOOKS = {
+TOP_HANDICAP_BOOKS = (
     "Bet365",
     "澳门彩票",
     "皇冠",
@@ -207,7 +311,7 @@ TOP_HANDICAP_BOOKS = {
     "Interwetten",
     "SNAI",
     "Mansion 88",
-}
+)
 
 
 @dataclass(frozen=True)
@@ -466,16 +570,21 @@ def match_meta(block_html: str) -> tuple[str, str, datetime, str, str, str]:
     league = clean_html_text(title.group(2))
     kickoff = parse_kickoff_md(clean_html_text(title.group(3)))
 
+    # 未赛：…<span>主队</span>…<strong>VS</strong><b>客队</b>；已赛复盘：…<span>主队</span><em>(-1)</em><strong>1-1</strong><b>客队</b>
     teams = re.search(
-        r"<span>(.*?)</span>\s*(?P<hc><em\b.*?</em>)?\s*<strong>\s*VS\s*</strong>\s*<b>(.*?)</b>",
+        r"<span>(?P<home>.*?)</span>\s*(?P<hc><em\b[^>]*>.*?</em>)?\s*(?:<strong>\s*VS\s*</strong>\s*<b>(?P<away_vs>.*?)</b>"
+        r"|<strong>\s*\d+\s*-\s*\d+\s*</strong>\s*<b>(?P<away_sc>.*?)</b>)",
         block_html,
         flags=re.I | re.S,
     )
     if not teams:
         raise DataError("cannot parse Okooo teams")
-    home = clean_html_text(teams.group(1))
+    home = clean_html_text(teams.group("home"))
     handicap = signed_lottery_handicap(clean_html_text(teams.group("hc") or ""))
-    away = clean_html_text(teams.group(3))
+    away_raw = teams.group("away_vs") or teams.group("away_sc")
+    if not away_raw:
+        raise DataError("cannot parse Okooo away team")
+    away = clean_html_text(away_raw)
     return jc_code, league, kickoff, home, away, handicap
 
 
@@ -536,7 +645,6 @@ def parse_betfa_html(html_text: str) -> dict[int, OkoooBaseMatch]:
             "SortName": league,
             "LeagueName": league,
             "MatchPath": league,
-            "AsianAvrLet": handicap,
             "BfIndexHome": home_sel.bf_ratio_pct,
             "BfIndexDraw": draw_sel.bf_ratio_pct,
             "BfIndexAway": away_sel.bf_ratio_pct,
@@ -663,6 +771,7 @@ def parse_pankou_html(html_text: str) -> dict[int, OkoooHandicap]:
             if not name or name == "公司名":
                 continue
             init_home = parse_first_number(tds[1])
+            init_line = asian_line_number(tds[2])
             init_away = parse_first_number(tds[3])
             latest_home = parse_first_number(tds[17])
             latest_line = asian_line_number(tds[18])
@@ -680,6 +789,9 @@ def parse_pankou_html(html_text: str) -> dict[int, OkoooHandicap]:
                     payout=0.97,
                     update_time=None,
                     source="okooo",
+                    init_line=init_line,
+                    latest_line=latest_line,
+                    priority_hint=okooo_bookmaker_priority_index(name),
                 )
             )
             if latest_line:
@@ -688,14 +800,20 @@ def parse_pankou_html(html_text: str) -> dict[int, OkoooHandicap]:
             away_waters.append(latest_away)
         if rows:
             if line_values:
-                consensus = normalize_line_for_spdex(str(median(line_values)))
+                consensus_value = median(line_values)
+                consensus = normalize_line_for_spdex(str(consensus_value))
+                avg_rows = [row for row in rows if abs(row.latest_line - consensus_value) <= 0.26]
             else:
+                consensus_value = 0.0
                 consensus = "0"
+                avg_rows = rows
+            if not avg_rows:
+                avg_rows = rows
             out[oid] = OkoooHandicap(
                 rows=rows,
                 consensus_line=consensus,
-                avg_home_water=average(home_waters),
-                avg_away_water=average(away_waters),
+                avg_home_water=average([row.sec_a for row in avg_rows]),
+                avg_away_water=average([row.sec_b for row in avg_rows]),
                 line_samples=line_values,
             )
     return out
@@ -743,7 +861,7 @@ def parse_peilv_html(html_text: str) -> dict[int, OkoooEuroKelly]:
                 kel_d.append(kd)
                 kel_a.append(ka)
             # Optional 初盘凯利（澳客部分模板在 12–14 列；缺失则不在此处填充）
-            if len(tds) >= 16:
+            if len(tds) >= 15:
                 ikh, ikd, ika = (
                     parse_first_number(tds[12]),
                     parse_first_number(tds[13]),
@@ -922,7 +1040,7 @@ class OkoooClient:
             raise DataError(f"Okooo match id not found in {self.issue}: {match_id}")
 
         raw = dict(base.raw)
-        asian_line = base.lottery_handicap or "0"
+        asian_line = "0"
         handicap = self.handicap.get(match_id)
         if handicap:
             asian_line = handicap.consensus_line
@@ -930,7 +1048,10 @@ class OkoooClient:
             raw["AsianAvrHome"] = handicap.avg_home_water
             raw["AsianAvrAway"] = handicap.avg_away_water
             raw["_okooo_handicap_rows"] = len(handicap.rows)
+            raw["_okooo_handicap_row_data"] = [handicap_row_to_dict(row) for row in handicap.rows]
             raw["_okooo_handicap_line_samples"] = handicap.line_samples[:8]
+        else:
+            raw["_okooo_missing_asian_line"] = True
 
         euro = self.euro_kelly.get(match_id)
         if euro:
@@ -941,6 +1062,7 @@ class OkoooClient:
             raw["KellyDraw"] = euro.kelly_draw
             raw["KellyAway"] = euro.kelly_away
             raw["_okooo_euro_bookmakers"] = euro.bookmaker_count
+            raw["_okooo_euro_trend_points"] = [euro_trend_point_to_dict(point) for point in euro.points]
 
         zhishu = self.zhishu.get(match_id)
         if zhishu:
@@ -1012,12 +1134,6 @@ class OkoooClient:
             depth = line_depth(match.asian_line)
             if depth > 0:
                 raw["ModelFairLineDepth"] = depth
-            if upper_key == "Home":
-                raw["ExternalSpreadUpperPrice"] = handicap.avg_home_water
-                raw["ExternalSpreadLowerPrice"] = handicap.avg_away_water
-            elif upper_key == "Away":
-                raw["ExternalSpreadUpperPrice"] = handicap.avg_away_water
-                raw["ExternalSpreadLowerPrice"] = handicap.avg_home_water
 
     def handicap_list(self, event_id: int, _asian_line: str) -> list[HandicapRow]:
         data = self.handicap.get(event_id)
@@ -1039,6 +1155,14 @@ class OkoooClient:
             else:
                 self._trend_cache[event_id] = self._fetch_trade_trend(event_id)
         return list(self._trend_cache[event_id].get(selection, []))
+
+    def attach_snapshot_replay_fields(self, match: Match) -> None:
+        trend = self._trend_cache.get(match.event_id)
+        if trend:
+            match.raw["_okooo_price_volume_points"] = {
+                selection: [price_volume_point_to_dict(point) for point in trend.get(selection, [])]
+                for selection in ("home", "draw", "away")
+            }
 
     def _fetch_exchanges_detail(self, event_id: int) -> dict[str, list[PriceVolumePoint]]:
         base_url = f"{OKOOO_BASE_URL}/soccer/match/{event_id}/exchanges/detail/"
@@ -1095,11 +1219,18 @@ class OkoooClient:
 
 
 def okooo_bookmaker_priority(row: HandicapRow) -> tuple[int, str]:
-    clean = re.sub(r"\s+", "", row.name)
-    for idx, name in enumerate(TOP_HANDICAP_BOOKS):
-        if re.sub(r"\s+", "", name) in clean:
-            return (idx, row.name)
-    return (100, row.name)
+    hint = row.priority_hint
+    if hint is not None:
+        return (hint, row.name)
+    return (okooo_bookmaker_priority_index(row.name), row.name)
+
+
+def okooo_bookmaker_priority_index(bookmaker_name: str) -> int:
+    clean = re.sub(r"\s+", "", bookmaker_name)
+    for idx, preferred_name in enumerate(TOP_HANDICAP_BOOKS):
+        if re.sub(r"\s+", "", preferred_name) in clean:
+            return idx
+    return 100
 
 
 def parse_trade_trend_payload(trend: list[Any]) -> dict[str, list[PriceVolumePoint]]:
@@ -1365,7 +1496,13 @@ def cmd_validate_snapshots(_client: OkoooClient, store: SnapshotStore, args: arg
     if not root.is_dir():
         print(f"error: snapshot directory not found: {root}", file=sys.stderr)
         return 1
-    return run_validate_snapshots_from_dir(root, scores)
+    return run_validate_snapshots_from_dir(root, scores, fail_on_miss=not args.allow_miss)
+
+
+def attach_snapshot_replay_fields(client: OkoooClient, match: Match) -> None:
+    attach = getattr(client, "attach_snapshot_replay_fields", None)
+    if callable(attach):
+        attach(match)
 
 
 def cmd_predict(client: OkoooClient, store: SnapshotStore, args: argparse.Namespace) -> int:
@@ -1374,6 +1511,7 @@ def cmd_predict(client: OkoooClient, store: SnapshotStore, args: argparse.Namesp
     predictor = Predictor(client, store)
     result = predictor.analyze(match)
     if args.save_snapshot:
+        attach_snapshot_replay_fields(client, result.match)
         path = store.save(result)
         if not args.json:
             print_snapshot_saved(path, result)
@@ -1390,6 +1528,7 @@ def cmd_snapshot(client: OkoooClient, store: SnapshotStore, args: argparse.Names
     for match_id in args.match_ids:
         match = client.build_match(match_id)
         result = predictor.analyze(match)
+        attach_snapshot_replay_fields(client, result.match)
         path = store.save(result)
         print_snapshot_saved(path, result)
     return 0
@@ -1433,6 +1572,7 @@ def cmd_watch(client: OkoooClient, store: SnapshotStore, args: argparse.Namespac
                         flush=True,
                     )
                     result = predictor.analyze(task.match)
+                    attach_snapshot_replay_fields(client, result.match)
                     path = store.save(result, fetched_at=now)
                     print_snapshot_saved(path, result)
                     if task.do_predict:
@@ -1503,6 +1643,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="JSON 如 {\"1315857\":[2,0]}；默认 tools/okooo_validate_scores.json",
+    )
+    val.add_argument(
+        "--allow-miss",
+        action="store_true",
+        help="有「未中」方向时仍退出 0（默认：存在 miss 则退出 1，便于 CI）",
     )
     val.set_defaults(func=cmd_validate_snapshots)
 

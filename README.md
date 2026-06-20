@@ -89,7 +89,10 @@ python3 okooo_ah_cli.py predict --match-id 1316320 --verbose --save-snapshot
 python3 okooo_ah_cli.py snapshot --match-ids 1316320 1316319
 python3 okooo_ah_cli.py trend --match-id 1316320
 python3 okooo_ah_cli.py watch --world-cup --horizon-hours 72 --interval 120 --verbose
+python3 okooo_ah_cli.py --no-dotenv validate-snapshots
 ```
+
+`validate-snapshots`：不访问网络，只读本地 `.okooo_snapshots` 与 `tools/okooo_validate_scores.json`，用当前 `Predictor` 重放并对照已知比分；新保存的澳客快照会携带公司盘口行、欧赔/Kelly 趋势点和已缓存的必发成交走势，旧快照缺少这些字段时会退回快照均水/首末值兜底。复盘表格式与统计说明见 `tools/OKOOO_VALIDATE_REVIEW.md`。存在有方向但未中场次时默认 **退出码 1**；仅打印统计可加 `--allow-miss`。
 
 重要参数：
 
@@ -97,7 +100,7 @@ python3 okooo_ah_cli.py watch --world-cup --horizon-hours 72 --interval 120 --ve
 - `--cookie-file PATH`：从文件读取 Cookie；否则读 `.env` 里的 `OKOOO_COOKIE`。
 - `--detail-max-pages N`：必发明细分页最多抓取页数，默认 5。
 - `--no-trade-trend`：关闭必发明细和近 3 小时成交接口探测。
-- `--snapshot-dir DIR`：快照目录，默认 `.okooo_snapshots` 或 `OKOOO_SNAPSHOT_DIR`。
+- `--snapshot-dir DIR`：快照目录；未指定时默认使用**仓库根**下的 `.okooo_snapshots`（与当前工作目录无关），也可用 `OKOOO_SNAPSHOT_DIR`。
 - `upcoming --world-cup`：只筛世界杯 / 世界盃 / World Cup。
 - `watch --world-cup`：自动观察当前期所有世界杯比赛。
 
@@ -106,11 +109,14 @@ python3 okooo_ah_cli.py watch --world-cup --horizon-hours 72 --interval 120 --ve
 `okooo_ah_cli.py` 会把澳客页面解析成 `Predictor` 能识别的 `Match`、`HandicapRow`、`EuroTrendPoint` 和 `PriceVolumePoint`：
 
 - 必发指数页：`https://www.okooo.cn/jingcai/shuju/betfa/dqjc/`
-  - 提供 match id、对阵、开赛时间、竞彩让球、必发指数、成交额、盈亏、必发赔率。
+  - 提供 match id、对阵、开赛时间、竞彩让球、必发指数、成交额、平局资金、盈亏、必发赔率。
+  - 注意：这里的“竞彩让球”只作为元数据保存在 `_okooo_lottery_handicap`，**不作为亚盘盘口**。真实亚盘必须来自亚盘页；亚盘页缺失时不再用竞彩让球兜底，盘口会降级为 `0` 并降低模型可用度。
 - 必发明细页：`https://www.okooo.cn/soccer/match/{match_id}/exchanges/detail/`
   - 需要 `OKOOO_COOKIE`。解析主/平/客每个时间点的价格、累计量、单笔量和可选买卖标记。
 - 亚盘页：`https://www.okooo.cn/soccer/match/{match_id}/ah/`
-  - 解析多家公司初盘/即时盘、水位、返还率，并生成亚盘矩阵。
+  - 解析多家公司初盘线、即时线、水位、返还率，并生成亚盘矩阵。
+  - 共识盘口用公司即时盘口的中位数；均水和评分只使用共识盘口附近的公司行，避免把 `-0.75`、`-1`、`-1.25` 不同盘口下的水位混算。
+  - 澳客重点公司按固定顺序优先：`Bet365`、`澳门彩票`、`皇冠`、`韦德国际`、`立博`、`Interwetten`、`SNAI`、`Mansion 88`。
 - 欧盘页：`https://www.okooo.cn/soccer/match/{match_id}/odds/`
   - 解析欧赔时间序列。
 - 凯莉方差页：`https://www.okooo.cn/jingcai/shuju/peilv/dqjc/`
@@ -131,11 +137,28 @@ python3 okooo_ah_cli.py watch --world-cup --horizon-hours 72 --interval 120 --ve
 - `score > 0`：支持上盘。
 - `score < 0`：支持下盘。
 - `abs(score) < 0.05`：无明显倾向。
-- 基础模型阈值约为 `+0.12 / -0.12`，超过后进入上盘/下盘模型方向；最终购买建议还会经过 `purchase` 门控。
+- 基础模型阈值约为 `+0.12 / -0.12`（代码常量 `UPPER_THRESHOLD` / `LOWER_THRESHOLD`），超过后进入上盘/下盘模型方向；**判定模型方向前**会先做完下面「边际修正」；最终购买建议还会经过 `purchase` 门控。
+
+#### 近期算法调优在做什么（`worldcup_ah_cli.Predictor`）
+
+目标可以概括成三句话：**盘口源必须干净，竞彩让球不能冒充亚盘**；**深盘 / 净胜类场次里，别让「门槛、升水、必发背离」单独把欧赔和盘口仍挺上盘的证据压成观望**；**浅盘必发大热仍守住 0.12 阈值，避免为了个案把全局阈值冲掉**。实现分两层：`okooo_ah_cli.py` 负责把澳客数据解析成干净盘口/赔率/资金结构，`worldcup_ah_cli.py` 的 `Predictor` 负责统一评分、边际修正和购买门控。
+
+1. **亚盘来源保护**：`betfa` 的竞彩让球不写入 `AsianAvrLet`；只有 `ah` 页拿到公司盘口矩阵后，才生成真实亚盘共识。缺亚盘页时宁可降级/观望，不用竞彩让球替代。
+2. **公司盘口线过滤**：每条 `HandicapRow` 保留初盘线和即时线；亚盘水位、公司一致性、均水只比较当前盘口附近的公司行，并把升盘/降盘作为独立信号进入亚盘评分。
+3. **盘口合理性**：实际盘口相对「合理线」偏深，但胜平负概率仍明显倾向上盘时，对过极端的负分做回拉，减少深盘强队被单行因子一票否决。
+4. **亚盘水位与欧赔一致性**：必发很热、上盘升水时本应对上盘扣分；若欧赔/Kelly 仍明确支撑让球方（`handicap_upper_water_rise_mitigated_by_euro`），则减轻扣分，把「升水」更多解读为正常受热而非单纯诱上。
+5. **同源降权**：澳客源下，`市场平衡/背离`、`盘口深度/打穿能力`、`高低水价值`、`外部赔率/实力校验` 等综合项会降权；澳客亚盘均水不再塞进 `ExternalSpread*` 参与“外部”校验，避免同一来源重复计分。
+6. **必发盈亏和平局资金**：必发盈亏用胜/平/负三路相对归一化，不再用 `/100` 后直接饱和；平局指数和成交占比会削弱胜负两端热度，避免平局吸金时误判单边热。
+7. **赢盘门槛风险**：风险项更多用于降低上盘确定性和转观望；模型已有方向时，购买层若要反向，需要欧赔/Kelly、盘口合理性、市场平衡等核心下盘确认，避免把“上盘风险高”机械变成“可以买下盘”。
+8. **边际补强**：中深盘/深让补强从固定 bump 改为随欧赔、市场平衡、外部校验、平局风险和盘口深度变化的连续函数；购买层仍允许“欧赔/外部支撑 + 临场 score 强回升”的深盘低优势上盘投资。
+9. **购买与模型口径**：`purchase_decision_from_signals` 在 **模型已是观望** 时，对购买侧若仍给出上/下盘会提高门槛或要求核心信号同向，减少「模型观望、购买却硬推一边」的分裂感。
+
+**数据与解析**：澳客欧赔/Kelly 页在能区分初盘/即盘时，趋势点使用各自时段的 Kelly 平均；初盘 Kelly 位于 12–14 列时会按 15 列模板读取，避免漏读。字段不可靠时 `Predictor` 侧会对相关信号保守降权。详见 `okooo_ah_cli.py` 与 `worldcup_ah_cli.py` 内注释。
 
 当前实际信号层：
 
-- 基础加权信号会进入 `weighted_score`：`必发指数`(0.16)、`必发成交走势`(0.08)、`亚盘水位`(0.13)、`欧赔/Kelly`(0.07)、`市场平衡/背离`(0.07)、`平局风险`(0.07)、`盘口合理性`(0.05)、`公司一致性`(0.05)、`盘口深度/打穿能力`(0.03)、`赢盘门槛风险`(0.05)、`快照趋势`(0.06)、`资金/盘口弹性`(0.05)、`外部赔率/实力校验`(0.04)、`高低水价值`(0.04)。
+- 基础加权信号会进入 `weighted_score`：`必发指数`(0.16)、`必发成交走势`(0.08)、`亚盘水位`(0.13)、`欧赔/Kelly`(0.07)、`市场平衡/背离`(0.07)、`平局风险`(0.07)、`盘口合理性`(0.05)、`公司一致性`(0.05)、`盘口深度/打穿能力`(0.03)、`赢盘门槛风险`(0.05)、`快照趋势`(0.06)、`资金/盘口弹性`(0.05)、`外部赔率/实力校验`(0.04)、`高低水价值`(0.032)。
+- 澳客源会做同源加权降权：`市场平衡/背离` 0.040、`平局风险` 0.045、`盘口深度/打穿能力` 0.015、`赢盘门槛风险` 0.035、`外部赔率/实力校验` 0.020、`高低水价值` 0.016。它们仍会参与解释和门控，但不会按完整独立信号重复放大。
 - 门控信号不改变基础 `weighted_score`，但会影响最终购买分 `purchase`：`临场score变化` 会比较当前 score、上一快照和首条快照；若临场方向突然转弱或转强，会在购买门控里修正。
 - 展示/质量信号：`数据质量` 根据可用权重和完整度生成，主要解释本次判断的覆盖度，并影响置信度理解。
 - 输出方向统一：正分支持上盘，负分支持下盘；但 `平局风险`、`赢盘门槛风险` 这类负分更准确的含义是“压制上盘确定性”，不应机械理解成“直接买下盘”。
@@ -152,17 +175,17 @@ python3 okooo_ah_cli.py watch --world-cup --horizon-hours 72 --interval 120 --ve
 
 ```mermaid
 flowchart LR
-    Money["资金压力\n必发指数 0.16\n必发成交走势 0.08\n成交速率曲线"] --> Balance["市场平衡/背离 0.07\n判断热度是否被盘口和价格确认"]
+    Money["资金压力\n必发指数 0.16\n必发成交走势 0.08\n含平局资金拖拽"] --> Balance["市场平衡/背离 0.07\n澳客源降到 0.040\n判断热度是否被盘口和价格确认"]
     Handicap["盘口响应\n亚盘水位 0.13\n公司一致性 0.05\n盘口合理性 0.05"] --> Balance
-    Price["价格确认\n欧赔-Kelly 0.07\n外部赔率/实力 0.04\n胜负指数/差异分析"] --> Balance
+    Price["价格确认\n欧赔-Kelly 0.07\n外部赔率/实力 0.04\n澳客源降到 0.020\n胜负指数/差异分析"] --> Balance
 
     Money --> Weighted["基础加权层\n14项可用信号加权平均\n得到 weighted_score"]
     Handicap --> Weighted
     Price --> Weighted
     Balance --> Weighted
 
-    Risk["风险门槛\n平局风险 0.07\n盘口深度/打穿 0.03\n赢盘门槛风险 0.05"] --> Weighted
-    Value["价值与弹性\n高低水价值 0.04\n资金/盘口弹性 0.05"] --> Weighted
+    Risk["风险门槛\n平局风险 0.07\n盘口深度/打穿 0.03\n赢盘门槛风险 0.05\n澳客源分别降到 0.045/0.015/0.035"] --> Weighted
+    Value["价值与弹性\n高低水价值 0.032\n澳客源降到 0.016\n资金/盘口弹性 0.05"] --> Weighted
     TimeBase["历史时间维度\n快照趋势 0.06"] --> Weighted
 
     Weighted --> Gate{"购买门控 purchase"}
@@ -189,18 +212,19 @@ flowchart TD
 
     Match --> Signals["生成14个基础信号\n每项归一到 -1 到 +1\n不可用信号不参与加权"]
     Signals --> Weight["计算 weighted_score\nsum(score * weight) / available_weight"]
-    Weight --> Complete["计算完整度\ncompleteness = available_weight / 0.95"]
+    Weight --> PostAdj["边际修正（条件触发）\n中深盘上沿 / 深让+欧赔外部"]
+    PostAdj --> Complete["计算完整度\ncompleteness = available_weight / 0.95"]
 
-    Weight --> Model{"基础模型方向"}
-    Model -->|score 大于 +0.12| ModelUpper["模型上盘"]
-    Model -->|score 小于 -0.12| ModelLower["模型下盘"]
+    PostAdj --> Model{"基础模型方向\n阈值对修正后分数"}
+    Model -->|修正后大于 +0.12| ModelUpper["模型上盘"]
+    Model -->|修正后小于 -0.12| ModelLower["模型下盘"]
     Model -->|阈值内| ModelWatch["模型观望"]
 
-    Weight --> Momentum["临场score变化\n当前score vs 上一快照/首条快照"]
+    PostAdj --> Momentum["临场score变化\n当前score vs 上一快照/首条快照"]
     Complete --> Quality["数据质量\n覆盖度解释和置信度参考"]
 
     Signals --> Gate{"purchase_decision_from_signals"}
-    Weight --> Gate
+    PostAdj --> Gate
     Momentum --> Gate
     Snap --> Gate
     ModelUpper --> Gate
@@ -397,7 +421,7 @@ python3 scripts/titan007_one_match.py predict 2906745 --okooo-ids 2906745=131632
 - `OKOOO_ISSUE`：默认 `dqjc`。
 - `OKOOO_TIMEOUT`：HTTP 超时秒。
 - `OKOOO_DETAIL_MAX_PAGES`：必发明细最多分页。
-- `OKOOO_SNAPSHOT_DIR`：默认 `.okooo_snapshots`。
+- `OKOOO_SNAPSHOT_DIR`：未设置时与 `okooo_ah_cli` 内置默认一致，为**本仓库根目录**下的 `.okooo_snapshots`；设置后可改为任意路径。
 
 Titan007：
 

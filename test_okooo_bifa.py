@@ -21,6 +21,36 @@ from titan007_client import _parse_bf_match_time
 from worldcup_ah_cli import DataError
 
 
+class OkoooAhCliBetfaParseTests(unittest.TestCase):
+    """okooo_ah_cli.parse_betfa_html：已赛比分行（无 VS）与未赛行兼容。"""
+
+    def test_parse_betfa_finished_match_without_vs(self) -> None:
+        from okooo_ah_cli import parse_betfa_html
+
+        html = """
+        <div class="clearfix container_wrapper betfa">
+          <div class="magazineDateTit font_14">
+            <p class="float_l"><b>周一013</b><b>世界杯</b><b>06-16 00:00</b></p>
+            <div class="titnamebox titname_box">
+              <span>西班牙</span><em class="font_red">(-2)</em><strong>0-0</strong><b>佛得角</b>
+            </div>
+          </div>
+          <a href="/soccer/match/1315999/odds/">x</a>
+          <table>
+            <tr><td>主胜</td><td></td><td></td><td></td><td></td><td>100</td><td>1</td><td>2</td><td>1.1</td><td>10%</td><td>2</td><td>20%</td><td></td><td>0</td></tr>
+            <tr><td>平局</td><td></td><td></td><td></td><td></td><td>100</td><td>1</td><td>2</td><td>3</td><td>10%</td><td>2</td><td>20%</td><td></td><td>0</td></tr>
+            <tr><td>客胜</td><td></td><td></td><td></td><td></td><td>100</td><td>1</td><td>2</td><td>5</td><td>10%</td><td>2</td><td>20%</td><td></td><td>0</td></tr>
+          </table>
+        </div>
+        """
+        out = parse_betfa_html(html)
+        self.assertIn(1315999, out)
+        m = out[1315999]
+        self.assertEqual(m.home, "西班牙")
+        self.assertEqual(m.away, "佛得角")
+        self.assertEqual(m.lottery_handicap, "-2")
+
+
 class OkoooBifaTests(unittest.TestCase):
     def test_parse_fixture_snippet(self) -> None:
         html = Path("fixtures/okooo_betfa_snippet.html").read_text(encoding="utf-8")
