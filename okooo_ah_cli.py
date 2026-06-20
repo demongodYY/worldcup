@@ -200,11 +200,22 @@ def _format_validate_snapshot_row(values: tuple[str, ...]) -> str:
     return "| " + _VALIDATE_SNAPSHOT_COL_SEP.join(cells) + " |"
 
 
+class ValidateReplaySnapshotStore(SnapshotStore):
+    def __init__(self, root: Path, current_event_id: int, history_records: list[dict[str, Any]]):
+        super().__init__(root)
+        self.current_event_id = current_event_id
+        self.history_records = list(history_records)
+
+    def load_event(self, event_id: int) -> list[dict[str, Any]]:
+        if event_id == self.current_event_id:
+            return list(self.history_records)
+        return super().load_event(event_id)
+
+
 def run_validate_snapshots_from_dir(
     snapshot_root: Path, scores: dict[int, tuple[int, int]], *, fail_on_miss: bool = True
 ) -> int:
     """仅用 ``snapshot_root`` 下各场 jsonl 的 match 基础数据 + ``Predictor`` 重放，对照已知比分（不访问澳客网）。"""
-    store = SnapshotStore(snapshot_root)
     hit = miss = na = 0
     print(_format_validate_snapshot_header())
     print(_validate_snapshot_rule_line())
@@ -222,6 +233,7 @@ def run_validate_snapshots_from_dir(
             continue
         match = match_from_dict(lines[-1]["match"])
         client = OkoooSnapshotReplayClient(lines)
+        store = ValidateReplaySnapshotStore(snapshot_root, eid, lines[:-1])
         res = Predictor(client, store).analyze(match)
         out, _margin = _replay_recommendation_outcome(
             res.recommendation,

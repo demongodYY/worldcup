@@ -4498,6 +4498,7 @@ def model_upper_trap_score_adjustment(
     market = lookup.get("市场平衡/背离")
     snapshot = lookup.get("快照趋势")
     water_value = lookup.get("高低水价值")
+    external = lookup.get("外部赔率/实力校验")
 
     trade_available = bool(trade and trade.available)
     pressure = upper_favorite_trap_pressure_from_values(
@@ -4548,6 +4549,47 @@ def model_upper_trap_score_adjustment(
         confirmation_reasons.append("深盘打穿价值不足")
 
     if lower_confirmations <= 0:
+        return weighted_score, None
+
+    positive_snapshot_guard = bool(snapshot and snapshot.available and signal_value(snapshot) >= 0.25)
+    core_lower_cluster = (
+        lower_confirmations >= 2
+        or signal_value(market) <= -0.12
+        or signal_value(handicap) <= -0.12
+        or signal_value(fair_line) <= -0.08
+        or signal_value(water_value) <= -0.18
+    )
+    if positive_snapshot_guard and not core_lower_cluster and weighted_score > 0:
+        guarded_shift = pressure * 0.42 + 0.025
+        guarded_shift = clamp(guarded_shift, 0.05, 0.13)
+        adjusted = max(weighted_score - guarded_shift, LOWER_THRESHOLD + 0.005)
+        if adjusted < weighted_score:
+            reason = "、".join(confirmation_reasons[:3])
+            return adjusted, f"模型层热门陷阱回撤 {guarded_shift:.3f}（快照仍偏上，仅单项下盘确认：{reason}）"
+        return weighted_score, None
+
+    fallback_handicap_lower = bool(
+        handicap
+        and handicap.available
+        and signal_value(handicap) <= -0.12
+        and "静态亚盘均值兜底" in handicap.reason
+    )
+    direct_lower_confirmation = (
+        signal_value(euro) <= -0.10
+        or signal_value(fair_line) <= -0.08
+        or (signal_value(handicap) <= -0.12 and not fallback_handicap_lower)
+        or signal_value(water_value) <= -0.18
+    )
+    if (
+        fallback_handicap_lower
+        and not direct_lower_confirmation
+        and signal_value(bifa) >= 0.30
+        and signal_value(external) >= 0.12
+    ):
+        guarded_shift = clamp(pressure * 0.45 + 0.025, 0.05, 0.14)
+        adjusted = max(weighted_score - guarded_shift, LOWER_THRESHOLD + 0.005)
+        if adjusted < weighted_score:
+            return adjusted, f"模型层热门陷阱回撤 {guarded_shift:.3f}（亚盘为静态均水兜底，缺少直接下盘确认）"
         return weighted_score, None
 
     # 强热且快照冲突，但缺少欧赔/盘口/合理线等直接下盘确认时，模型只降到观望。
@@ -4670,6 +4712,22 @@ def purchase_core_signals_confirm_when_model_wait(
         return 0
 
     de, dh = dir3(euro), dir3(ah)
+    if not want_upper:
+        bifa = lookup.get("必发指数")
+        external = lookup.get("外部赔率/实力校验")
+        fallback_handicap_lower = bool(
+            ah
+            and ah.available
+            and signal_value(ah) <= -0.12
+            and "静态亚盘均值兜底" in ah.reason
+        )
+        if (
+            fallback_handicap_lower
+            and signal_value(euro) > -0.10
+            and signal_value(bifa) >= 0.30
+            and signal_value(external) >= 0.12
+        ):
+            return False
     non_zero = [x for x in (de, dh) if x != 0]
     if len(non_zero) >= 2:
         return all(x == need for x in non_zero)
@@ -4682,9 +4740,29 @@ def purchase_core_signals_confirm_when_model_wait(
         cover_risk = lookup.get("赢盘门槛风险")
         water_value = lookup.get("高低水价值")
         bifa = lookup.get("必发指数")
+        external = lookup.get("外部赔率/实力校验")
         market_score = signal_value(market)
         trap_reason = "热门陷阱" in (market.reason if market else "")
         shallow_hot_trap = trap_reason and "浅盘大热" in (bifa.reason if bifa else "")
+        fallback_handicap_lower = bool(
+            ah
+            and ah.available
+            and signal_value(ah) <= -0.12
+            and "静态亚盘均值兜底" in ah.reason
+        )
+        direct_lower_confirmation = (
+            signal_value(euro) <= -0.10
+            or signal_value(fair_line) <= -0.08
+            or (signal_value(ah) <= -0.12 and not fallback_handicap_lower)
+            or signal_value(water_value) <= -0.18
+        )
+        if (
+            fallback_handicap_lower
+            and not direct_lower_confirmation
+            and signal_value(bifa) >= 0.30
+            and signal_value(external) >= 0.12
+        ):
+            return False
         if (
             abs_adjusted >= 0.13
             and (

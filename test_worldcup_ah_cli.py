@@ -33,6 +33,7 @@ from worldcup_ah_cli import (
     parse_chuqi_match_refs,
     parse_match,
     match_from_dict,
+    model_upper_trap_score_adjustment,
     price_volume_point_to_dict,
     purchase_decision_from_signals,
     purchase_display_text,
@@ -1391,6 +1392,102 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertTrue(external_signal.available)
         self.assertGreater(external_signal.score, 0.25)
         self.assertIn("外部让球赔率", external_signal.reason)
+
+    def test_positive_snapshot_prevents_single_euro_trap_from_flipping_lower(self):
+        raw = {
+            "BfIndexHome": 76.84,
+            "BfIndexDraw": 12.84,
+            "BfIndexAway": 10.32,
+            "BfAmountHome": 3656957.0,
+            "BfAmountDraw": 611172.0,
+            "BfAmountAway": 491157.0,
+            "BfPayoutHome": -1713528.0,
+            "BfPayoutDraw": 2192364.0,
+            "BfPayoutAway": 2254385.0,
+            "BfOddsHome": 1.77,
+            "BfOddsAway": 5.10,
+        }
+        match = sample_match(raw=raw, asian_line="-0.75")
+        signals = [
+            Signal("必发指数", 0.192, 0.16, True, "浅盘大热但庄家盈亏对让球方承压"),
+            Signal("必发成交走势", 0.0, 0.08, False, "近1小时成交走势不足"),
+            Signal("亚盘水位", 0.073, 0.13, True, "轻微偏上盘"),
+            Signal("欧赔/Kelly", -0.118, 0.07, True, "背离"),
+            Signal("市场平衡/背离", -0.080, 0.04, True, "中性偏下"),
+            Signal("平局风险", -0.185, 0.045, True, "小胜风险"),
+            Signal("盘口合理性", 0.0, 0.05, True, "匹配"),
+            Signal("盘口深度/打穿能力", 0.123, 0.015, True, "偏上"),
+            Signal("赢盘门槛风险", -0.330, 0.035, True, "门槛风险"),
+            Signal("快照趋势", 0.581, 0.06, True, "强烈偏上"),
+            Signal("高低水价值", 0.080, 0.016, True, "弱上"),
+        ]
+
+        adjusted, note = model_upper_trap_score_adjustment(match, 0.079, signals)
+
+        self.assertGreater(adjusted, -0.12)
+        self.assertIn("仅单项下盘确认", note)
+
+    def test_static_handicap_fallback_trap_does_not_force_lower_against_external_support(self):
+        raw = {
+            "BfIndexHome": 87.6,
+            "BfIndexDraw": 6.6,
+            "BfIndexAway": 5.8,
+            "BfAmountHome": 3859832.0,
+            "BfAmountDraw": 291780.0,
+            "BfAmountAway": 253797.0,
+            "BfPayoutHome": -1770322.0,
+            "BfPayoutDraw": 3121000.0,
+            "BfPayoutAway": 2628830.0,
+            "BfOddsHome": 1.60,
+            "BfOddsAway": 7.00,
+        }
+        match = sample_match(raw=raw, asian_line="-1")
+        signals = [
+            Signal("必发指数", 0.762, 0.16, True, "强热"),
+            Signal("必发成交走势", 0.0, 0.08, False, "近1小时成交走势不足"),
+            Signal("亚盘水位", -0.466, 0.13, True, "静态亚盘均值兜底，已降权"),
+            Signal("欧赔/Kelly", -0.022, 0.07, True, "基本中性"),
+            Signal("市场平衡/背离", -0.410, 0.04, True, "亚盘升水或分歧"),
+            Signal("平局风险", -0.118, 0.045, True, "小胜风险"),
+            Signal("盘口合理性", 0.0, 0.05, True, "匹配"),
+            Signal("盘口深度/打穿能力", -0.011, 0.015, True, "中性"),
+            Signal("赢盘门槛风险", -0.730, 0.035, True, "门槛风险"),
+            Signal("快照趋势", -0.358, 0.06, True, "转弱"),
+            Signal("高低水价值", 0.0, 0.016, True, "中性"),
+            Signal("外部赔率/实力校验", 0.180, 0.020, True, "强队支持"),
+        ]
+
+        adjusted, note = model_upper_trap_score_adjustment(match, -0.009, signals)
+
+        self.assertGreater(adjusted, -0.12)
+        self.assertIn("静态均水兜底", note)
+
+    def test_model_wait_purchase_rejects_lower_from_static_handicap_fallback(self):
+        match = sample_match(asian_line="-1")
+        decision = purchase_decision_from_signals(
+            match=match,
+            weighted_score=-0.115,
+            completeness=78,
+            available_weight=0.74,
+            model_recommendation="观望",
+            signals=[
+                Signal("必发指数", 0.762, 0.16, True, "强热"),
+                Signal("必发成交走势", 0.0, 0.08, False, "近1小时成交走势不足"),
+                Signal("亚盘水位", -0.466, 0.13, True, "静态亚盘均值兜底，已降权"),
+                Signal("欧赔/Kelly", -0.022, 0.07, True, "基本中性"),
+                Signal("市场平衡/背离", -0.410, 0.04, True, "热门陷阱"),
+                Signal("平局风险", -0.118, 0.045, True, "小胜风险"),
+                Signal("盘口合理性", 0.0, 0.05, True, "匹配"),
+                Signal("盘口深度/打穿能力", -0.011, 0.015, True, "中性"),
+                Signal("赢盘门槛风险", -0.730, 0.035, True, "门槛风险"),
+                Signal("快照趋势", -0.358, 0.06, True, "转弱"),
+                Signal("外部赔率/实力校验", 0.180, 0.020, True, "强队支持"),
+                Signal("临场score变化", -0.56, 0.0, True, "走弱"),
+            ],
+        )
+
+        self.assertEqual(decision.side, "观望")
+        self.assertIn("模型观望", decision.reason)
 
     def test_middle_line_cover_risk_downgrades_stale_upper_pick_to_watch(self):
         raw = {
