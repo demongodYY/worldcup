@@ -53,7 +53,7 @@ WEIGHTS = {
     "snapshot_trend": 0.06,
     "market_elasticity": 0.05,
     "external_consensus": 0.04,
-    "water_value": 0.04,
+    "water_value": 0.032,
     "data_quality": 0.05,
 }
 
@@ -1847,6 +1847,20 @@ class Predictor:
             -1,
             1,
         )
+        # 浅盘：必发指数一边倒但让球方必发赔付为巨额负、赔付方在另一侧 → 典型「大热难穿」风险，避免单押上盘
+        depth_bd = line_depth(match.asian_line)
+        extra_bifa = ""
+        if (
+            depth_bd <= 0.75
+            and score > 0.38
+            and upper_index >= 72.0
+            and upper_payout < 0.0
+            and lower_payout > 0.0
+            and abs(upper_payout) >= abs(lower_payout) * 0.82
+        ):
+            mut_damper = clamp(0.34 + (upper_index - 72.0) * 0.007 + max(score - 0.38, 0.0) * 0.35, 0.30, 0.68)
+            score = clamp(score - mut_damper, -1, 1)
+            extra_bifa = f"，浅盘大热但庄家盈亏对让球方承压 扣分 {mut_damper:.2f}"
         reason = (
             f"{upper_team} 必发指数 {upper_index:.1f} vs {lower_team} {lower_index:.1f}，"
             f"成交额 {upper_amount:,.0f} vs {lower_amount:,.0f}，"
@@ -1858,6 +1872,7 @@ class Predictor:
             reason += f"，{split_reason}"
         if hot_divergence_penalty:
             reason += f"，大热未获赔率/盈亏确认 扣分 {hot_divergence_penalty:.2f}"
+        reason += extra_bifa
         return Signal("必发指数", score, WEIGHTS["bifa"], True, reason)
 
     def _trade_signal(
@@ -1935,6 +1950,9 @@ class Predictor:
         upper_init_avg, upper_now_avg, upper_move = average_upper_water_movement(selected_rows, match, upper_team)
         if upper_move > 0.035:
             move_penalty = clamp(upper_move / 0.20, 0, 0.35)
+            if handicap_upper_water_rise_mitigated_by_euro(match, upper_team):
+                move_penalty *= 0.50
+                reasons.append("欧赔/凯利支撑让球方，上盘升水扣分减半")
             score = clamp(score - move_penalty, -1, 1)
             reasons.append(
                 f"上盘平均水位上升 {upper_init_avg:.3g}->{upper_now_avg:.3g}，扣分 {move_penalty:.2f}"
@@ -1997,7 +2015,18 @@ class Predictor:
         upper_kelly_drop = getattr(first, f"{upper_key}_kelly") - getattr(last, f"{upper_key}_kelly")
         lower_kelly_drop = getattr(first, f"{lower_key}_kelly") - getattr(last, f"{lower_key}_kelly")
         price_edge = clamp((upper_price_drop - lower_price_drop) / 0.6, -1, 1)
-        kelly_edge = clamp((upper_kelly_drop - lower_kelly_drop) / 8.0, -1, 1)
+        kelly_flat = (
+            abs(first.home_kelly - last.home_kelly) < 1e-5
+            and abs(first.draw_kelly - last.draw_kelly) < 1e-5
+            and abs(first.away_kelly - last.away_kelly) < 1e-5
+        )
+        # 澳客 peilv 常仅有一组即时凯利复制到走势首尾，Kelly 变化为伪 0；仅用欧赔价差并注明
+        if match.raw.get("_source") == "okooo" and kelly_flat:
+            kelly_edge = 0.0
+            kelly_note = "（澳客仅即时凯利，走势点 Kelly 无变化，Kelly 项按中性）"
+        else:
+            kelly_edge = clamp((upper_kelly_drop - lower_kelly_drop) / 8.0, -1, 1)
+            kelly_note = ""
         draw_risk = 0.0
         if last.draw_kelly < min(last.home_kelly, last.away_kelly):
             draw_risk = 0.20
@@ -2010,6 +2039,7 @@ class Predictor:
             (
                 f"{upper_team} 欧赔变化 {upper_price_drop:+.2f}、Kelly变化 {upper_kelly_drop:+.2f}；"
                 f"{lower_team} 欧赔变化 {lower_price_drop:+.2f}、Kelly变化 {lower_kelly_drop:+.2f}"
+                f"{kelly_note}"
             ),
         )
 
@@ -3119,6 +3149,76 @@ def match_to_dict(match: Match) -> dict[str, Any]:
     }
 
 
+def match_from_dict(data: dict[str, Any]) -> Match:
+    """从 SnapshotStore / jsonl 的 ``match`` 字段还原 ``Match``（用于离线重放）。"""
+    mt = data.get("match_time", "")
+    if isinstance(mt, str):
+        text = mt
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        mtime = datetime.fromisoformat(text)
+        if mtime.tzinfo is None:
+            mtime = mtime.replace(tzinfo=timezone.utc)
+        else:
+            mtime = mtime.astimezone(timezone.utc)
+    else:
+        mtime = datetime.now(timezone.utc)
+    return Match(
+        event_id=int(data.get("event_id", 0)),
+        match_time=mtime,
+        home=str(data.get("home", "")),
+        away=str(data.get("away", "")),
+        league_id=to_int_or_none(data.get("league_id")),
+        league_name=str(data.get("league_name", "")),
+        asian_line=str(data.get("asian_line", "0")),
+        is_stop_update=bool(data.get("is_stop_update", False)),
+        raw=dict(data.get("raw") or {}),
+    )
+
+
+@dataclass
+class OkoooSnapshotReplayClient:
+    """用同一 event 的 jsonl 首末条欧赔/Kelly 构造 ``euro_trend``；盘口行留空以走 ``fallback_handicap``。"""
+
+    records: list[dict[str, Any]]
+
+    def __post_init__(self) -> None:
+        self._records = sorted(self.records, key=lambda r: str(r.get("fetched_at", "")))
+
+    @staticmethod
+    def _euro_point_from_raw(raw: dict[str, Any]) -> EuroTrendPoint:
+        return EuroTrendPoint(
+            refresh_time=None,
+            home_price=float_or_zero(raw.get("EuroAvrHome")),
+            draw_price=float_or_zero(raw.get("EuroAvrDraw")),
+            away_price=float_or_zero(raw.get("EuroAvrAway")),
+            home_kelly=float_or_zero(raw.get("KellyHome")),
+            draw_kelly=float_or_zero(raw.get("KellyDraw")),
+            away_kelly=float_or_zero(raw.get("KellyAway")),
+        )
+
+    def handicap_list(self, event_id: int, _asian_line: str) -> list[HandicapRow]:
+        return []
+
+    def euro_trend(self, event_id: int) -> list[EuroTrendPoint]:
+        del event_id
+        if not self._records:
+            return []
+        raw_first = (self._records[0].get("match") or {}).get("raw") or {}
+        raw_last = (self._records[-1].get("match") or {}).get("raw") or {}
+        if not isinstance(raw_first, dict):
+            raw_first = {}
+        if not isinstance(raw_last, dict):
+            raw_last = {}
+        a = self._euro_point_from_raw(raw_first)
+        b = self._euro_point_from_raw(raw_last)
+        return [a, b]
+
+    def price_volume(self, event_id: int, selection: str) -> list[PriceVolumePoint]:
+        del event_id, selection
+        return []
+
+
 def parse_handicap(item: dict[str, Any], bookmaker_id: int | None = None) -> HandicapRow:
     return HandicapRow(
         bookmaker_id=int(item.get("BookmakerId", bookmaker_id or 0)),
@@ -3770,8 +3870,9 @@ def model_edge_for_water_value(signals: list[Signal]) -> float:
         "欧赔/Kelly": 0.15,
         "盘口合理性": 0.14,
         "盘口深度/打穿能力": 0.10,
-        "快照趋势": 0.12,
-        "资金/盘口弹性": 0.08,
+        # 高低水内部的模型边已与主模型「快照趋势」叠加，略降权避免同维重复
+        "快照趋势": 0.08,
+        "资金/盘口弹性": 0.12,
         "外部赔率/实力校验": 0.07,
     }
     total = 0.0
@@ -3813,6 +3914,25 @@ def signal_conflict_count(signals: list[Signal]) -> int:
     positives = sum(1 for direction in directions if direction > 0)
     negatives = sum(1 for direction in directions if direction < 0)
     return min(positives, negatives) * 2
+
+
+def handicap_upper_water_rise_mitigated_by_euro(match: Match, upper_team: str) -> bool:
+    """欧赔/凯利明显支撑让球方(上盘)时，上盘临场升水多为正常受热，减轻扣分。"""
+    uk = side_key(match, upper_team)
+    if uk not in ("Home", "Away"):
+        return False
+    lk = "Away" if uk == "Home" else "Home"
+    eu_u = float_or_zero(match.raw.get(f"EuroAvr{uk}"))
+    eu_l = float_or_zero(match.raw.get(f"EuroAvr{lk}"))
+    if min(eu_u, eu_l) <= 0:
+        return False
+    if eu_u > eu_l - 0.12:
+        return False
+    ke_u = float_or_zero(match.raw.get(f"Kelly{uk}"))
+    ke_l = float_or_zero(match.raw.get(f"Kelly{lk}"))
+    if min(ke_u, ke_l) <= 0:
+        return eu_u + 0.4 < eu_l
+    return ke_u >= ke_l - 0.03
 
 
 def score_handicap_row(match: Match, row: HandicapRow, upper_team: str) -> float:
@@ -3898,6 +4018,39 @@ def current_score_momentum_signal(current_score: float, snapshot_context: Snapsh
     return Signal("临场score变化", momentum, 0.0, True, reason)
 
 
+# 模型为「观望」时，购买层若仍给方向，需欧赔/Kelly 与亚盘同向且购买分足够，避免弱噪声买错边
+MODEL_WAIT_PURCHASE_ABS_FLOOR = 0.14
+MODEL_WAIT_CORE_SCORE_THRESH = 0.06
+MODEL_WAIT_SINGLE_CORE_ABS_FLOOR = 0.18
+
+
+def purchase_core_signals_confirm_when_model_wait(
+    lookup: dict[str, Signal], want_upper: bool, abs_adjusted: float
+) -> bool:
+    if abs_adjusted < MODEL_WAIT_PURCHASE_ABS_FLOOR:
+        return False
+    need = 1 if want_upper else -1
+    euro = lookup.get("欧赔/Kelly")
+    ah = lookup.get("亚盘水位")
+
+    def dir3(sig: Signal | None) -> int:
+        if sig is None or not sig.available:
+            return 0
+        if sig.score > MODEL_WAIT_CORE_SCORE_THRESH:
+            return 1
+        if sig.score < -MODEL_WAIT_CORE_SCORE_THRESH:
+            return -1
+        return 0
+
+    de, dh = dir3(euro), dir3(ah)
+    non_zero = [x for x in (de, dh) if x != 0]
+    if len(non_zero) >= 2:
+        return all(x == need for x in non_zero)
+    if len(non_zero) == 1:
+        return non_zero[0] == need and abs_adjusted >= MODEL_WAIT_SINGLE_CORE_ABS_FLOOR
+    return False
+
+
 def purchase_decision_from_signals(
     match: Match,
     weighted_score: float,
@@ -3942,11 +4095,19 @@ def purchase_decision_from_signals(
     handicap = lookup.get("亚盘水位")
     bookmaker_consensus = lookup.get("公司一致性")
     market_balance = lookup.get("市场平衡/背离")
+    euro_kelly = lookup.get("欧赔/Kelly")
     strong_upper_consensus = (
         weighted_score > 0.10
         and signal_value(handicap) >= 0.40
         and signal_value(bookmaker_consensus) >= 0.30
     )
+    strong_upper_consensus_euro = (
+        weighted_score > 0.05
+        and signal_value(handicap) >= 0.35
+        and signal_value(bookmaker_consensus) >= 0.28
+        and signal_value(euro_kelly) >= 0.25
+    )
+    strong_upper_protected = strong_upper_consensus or strong_upper_consensus_euro
 
     cover_risk = lookup.get("赢盘门槛风险")
     if (
@@ -3957,16 +4118,21 @@ def purchase_decision_from_signals(
         and weighted_score > -LEAN_THRESHOLD
     ):
         risk_shift = clamp(abs(cover_risk.score) * 0.35, 0.02, 0.20)
-        if strong_upper_consensus:
+        if strong_upper_protected:
             risk_shift *= 0.30
-            reasons.append("强亚盘/公司共识保护，门槛风险仅降权不反向")
+            reasons.append(
+                "强亚盘/公司共识保护，门槛风险仅降权不反向"
+                if strong_upper_consensus
+                else "强亚盘/公司/欧赔共识保护，门槛风险仅降权不反向"
+            )
         adjusted_score -= risk_shift
         reasons.append(f"上盘赢盘门槛风险向下修正 {risk_shift:.2f}")
-        if cover_risk.score <= -0.35 and weighted_score > 0 and not strong_upper_consensus:
+        if cover_risk.score <= -0.35 and weighted_score > 0 and not strong_upper_protected:
             adjusted_score = max(adjusted_score, weighted_score * 0.35)
             reasons.append("门槛风险较高，仅缩小上盘优势")
 
     score_momentum = lookup.get("临场score变化")
+    momentum_shift = 0.0
     if secondary_enabled and score_momentum and score_momentum.available and abs(score_momentum.score) >= 0.25:
         momentum_shift = 0.14 * score_momentum.score
         adjusted_score += momentum_shift
@@ -3982,6 +4148,10 @@ def purchase_decision_from_signals(
             elif abs(weighted_score) < 0.08 and abs(score_momentum.score) < 0.30:
                 trend_shift *= 0.45
                 reasons.append("当前score未强确认历史快照趋势，快照修正降权")
+            elif snapshot_trend.score * score_momentum.score > 0 and abs(score_momentum.score) >= 0.25:
+                # 临场修正已用「当前综合分 − 上条快照」；快照趋势含相邻快照间 score，同向时降权去重
+                trend_shift *= 0.52
+                reasons.append("临场与快照趋势同向，快照修正去重降权")
         adjusted_score += trend_shift
         if abs(trend_shift) >= 0.02:
             reasons.append(f"快照趋势二次修正 {trend_shift:+.2f}")
@@ -4013,8 +4183,8 @@ def purchase_decision_from_signals(
 
     water_value = lookup.get("高低水价值")
     if secondary_enabled and water_value and water_value.available and abs(water_value.score) >= 0.12:
-        value_shift = 0.11 * water_value.score
-        if strong_upper_consensus and value_shift < 0:
+        value_shift = 0.075 * water_value.score
+        if strong_upper_protected and value_shift < 0:
             value_shift *= 0.40
             reasons.append("强亚盘/公司共识保护，低水价值负修正降权")
         adjusted_score += value_shift
@@ -4052,15 +4222,23 @@ def purchase_decision_from_signals(
         adjusted_score -= 0.05
         reasons.append("主流公司一致性偏下盘")
 
-    if strong_upper_consensus and adjusted_score < 0:
+    if strong_upper_protected and adjusted_score < 0:
         adjusted_score = max(min(weighted_score * 0.50, 0.08), 0.03)
         reasons.append("强亚盘/公司共识保护，不允许二次门控反向")
 
-    if (
-        weighted_score > 0.10
-        and signal_value(market_balance) > 0.45
-        and signal_value(handicap) > 0.30
-        and signal_value(cover_risk) > -0.55
+    if weighted_score > 0.08 and (
+        (
+            weighted_score > 0.10
+            and signal_value(market_balance) > 0.45
+            and signal_value(handicap) > 0.30
+            and signal_value(cover_risk) > -0.55
+        )
+        or (
+            signal_value(euro_kelly) >= 0.30
+            and signal_value(handicap) > 0.28
+            and signal_value(cover_risk) > -0.55
+            and signal_value(market_balance) > 0.35
+        )
     ):
         adjusted_score = max(adjusted_score, 0.06)
         reasons.append("盘口防守和亚盘同向，保留正向")
@@ -4072,6 +4250,15 @@ def purchase_decision_from_signals(
         reasons.append("方向和购买优势都不足，观望不买")
     else:
         side = "上盘" if adjusted_score > 0 else "下盘"
+
+    if (
+        model_recommendation == "观望"
+        and side in ("上盘", "下盘")
+        and not purchase_core_signals_confirm_when_model_wait(lookup, side == "上盘", abs(adjusted_score))
+    ):
+        reasons.append("模型观望且欧赔/Kelly与亚盘未同向确认或购买优势不足，不买")
+        side = "观望"
+
     attempted_reverse = (
         reference_side in ("上盘", "下盘")
         and side != reference_side
@@ -4087,7 +4274,7 @@ def purchase_decision_from_signals(
         side = "观望"
     elif attempted_reverse:
         reasons.append(f"最终购买方向由{reference_side}反向到{side}")
-    elif model_recommendation == "观望":
+    elif model_recommendation == "观望" and side in ("上盘", "下盘"):
         reasons.append(f"模型阈值为观望，低优势选择{side}")
     else:
         reasons.append(f"最终购买方向保持{side}")
