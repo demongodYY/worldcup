@@ -57,9 +57,37 @@ WEIGHTS = {
     "data_quality": 0.05,
 }
 
+OKOOO_INTERNAL_SIGNAL_NAMES = {
+    "盘口深度/打穿能力",
+    "外部赔率/实力校验",
+    "高低水价值",
+}
+OKOOO_PURCHASE_INTERNAL_SIGNAL_NAMES = {
+    "高低水价值",
+}
+
+OKOOO_SCORING_WEIGHT_OVERRIDES = {
+    "必发指数": 0.12,
+    "必发成交走势": 0.09,
+    "亚盘水位": 0.20,
+    "欧赔/Kelly": 0.06,
+    "市场平衡/背离": 0.055,
+    "平局风险": 0.040,
+    "盘口合理性": 0.075,
+    "公司一致性": 0.10,
+    "盘口深度/打穿能力": 0.020,
+    "赢盘门槛风险": 0.060,
+    "快照趋势": 0.060,
+    "资金/盘口弹性": 0.080,
+    "高低水价值": 0.016,
+    "外部赔率/实力校验": 0.020,
+}
+
 UPPER_THRESHOLD = 0.12
 LOWER_THRESHOLD = -0.12
 LEAN_THRESHOLD = 0.05
+MODEL_DIRECTION_EPSILON = 0.015
+STRONG_THRESHOLD = 0.25
 
 TOP_BOOKMAKERS = ("PinnacleSports", "Bet365", "Singbet", "IBC", "Ysb88")
 MATCH_LIST_HOT_MODES = (1, None)
@@ -576,7 +604,7 @@ class AnalysisResult:
 
     @property
     def lean(self) -> str:
-        if abs(self.score) < LEAN_THRESHOLD:
+        if abs(self.score) < MODEL_DIRECTION_EPSILON:
             return "无明显倾向"
         if self.score < 0:
             return "下盘"
@@ -589,6 +617,10 @@ class AnalysisResult:
         if self.lean == "下盘":
             return self.lower_team
         return self.upper_team
+
+    @property
+    def strength(self) -> str:
+        return score_strength_label(self.score)
 
     @property
     def purchase_side(self) -> str:
@@ -622,6 +654,7 @@ class AnalysisResult:
             "is_reversed": self.is_reversed,
             "lean": self.lean,
             "lean_team": self.lean_team,
+            "strength": self.strength,
             "score": round(self.score, 4),
             "confidence": self.confidence,
             "completeness": self.completeness,
@@ -1756,7 +1789,7 @@ class Predictor:
             snapshot_context,
         )
 
-        signals: list[Signal] = [
+        all_signals: list[Signal] = [
             bifa_signal,
             trade_signal,
             handicap_signal,
@@ -1772,7 +1805,8 @@ class Predictor:
             external_consensus_signal,
             water_value_signal,
         ]
-        signals = source_adjusted_signals(match, signals)
+        adjusted_signals = source_adjusted_signals(match, all_signals)
+        signals = scoring_signals_for_source(match, adjusted_signals)
 
         available_weight = sum(s.weight for s in signals if s.available)
         weighted_score = 0.0
@@ -1811,9 +1845,16 @@ class Predictor:
             )
             if deep_lift_note:
                 warnings.append(deep_lift_note)
-            weighted_score, trap_note = model_upper_trap_score_adjustment(match, weighted_score, signals)
+            weighted_score, trap_note = model_upper_trap_score_adjustment(match, weighted_score, decision_signals_for_source(match, adjusted_signals))
             if trap_note:
                 warnings.append(trap_note)
+            weighted_score, missing_asian_note = okooo_missing_live_asian_model_cap(
+                match,
+                weighted_score,
+                decision_signals_for_source(match, adjusted_signals),
+            )
+            if missing_asian_note:
+                warnings.append(missing_asian_note)
 
         completeness = int(round(100 * available_weight / (1 - WEIGHTS["data_quality"])))
         completeness = clamp_int(completeness, 0, 100)
@@ -1844,30 +1885,22 @@ class Predictor:
             reason=f"可用权重 {available_weight:.2f}，完整度 {completeness}%",
         )
         score_momentum_signal = current_score_momentum_signal(weighted_score, snapshot_context)
-        decision_signals = [*signals, score_momentum_signal]
-        purchase_decision = purchase_decision_from_signals(
-            match=match,
-            weighted_score=weighted_score,
-            completeness=completeness,
-            available_weight=available_weight,
-            model_recommendation=model_recommendation,
-            signals=decision_signals,
-        )
+        decision_reason = model_decision_reason(weighted_score, model_recommendation, available_weight)
         return AnalysisResult(
             match=match,
-            recommendation=purchase_decision.side,
+            recommendation=model_recommendation,
             score=weighted_score,
-            confidence=purchase_decision.confidence,
+            confidence=model_confidence,
             completeness=completeness,
             upper_team=upper_team,
             lower_team=lower_team,
-            signals=[*decision_signals, data_quality_signal],
+            signals=[*signals, score_momentum_signal, data_quality_signal],
             warnings=warnings,
             model_recommendation=model_recommendation,
             model_confidence=model_confidence,
-            purchase_score=purchase_decision.score,
-            decision_reason=purchase_decision.reason,
-            is_reversed=purchase_decision.is_reversed,
+            purchase_score=weighted_score,
+            decision_reason=decision_reason,
+            is_reversed=False,
         )
 
     def _refresh_newspdex_detail(self, match: Match, warnings: list[str]) -> Match:
@@ -2087,31 +2120,47 @@ class Predictor:
                 )
 
         score = clamp(sum(row_scores) / len(row_scores), -1, 1)
-        upper_init_avg, upper_now_avg, upper_move = average_upper_water_movement(selected_rows, match, upper_team)
-        if upper_move > 0.035:
-            move_penalty = clamp(upper_move / 0.20, 0, 0.35)
+        upper_init_avg, upper_now_avg, upper_move, upper_line_delta, adjusted_upper_move = (
+            average_team_line_adjusted_water_movement(selected_rows, match, upper_team)
+        )
+        if adjusted_upper_move > 0.035:
+            move_penalty = clamp(adjusted_upper_move / 0.20, 0, 0.35)
             if handicap_upper_water_rise_mitigated_by_euro(match, upper_team):
-                move_penalty *= 0.50
-                reasons.append("欧赔/凯利支撑让球方，上盘升水扣分减半")
+                if match.raw.get("_source") == "okooo" and line_depth(match.asian_line) >= 1.25:
+                    move_penalty *= 0.80
+                    reasons.append("深盘欧赔仅确认胜负，上盘升水扣分小幅减轻")
+                else:
+                    move_penalty *= 0.50
+                    reasons.append("欧赔/凯利支撑让球方，上盘升水扣分减半")
             score = clamp(score - move_penalty, -1, 1)
             reasons.append(
-                f"上盘平均水位上升 {upper_init_avg:.3g}->{upper_now_avg:.3g}，扣分 {move_penalty:.2f}"
+                f"上盘水位 {upper_init_avg:.3g}->{upper_now_avg:.3g}，盘口变化 {upper_line_delta:+.2f} 后仍偏升水 {adjusted_upper_move:+.3f}，扣分 {move_penalty:.2f}"
             )
-        elif upper_move < -0.035:
-            reasons.append(f"上盘平均水位下降 {upper_init_avg:.3g}->{upper_now_avg:.3g}")
+        elif adjusted_upper_move < -0.035:
+            reasons.append(
+                f"上盘水位 {upper_init_avg:.3g}->{upper_now_avg:.3g}，盘口变化 {upper_line_delta:+.2f} 后仍偏降水 {adjusted_upper_move:+.3f}"
+            )
+        elif abs(upper_move) > 0.035 and abs(upper_line_delta) > 0.01:
+            reasons.append(
+                f"上盘水位 {upper_init_avg:.3g}->{upper_now_avg:.3g} 与盘口变化 {upper_line_delta:+.2f} 基本匹配"
+            )
         if snapshot_context and snapshot_context.available:
-            if snapshot_context.heat_delta > 0.06 and snapshot_context.upper_water_delta > 0.025:
+            adjusted_history_water = line_adjusted_snapshot_water_delta(
+                snapshot_context.upper_water_delta,
+                snapshot_context.line_depth_delta,
+            )
+            if snapshot_context.heat_delta > 0.06 and adjusted_history_water > 0.025:
                 history_penalty = clamp(
-                    0.12 + snapshot_context.heat_delta * 0.65 + snapshot_context.upper_water_delta * 1.5,
+                    0.12 + snapshot_context.heat_delta * 0.65 + adjusted_history_water * 1.5,
                     0,
                     0.35,
                 )
                 score = clamp(score - history_penalty, -1, 1)
                 reasons.append(
-                    f"历史热度升高但上盘水位也升高，扣分 {history_penalty:.2f}"
+                    f"历史热度升高但盘口校正后上盘仍升水，扣分 {history_penalty:.2f}"
                 )
-            elif snapshot_context.heat_delta > 0.06 and snapshot_context.upper_water_delta < -0.025:
-                reasons.append("历史热度升高且上盘降水")
+            elif snapshot_context.heat_delta > 0.06 and adjusted_history_water < -0.025:
+                reasons.append("历史热度升高且盘口校正后上盘降水")
         bifa_heat_edge = score_bifa_heat_edge(match, upper_team, lower_team)
         divergence_penalty = score_heat_handicap_divergence_penalty(bifa_heat_edge, score)
         if fallback_only:
@@ -2121,12 +2170,18 @@ class Predictor:
             reasons.append(f"必发热度与亚盘水位背离 扣分 {divergence_penalty:.2f}")
         if fallback_only:
             reasons.append("静态亚盘均值兜底，已降权")
+            score = clamp(score, -0.10, 0.10)
+            reasons.append("缺少真实公司行，亚盘分只作弱参考")
         # 深盘且欧赔/凯利明显挺让球方时，亚盘「大热背离」不宜把强队打穿盘整体压成强烈下盘（如深让大胜）
         if line_depth(match.asian_line) >= 1.2 and score < -0.18 and handicap_upper_water_rise_mitigated_by_euro(
             match, upper_team
         ):
-            score = clamp(score * 0.52 + 0.26, -1, 0.22)
-            reasons.append("深盘欧赔挺上盘，热背离对亚盘的负分回拉")
+            if match.raw.get("_source") == "okooo":
+                score = clamp(score * 0.72 + 0.08, -1, -0.08)
+                reasons.append("深盘欧赔挺胜负但亚盘仍背离，仅小幅回拉")
+            else:
+                score = clamp(score * 0.52 + 0.26, -1, 0.22)
+                reasons.append("深盘欧赔挺上盘，热背离对亚盘的负分回拉")
         return Signal(
             "亚盘水位",
             score,
@@ -2278,6 +2333,7 @@ class Predictor:
 
         price_edge = score_bifa_odds_confirmation(upper_price, lower_price)
         probability_reason = ""
+        upper_prob = draw_prob = lower_prob = 0.0
         if draw_price > 0:
             upper_prob, draw_prob, lower_prob = normalized_probabilities(upper_price, draw_price, lower_price)
             fair_depth = fair_handicap_depth_from_probabilities(upper_prob, draw_prob, lower_prob)
@@ -2297,6 +2353,14 @@ class Predictor:
         payout_edge = score_bifa_payout_edge(match, upper_team, lower_team)
         heat_split = index_edge * amount_edge < 0 and abs(index_edge) >= 0.04 and abs(amount_edge) >= 0.18
         hot_upper_pressure = max(heat_edge, amount_edge, 0.0)
+        okooo_shallow_cover_value = (
+            match.raw.get("_source") == "okooo"
+            and draw_price > 0
+            and gap >= 0.30
+            and upper_prob >= 0.70
+            and draw_prob <= 0.16
+            and (not has_upper_water or upper_water < 2.00)
+        )
         interpretation = "盘口与价格大致匹配"
         if gap > 0.12:
             shallow_pressure = clamp(gap / 0.65, 0, 1)
@@ -2308,14 +2372,19 @@ class Predictor:
                 score = clamp(0.12 + 0.30 * shallow_pressure, 0, 0.45)
                 interpretation = "实际盘口偏浅但上盘低水防守，偏上盘确认"
             elif gap >= 0.30:
-                neutral_water_pressure = clamp((upper_water - 1.86) / 0.14, 0, 1) if has_upper_water else 0.0
-                bifa_pressure = clamp(hot_upper_pressure / 0.45, 0, 1)
-                score = -clamp(
-                    0.12 + 0.26 * shallow_pressure + 0.18 * neutral_water_pressure + 0.12 * bifa_pressure,
-                    0,
-                    0.65,
-                )
-                interpretation = "实际盘口明显偏浅且上盘未低水防守，偏下盘风险"
+                if okooo_shallow_cover_value:
+                    neutral_water_drag = clamp((upper_water - 1.88) / 0.12, 0, 1) if has_upper_water else 0.0
+                    score = clamp(0.10 + 0.20 * shallow_pressure - 0.12 * neutral_water_drag, -0.05, 0.28)
+                    interpretation = "实际盘口明显偏浅，上盘打穿门槛友好；水位未低水防守，价值降权"
+                else:
+                    neutral_water_pressure = clamp((upper_water - 1.86) / 0.14, 0, 1) if has_upper_water else 0.0
+                    bifa_pressure = clamp(hot_upper_pressure / 0.45, 0, 1)
+                    score = -clamp(
+                        0.12 + 0.26 * shallow_pressure + 0.18 * neutral_water_pressure + 0.12 * bifa_pressure,
+                        0,
+                        0.65,
+                    )
+                    interpretation = "实际盘口明显偏浅且上盘未低水防守，偏下盘风险"
             else:
                 score = clamp(0.12 * shallow_pressure, -0.15, 0.18)
                 interpretation = "实际盘口偏浅但未见明显高水诱导，弱上盘价值"
@@ -2353,10 +2422,14 @@ class Predictor:
             bifa_reasons.append("必发指数/成交额分裂，盘口估算降权")
         if gap > 0.12 and hot_upper_pressure >= 0.25 and upper_water > 1.86:
             penalty = clamp(0.08 + 0.18 * clamp(hot_upper_pressure / 0.55, 0, 1), 0, 0.24)
+            if okooo_shallow_cover_value:
+                penalty *= 0.35
             score = clamp(score - penalty, -1, 1)
             bifa_reasons.append(f"必发资金偏上盘但盘口未升深/低水防守，扣分 {penalty:.2f}")
         if payout_edge < -0.10 and gap > 0.12:
             penalty = clamp(0.05 + abs(payout_edge) * 0.20, 0, 0.18)
+            if okooo_shallow_cover_value:
+                penalty *= 0.45
             score = clamp(score - penalty, -1, 1)
             bifa_reasons.append(f"必发盈亏不支持上盘，扣分 {penalty:.2f}")
         elif payout_edge > 0.15 and score > 0:
@@ -2374,8 +2447,13 @@ class Predictor:
             and (upper_prob - lower_prob) >= 0.16
         ):
             bump = clamp(0.28 + 0.45 * min((upper_prob - lower_prob - 0.16) / 0.22, 1.0), 0.22, 0.62)
-            score = clamp(score + bump, -1, 0.10)
-            interpretation += f"；深盘强队胜赔概率仍明显领先，盘口合理性负分回拉 {bump:.2f}"
+            if match.raw.get("_source") == "okooo" and upper_water >= 1.96:
+                bump *= 0.35
+                score = clamp(score + bump, -1, -0.05)
+                interpretation += f"；澳客深盘上盘高水，胜赔只小幅回拉 {bump:.2f}"
+            else:
+                score = clamp(score + bump, -1, 0.10)
+                interpretation += f"；深盘强队胜赔概率仍明显领先，盘口合理性负分回拉 {bump:.2f}"
         return Signal(
             "盘口合理性",
             score,
@@ -2408,13 +2486,30 @@ class Predictor:
         adjusted = avg * consistency
         if mixed_penalty and adjusted:
             adjusted = math.copysign(max(abs(adjusted) - mixed_penalty, 0.0), adjusted)
+        consensus_note = ""
+        consensus_direction = 1 if positives > negatives else -1 if negatives > positives else 0
+        consensus_count = max(positives, negatives)
+        consensus_share = consensus_count / len(scores)
+        if consensus_direction and consensus_count >= 5 and consensus_share >= 0.75 and dispersion <= 0.30:
+            consensus_floor = clamp(
+                0.30 + 0.40 * (consensus_share - 0.75) + 0.20 * max(0.0, 0.22 - dispersion),
+                0.30,
+                0.46,
+            )
+            if adjusted * consensus_direction > 0:
+                if abs(adjusted) < consensus_floor:
+                    adjusted = consensus_direction * consensus_floor
+                    consensus_note = f"；多数公司同向，强度下限 {consensus_floor:.2f}"
+            elif abs(adjusted) < 0.08:
+                adjusted = consensus_direction * consensus_floor * 0.75
+                consensus_note = f"；多数公司同向但水位幅度弱，强度下限折减 {consensus_floor * 0.75:.2f}"
         score = clamp(adjusted, -1, 1)
         return Signal(
             "公司一致性",
             score,
             WEIGHTS["bookmaker_consensus"],
             True,
-            f"{len(scores)}家公司：上盘{positives}，下盘{negatives}，中性{neutral}，分歧度 {dispersion:.2f}",
+            f"{len(scores)}家公司：上盘{positives}，下盘{negatives}，中性{neutral}，分歧度 {dispersion:.2f}{consensus_note}",
         )
 
     def _depth_profile_signal(
@@ -2525,9 +2620,13 @@ class Predictor:
             reasons.append("缺少快照趋势确认")
 
         if snapshot_context and snapshot_context.available:
-            if snapshot_context.heat_delta > 0.06 and snapshot_context.upper_water_delta > 0.025:
+            adjusted_history_water = line_adjusted_snapshot_water_delta(
+                snapshot_context.upper_water_delta,
+                snapshot_context.line_depth_delta,
+            )
+            if snapshot_context.heat_delta > 0.06 and adjusted_history_water > 0.025:
                 penalty += 0.18
-                reasons.append("历史热度升高但上盘升水")
+                reasons.append("历史热度升高但盘口校正后上盘仍升水")
             if depth >= 0.75 and snapshot_context.heat_delta > 0.06 and snapshot_context.line_depth_delta <= 0.05:
                 penalty += 0.10
                 reasons.append("历史热度升高但盘口未升深")
@@ -2537,8 +2636,14 @@ class Predictor:
             reasons.append("中盘存在平局/小胜风险")
 
         if bookmaker_consensus_signal.available and bookmaker_consensus_signal.score < -0.08:
-            penalty += 0.10
+            consensus_penalty = 0.14 if depth >= 1.25 else 0.10
+            penalty += consensus_penalty
             reasons.append("主流公司分歧偏下盘")
+
+        fallback_handicap = "静态亚盘均值兜底" in handicap_signal.reason if handicap_signal.available else False
+        if depth >= 1.25 and handicap_signal.available and handicap_signal.score < -0.10 and not fallback_handicap:
+            penalty += 0.12
+            reasons.append("深盘亚盘水位未确认上盘打穿")
 
         if depth_profile_signal.available and depth_profile_signal.score < 0.25:
             penalty += 0.08 if depth <= 1.25 else 0.12
@@ -2565,8 +2670,16 @@ class Predictor:
             reasons.append("亚盘水位和公司一致性同向确认，缺数据风险封顶")
 
         if depth >= 1.25 and euro_kelly_signal.available and euro_kelly_signal.score >= 0.28:
-            penalty *= 0.55
-            reasons.append("深盘欧赔/Kelly仍挺上盘，赢盘门槛扣分打折")
+            asian_cover_weak = (
+                (handicap_signal.available and handicap_signal.score < -0.10 and not fallback_handicap)
+                or (bookmaker_consensus_signal.available and bookmaker_consensus_signal.score < -0.10)
+            )
+            if match.raw.get("_source") == "okooo" and asian_cover_weak:
+                penalty *= 0.85
+                reasons.append("深盘欧赔/Kelly只确认胜负，亚盘未确认时门槛扣分保留")
+            else:
+                penalty *= 0.55
+                reasons.append("深盘欧赔/Kelly仍挺上盘，赢盘门槛扣分打折")
 
         score = -clamp(penalty, 0, 0.75)
         if not reasons:
@@ -2644,49 +2757,60 @@ class Predictor:
         hot_team = upper_team if hot_direction > 0 else lower_team
         price_confirm = hot_direction * score_bifa_price_edge(match, upper_team, lower_team)
         payout_confirm = hot_direction * score_bifa_payout_edge(match, upper_team, lower_team)
-        _, _, hot_water_move = average_team_water_movement(rows, match, hot_team)
+        _hot_init, _hot_now, hot_water_move, hot_line_delta, adjusted_hot_water_move = (
+            average_team_line_adjusted_water_movement(rows, match, hot_team)
+        )
         reaction = 0.0
         reasons: list[str] = [f"{hot_team}热度 {heat_edge:+.2f}"]
+        okooo_source = match.raw.get("_source") == "okooo"
 
         if price_confirm >= 0.18:
-            reaction += 0.20
+            reaction += 0.10 if okooo_source else 0.20
             reasons.append("必发价格有确认")
         elif price_confirm <= -0.05:
-            reaction -= 0.24
+            reaction -= 0.12 if okooo_source else 0.24
             reasons.append("必发价格未确认")
 
         water_threshold = 0.035
-        if hot_water_move < -water_threshold:
-            water_scale = clamp((abs(hot_water_move) - water_threshold) / 0.11, 0, 1)
-            water_bonus = 0.16 + 0.14 * water_scale
+        if adjusted_hot_water_move < -water_threshold:
+            water_scale = clamp((abs(adjusted_hot_water_move) - water_threshold) / 0.11, 0, 1)
+            water_bonus = (0.24 + 0.22 * water_scale) if okooo_source else (0.16 + 0.14 * water_scale)
             reaction += water_bonus
-            reasons.append(f"{hot_team}水位下降 {hot_water_move:+.3f}，弹性加分 {water_bonus:.2f}")
-        elif hot_water_move > water_threshold:
-            water_scale = clamp((hot_water_move - water_threshold) / 0.11, 0, 1)
-            water_penalty = 0.24 + 0.18 * water_scale
+            reasons.append(
+                f"{hot_team}水位变化 {hot_water_move:+.3f}，盘口变化 {hot_line_delta:+.2f} 后偏降水 {adjusted_hot_water_move:+.3f}，弹性加分 {water_bonus:.2f}"
+            )
+        elif adjusted_hot_water_move > water_threshold:
+            water_scale = clamp((adjusted_hot_water_move - water_threshold) / 0.11, 0, 1)
+            water_penalty = (0.32 + 0.25 * water_scale) if okooo_source else (0.24 + 0.18 * water_scale)
             reaction -= water_penalty
-            reasons.append(f"{hot_team}水位上升 {hot_water_move:+.3f}，弹性扣分 {water_penalty:.2f}")
+            reasons.append(
+                f"{hot_team}水位变化 {hot_water_move:+.3f}，盘口变化 {hot_line_delta:+.2f} 后偏升水 {adjusted_hot_water_move:+.3f}，弹性扣分 {water_penalty:.2f}"
+            )
         elif rows:
-            reaction -= 0.10
-            reasons.append("盘口水位反应偏弱")
+            reaction -= 0.14 if okooo_source else 0.10
+            if abs(hot_water_move) > water_threshold and abs(hot_line_delta) > 0.01:
+                reasons.append("盘口和水位配套变化，未形成额外防守")
+            else:
+                reasons.append("盘口水位反应偏弱")
 
         if payout_confirm < -0.12:
-            reaction -= 0.15
+            reaction -= 0.08 if okooo_source else 0.15
             reasons.append("盈亏压力未支持热门方")
         elif payout_confirm > 0.12:
-            reaction += 0.08
+            reaction += 0.04 if okooo_source else 0.08
             reasons.append("盈亏压力支持热门方")
 
         if snapshot_context and snapshot_context.available:
             heat_delta = snapshot_context.heat_delta * hot_direction
             hot_water_delta = snapshot_context.upper_water_delta if hot_direction > 0 else snapshot_context.lower_water_delta
             depth_delta = snapshot_context.line_depth_delta * hot_direction
-            if heat_delta > 0.06 and hot_water_delta > 0.025:
-                reaction -= 0.22
-                reasons.append("历史热度升高但热门方升水")
-            elif heat_delta > 0.06 and hot_water_delta < -0.025:
-                reaction += 0.18
-                reasons.append("历史热度升高且热门方降水")
+            adjusted_hot_history_water = line_adjusted_snapshot_water_delta(hot_water_delta, depth_delta)
+            if heat_delta > 0.06 and adjusted_hot_history_water > 0.025:
+                reaction -= 0.28 if okooo_source else 0.22
+                reasons.append("历史热度升高但盘口校正后热门方仍升水")
+            elif heat_delta > 0.06 and adjusted_hot_history_water < -0.025:
+                reaction += 0.24 if okooo_source else 0.18
+                reasons.append("历史热度升高且盘口校正后热门方降水")
             if heat_delta > 0.06 and depth_delta > 0.05:
                 reaction += 0.12
                 reasons.append("盘口深度随热度防守")
@@ -2927,6 +3051,7 @@ class Predictor:
         external_edge = external_consensus_signal.score if external_consensus_signal.available else 0.0
         water_value_edge = water_value_signal.score if water_value_signal.available else 0.0
         depth = line_depth(match.asian_line)
+        okooo_core_only = match.raw.get("_source") == "okooo"
 
         components: list[float] = []
         reasons: list[str] = []
@@ -2943,53 +3068,67 @@ class Predictor:
             elasticity_confirm = hot_direction * elasticity_edge
             external_confirm = hot_direction * external_edge
             water_value_confirm = hot_direction * water_value_edge
+            if okooo_core_only:
+                price_pos_w, price_neg_w = 0.10, 0.14
+                handicap_pos_w, handicap_neg_w, handicap_neutral_w = 0.48, 0.56, 0.22
+                trade_pos_w, trade_neg_w = 0.30, 0.34
+                euro_pos_w, euro_neg_w = 0.06, 0.06
+                fair_pos_w, fair_neg_w = 0.08, 0.10
+                elasticity_pos_w, elasticity_neg_w = 0.28, 0.32
+            else:
+                price_pos_w, price_neg_w = 0.25, 0.35
+                handicap_pos_w, handicap_neg_w, handicap_neutral_w = 0.35, 0.45, 0.15
+                trade_pos_w, trade_neg_w = 0.20, 0.25
+                euro_pos_w, euro_neg_w = 0.15, 0.15
+                fair_pos_w, fair_neg_w = 0.12, 0.16
+                elasticity_pos_w, elasticity_neg_w = 0.16, 0.20
 
             if price_confirm >= 0.10:
-                components.append(0.25 * hot_direction)
+                components.append(price_pos_w * hot_direction)
                 reasons.append(f"{hot_side}热度获必发价格确认")
             else:
-                components.append(-0.35 * hot_direction)
+                components.append(-price_neg_w * hot_direction)
                 reasons.append(f"{hot_side}热度未获必发价格确认")
 
             if handicap_signal.available:
                 if handicap_confirm >= 0.08:
-                    weight = 0.16 if handicap_is_fallback else 0.35
+                    weight = 0.10 if handicap_is_fallback else handicap_pos_w
                     components.append(weight * hot_direction)
                     reasons.append("亚盘低水/降水确认热门方" + ("(静态均值降权)" if handicap_is_fallback else ""))
                 elif handicap_confirm <= -0.08:
-                    weight = 0.16 if handicap_is_fallback else 0.45
+                    weight = 0.12 if handicap_is_fallback else handicap_neg_w
                     components.append(-weight * hot_direction)
                     reasons.append("亚盘升水或分歧，热门方买入更危险" + ("(静态均值降权)" if handicap_is_fallback else ""))
                 else:
-                    weight = 0.05 if handicap_is_fallback else 0.15
+                    weight = 0.05 if handicap_is_fallback else handicap_neutral_w
                     components.append(-weight * hot_direction)
                     reasons.append("亚盘对热门方防守不足" + ("(静态均值降权)" if handicap_is_fallback else ""))
 
             if trade_signal.available:
                 if trade_confirm >= 0.10:
-                    components.append(0.20 * hot_direction)
+                    components.append(trade_pos_w * hot_direction)
                     reasons.append("成交走势顺热度")
                 elif trade_confirm <= -0.10:
-                    components.append(-0.25 * hot_direction)
+                    components.append(-trade_neg_w * hot_direction)
                     reasons.append("成交走势反热度")
 
             if euro_kelly_signal.available:
                 if euro_confirm >= 0.10:
-                    components.append(0.15 * hot_direction)
+                    components.append(euro_pos_w * hot_direction)
                     reasons.append("欧赔/Kelly同步")
                 elif euro_confirm <= -0.10:
-                    components.append(-0.15 * hot_direction)
+                    components.append(-euro_neg_w * hot_direction)
                     reasons.append("欧赔/Kelly背离")
 
             if fair_line_signal.available:
                 if fair_confirm >= 0.10:
-                    components.append(0.12 * hot_direction)
+                    components.append(fair_pos_w * hot_direction)
                     reasons.append("盘口深度与价格匹配")
                 elif fair_confirm <= -0.10:
-                    components.append(-0.16 * hot_direction)
+                    components.append(-fair_neg_w * hot_direction)
                     reasons.append("盘口相对价格偏深/偏危险")
 
-            if depth_profile_signal.available:
+            if depth_profile_signal.available and not okooo_core_only:
                 if depth_confirm >= 0.10:
                     components.append((0.10 if depth <= 0.5 else 0.16) * hot_direction)
                     reasons.append("盘口深度模型确认")
@@ -2999,23 +3138,23 @@ class Predictor:
 
             if market_elasticity_signal.available:
                 if elasticity_confirm >= 0.12:
-                    weight = 0.16
+                    weight = elasticity_pos_w
                     if trade_confirm <= -0.10 and euro_confirm <= -0.10:
-                        weight = 0.06
+                        weight = 0.12 if okooo_core_only else 0.06
                         reasons.append("资金/盘口弹性确认热门方但成交/Kelly仍背离，降权")
                     else:
                         reasons.append("资金/盘口弹性确认热门方")
                     components.append(weight * hot_direction)
                 elif elasticity_confirm <= -0.12:
-                    weight = 0.20
+                    weight = elasticity_neg_w
                     if trade_confirm >= 0.10 and euro_confirm >= 0.10:
-                        weight = 0.08
+                        weight = 0.14 if okooo_core_only else 0.08
                         reasons.append("资金/盘口弹性背离热门方但成交/Kelly同步，降权")
                     else:
                         reasons.append("资金/盘口弹性背离热门方")
                     components.append(-weight * hot_direction)
 
-            if external_consensus_signal.available:
+            if external_consensus_signal.available and not okooo_core_only:
                 if external_confirm >= 0.12:
                     components.append(0.12 * hot_direction)
                     reasons.append("外部赔率/实力同步")
@@ -3023,7 +3162,7 @@ class Predictor:
                     components.append(-0.14 * hot_direction)
                     reasons.append("外部赔率/实力背离")
 
-            if water_value_signal.available:
+            if water_value_signal.available and not okooo_core_only:
                 if water_value_confirm >= 0.30:
                     components.append(0.10 * hot_direction)
                     reasons.append("高低水价值确认热门方")
@@ -3036,12 +3175,16 @@ class Predictor:
                 reasons.append("浅盘热门存在平局风险")
 
             if snapshot_context and snapshot_context.available and hot_direction > 0:
-                if snapshot_context.heat_delta > 0.06 and snapshot_context.upper_water_delta > 0.025:
+                adjusted_history_water = line_adjusted_snapshot_water_delta(
+                    snapshot_context.upper_water_delta,
+                    snapshot_context.line_depth_delta,
+                )
+                if snapshot_context.heat_delta > 0.06 and adjusted_history_water > 0.025:
                     components.append(-0.22 * hot_direction)
-                    reasons.append("历史热度升高但盘口未防守热门方")
-                elif snapshot_context.heat_delta > 0.06 and snapshot_context.upper_water_delta < -0.025:
+                    reasons.append("历史热度升高但盘口校正后仍未防守热门方")
+                elif snapshot_context.heat_delta > 0.06 and adjusted_history_water < -0.025:
                     components.append(0.12 * hot_direction)
-                    reasons.append("历史热度升高且盘口降水确认")
+                    reasons.append("历史热度升高且盘口校正后降水确认")
                 if snapshot_context.line_depth_delta <= 0.05 and depth >= 0.75 and snapshot_context.heat_delta > 0.06:
                     components.append(-0.10 * hot_direction)
                     reasons.append("历史热度升高但盘口未升深")
@@ -3061,10 +3204,10 @@ class Predictor:
             if market_elasticity_signal.available and abs(elasticity_edge) >= 0.20:
                 components.append(0.16 * math.copysign(1.0, elasticity_edge))
                 reasons.append(f"热度不高但资金/盘口弹性偏{direction_label(elasticity_edge)}")
-            if external_consensus_signal.available and abs(external_edge) >= 0.18:
+            if external_consensus_signal.available and abs(external_edge) >= 0.18 and not okooo_core_only:
                 components.append(0.12 * math.copysign(1.0, external_edge))
                 reasons.append(f"热度不高但外部校验偏{direction_label(external_edge)}")
-            if water_value_signal.available and abs(water_value_edge) >= 0.30:
+            if water_value_signal.available and abs(water_value_edge) >= 0.30 and not okooo_core_only:
                 components.append(0.12 * math.copysign(1.0, water_value_edge))
                 reasons.append(f"热度不高但高低水价值偏{direction_label(water_value_edge)}")
 
@@ -3093,7 +3236,14 @@ class Predictor:
         )
         if upper_trap_pressure > 0:
             score = clamp(score - upper_trap_pressure, -1, 1)
-            if depth <= 0.5:
+            if okooo_core_only:
+                if trade_edge >= 0.10 or handicap_edge >= 0.08 or elasticity_edge >= 0.12:
+                    cap = 0.10
+                elif handicap_edge <= -0.08 or elasticity_edge <= -0.12:
+                    cap = -0.10
+                else:
+                    cap = 0.02
+            elif depth <= 0.5:
                 cap = -0.10 if (euro_edge <= -0.10 or fair_edge <= -0.10) else 0.08
             elif depth <= 1.25:
                 cap = -0.08 if euro_edge <= 0.02 else 0.10
@@ -3101,32 +3251,18 @@ class Predictor:
                 cap = -0.12 if fair_edge <= -0.05 else 0.06
             score = min(score, cap)
             reasons.append(f"上盘大热但成交/欧赔/盘口未形成确认，热门陷阱降权 {upper_trap_pressure:.2f}")
-        same_direction_count = count_same_direction(
-            [
-                bifa_signal,
-                trade_signal,
-                handicap_signal,
-                euro_kelly_signal,
-                fair_line_signal,
-                depth_profile_signal,
-                market_elasticity_signal,
-                external_consensus_signal,
-                water_value_signal,
-            ]
-        )
-        conflicts = signal_conflict_count(
-            [
-                bifa_signal,
-                trade_signal,
-                handicap_signal,
-                euro_kelly_signal,
-                fair_line_signal,
-                depth_profile_signal,
-                market_elasticity_signal,
-                external_consensus_signal,
-                water_value_signal,
-            ]
-        )
+        direction_signals = [
+            bifa_signal,
+            trade_signal,
+            handicap_signal,
+            euro_kelly_signal,
+            fair_line_signal,
+            market_elasticity_signal,
+        ]
+        if not okooo_core_only:
+            direction_signals.extend([depth_profile_signal, external_consensus_signal, water_value_signal])
+        same_direction_count = count_same_direction(direction_signals)
+        conflicts = signal_conflict_count(direction_signals)
         if abs(score) < 0.08 and conflicts >= 2:
             reasons.append("正反信号抵消，市场平衡中性")
         elif same_direction_count >= 3 and score > 0:
@@ -3729,6 +3865,49 @@ def average_team_water_movement(
     return init_avg, now_avg, now_avg - init_avg
 
 
+def team_line_delta(row: HandicapRow, match: Match, team: str) -> float:
+    """Positive means the handicap became deeper/harder for this team."""
+    if abs(row.init_line) < 1e-9 or abs(row.latest_line) < 1e-9:
+        return 0.0
+    line_delta = row.latest_line - row.init_line
+    return -line_delta if team == match.home else line_delta
+
+
+def average_team_line_delta(rows: list[HandicapRow], match: Match, team: str) -> float:
+    values = [
+        team_line_delta(row, match, team)
+        for row in rows
+        if abs(row.init_line) > 1e-9 or abs(row.latest_line) > 1e-9
+    ]
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def expected_water_move_for_line_delta(line_delta: float) -> float:
+    """Normal water drift caused by a line move: deeper line raises water, shallower line lowers it."""
+    return clamp(0.12 * line_delta, -0.18, 0.18)
+
+
+def line_adjusted_water_move(water_move: float, line_delta: float) -> float:
+    return water_move - expected_water_move_for_line_delta(line_delta)
+
+
+def average_team_line_adjusted_water_movement(
+    rows: list[HandicapRow],
+    match: Match,
+    team: str,
+) -> tuple[float, float, float, float, float]:
+    init_avg, now_avg, water_move = average_team_water_movement(rows, match, team)
+    line_delta = average_team_line_delta(rows, match, team)
+    adjusted = line_adjusted_water_move(water_move, line_delta)
+    return init_avg, now_avg, water_move, line_delta, adjusted
+
+
+def line_adjusted_snapshot_water_delta(water_delta: float, line_depth_delta: float) -> float:
+    return line_adjusted_water_move(water_delta, line_depth_delta)
+
+
 def score_dispersion(values: list[float]) -> float:
     if len(values) < 2:
         return 0.0
@@ -4239,6 +4418,55 @@ def signal_conflict_count(signals: list[Signal]) -> int:
     return min(positives, negatives) * 2
 
 
+def asian_lower_confirmation_cluster(lookup: dict[str, Signal]) -> tuple[int, list[str]]:
+    """Count lower-side confirmations that come from the handicap market itself."""
+    count = 0
+    reasons: list[str] = []
+    handicap = lookup.get("亚盘水位")
+    bookmaker = lookup.get("公司一致性")
+    fair_line = lookup.get("盘口合理性")
+    elasticity = lookup.get("资金/盘口弹性")
+    cover_risk = lookup.get("赢盘门槛风险")
+    fallback_handicap = bool(handicap and "静态亚盘均值兜底" in handicap.reason)
+
+    if signal_value(handicap) <= -0.10 and not fallback_handicap:
+        count += 1
+        reasons.append("亚盘水位偏下盘")
+    if signal_value(bookmaker) <= -0.12:
+        count += 1
+        reasons.append("公司一致性偏下盘")
+    if signal_value(fair_line) <= -0.10:
+        count += 1
+        reasons.append("盘口合理性偏下盘")
+    if signal_value(elasticity) <= -0.12:
+        count += 1
+        reasons.append("资金/盘口弹性偏下盘")
+    if signal_value(cover_risk) <= -0.35 and not fallback_handicap and (
+        signal_value(handicap) <= 0.02 or signal_value(bookmaker) <= 0.02
+    ):
+        count += 1
+        reasons.append("赢盘门槛风险未获亚盘确认")
+    return count, reasons
+
+
+def asian_upper_confirmation_cluster(lookup: dict[str, Signal]) -> tuple[int, list[str]]:
+    count = 0
+    reasons: list[str] = []
+    if signal_value(lookup.get("亚盘水位")) >= 0.18:
+        count += 1
+        reasons.append("亚盘水位偏上盘")
+    if signal_value(lookup.get("公司一致性")) >= 0.18:
+        count += 1
+        reasons.append("公司一致性偏上盘")
+    if signal_value(lookup.get("盘口合理性")) >= 0.08:
+        count += 1
+        reasons.append("盘口合理性偏上盘")
+    if signal_value(lookup.get("资金/盘口弹性")) >= 0.14:
+        count += 1
+        reasons.append("资金/盘口弹性偏上盘")
+    return count, reasons
+
+
 def handicap_upper_water_rise_mitigated_by_euro(match: Match, upper_team: str) -> bool:
     """欧赔/凯利明显支撑让球方(上盘)时，上盘临场升水多为正常受热，减轻扣分。"""
     uk = side_key(match, upper_team)
@@ -4266,8 +4494,13 @@ def score_handicap_row(match: Match, row: HandicapRow, upper_team: str) -> float
     lower_init = row.init_sec_b if upper_is_home else row.init_sec_a
 
     current_water_edge = clamp((lower_now - upper_now) / 0.45, -1, 1)
-    relative_movement_edge = clamp(((upper_init - upper_now) - (lower_init - lower_now)) / 0.35, -1, 1)
-    upper_water_direction = clamp((upper_init - upper_now) / 0.18, -1, 1)
+    line_delta = team_line_delta(row, match, upper_team)
+    upper_move = upper_now - upper_init
+    lower_move = lower_now - lower_init
+    upper_adjusted_move = line_adjusted_water_move(upper_move, line_delta)
+    lower_adjusted_move = line_adjusted_water_move(lower_move, -line_delta)
+    relative_movement_edge = clamp((lower_adjusted_move - upper_adjusted_move) / 0.35, -1, 1)
+    upper_water_direction = clamp(-upper_adjusted_move / 0.18, -1, 1)
     line_move_edge = handicap_line_move_edge(match, row, upper_team)
     payout_quality = clamp((row.payout - 0.92) / 0.08, 0, 1)
     if abs(line_move_edge) > 1e-9:
@@ -4357,28 +4590,66 @@ def okooo_static_snapshot_score_adjustment(
     return adjusted, note
 
 
+def okooo_missing_live_asian_model_cap(
+    match: Match,
+    weighted_score: float,
+    signals: list[Signal],
+) -> tuple[float, str | None]:
+    if match.raw.get("_source") != "okooo":
+        return weighted_score, None
+    lookup = {signal.name: signal for signal in signals}
+    handicap = lookup.get("亚盘水位")
+    bookmaker = lookup.get("公司一致性")
+    trade = lookup.get("必发成交走势")
+    fallback_or_missing_asian = bool(
+        (handicap and "静态亚盘均值兜底" in handicap.reason)
+        or bookmaker is None
+        or not bookmaker.available
+    )
+    if not fallback_or_missing_asian:
+        return weighted_score, None
+    upper_team, lower_team = upper_lower_teams(match)
+    heat_edge = score_bifa_heat_edge(match, upper_team, lower_team)
+    trade_missing = trade is None or not trade.available
+    direction_against_heat = abs(heat_edge) >= 0.25 and weighted_score * heat_edge < 0
+    if not trade_missing or (abs(weighted_score) >= 0.16 and not direction_against_heat):
+        return weighted_score, None
+    capped = clamp(weighted_score, LOWER_THRESHOLD + 0.005, UPPER_THRESHOLD - 0.005)
+    if abs(capped - weighted_score) < 1e-9:
+        return weighted_score, None
+    if direction_against_heat:
+        return capped, "缺少真实亚盘公司行，反热度模型方向封顶为观望"
+    return capped, "缺少真实亚盘公司行，弱模型方向封顶为观望"
+
+
 def source_adjusted_signals(match: Match, signals: list[Signal]) -> list[Signal]:
     if match.raw.get("_source") != "okooo":
         return signals
-    weight_overrides = {
-        "市场平衡/背离": 0.040,
-        "平局风险": 0.045,
-        "盘口深度/打穿能力": 0.015,
-        "赢盘门槛风险": 0.035,
-        "高低水价值": 0.016,
-        "外部赔率/实力校验": 0.020,
-    }
     adjusted: list[Signal] = []
     for signal in signals:
-        override = weight_overrides.get(signal.name)
-        if override is None or signal.weight <= override:
+        override = OKOOO_SCORING_WEIGHT_OVERRIDES.get(signal.name)
+        if override is None or abs(signal.weight - override) < 1e-9:
             adjusted.append(signal)
             continue
         reason = signal.reason
-        if "澳客同源加权降权" not in reason:
+        if override < signal.weight and "澳客同源加权降权" not in reason:
             reason += "；澳客同源加权降权"
+        elif override > signal.weight and signal.name in ("亚盘水位", "公司一致性", "盘口合理性", "赢盘门槛风险", "资金/盘口弹性"):
+            reason += "；澳客亚盘主导权重提升"
         adjusted.append(replace(signal, weight=override, reason=reason))
     return adjusted
+
+
+def scoring_signals_for_source(match: Match, signals: list[Signal]) -> list[Signal]:
+    if match.raw.get("_source") != "okooo":
+        return signals
+    return [signal for signal in signals if signal.name not in OKOOO_INTERNAL_SIGNAL_NAMES]
+
+
+def decision_signals_for_source(match: Match, signals: list[Signal]) -> list[Signal]:
+    if match.raw.get("_source") != "okooo":
+        return signals
+    return [signal for signal in signals if signal.name not in OKOOO_PURCHASE_INTERNAL_SIGNAL_NAMES]
 
 
 def marginal_model_score_lift_for_mid_deep_upper(
@@ -4473,7 +4744,7 @@ def model_upper_trap_score_adjustment(
     Betfair/public heat is useful, but for Asian handicap it is not equivalent to
     cover value.  The model score should be allowed to turn lower when the hot
     upper side lacks the README confirmation chain and there is a concrete lower
-    confirmation cluster; otherwise we only leave purchase gating to handle risk.
+    confirmation cluster; otherwise the risk stays as a lighter model direction.
     """
     if weighted_score <= LOWER_THRESHOLD:
         return weighted_score, None
@@ -4491,6 +4762,7 @@ def model_upper_trap_score_adjustment(
     trade = lookup.get("必发成交走势")
     euro = lookup.get("欧赔/Kelly")
     handicap = lookup.get("亚盘水位")
+    bookmaker = lookup.get("公司一致性")
     fair_line = lookup.get("盘口合理性")
     depth_profile = lookup.get("盘口深度/打穿能力")
     cover_risk = lookup.get("赢盘门槛风险")
@@ -4499,6 +4771,7 @@ def model_upper_trap_score_adjustment(
     snapshot = lookup.get("快照趋势")
     water_value = lookup.get("高低水价值")
     external = lookup.get("外部赔率/实力校验")
+    market_elasticity = lookup.get("资金/盘口弹性")
 
     trade_available = bool(trade and trade.available)
     pressure = upper_favorite_trap_pressure_from_values(
@@ -4535,9 +4808,15 @@ def model_upper_trap_score_adjustment(
     if signal_value(handicap) <= -0.12:
         lower_confirmations += 1
         confirmation_reasons.append("亚盘水位偏下盘")
+    if signal_value(bookmaker) <= -0.12:
+        lower_confirmations += 1
+        confirmation_reasons.append("公司一致性偏下盘")
     if signal_value(water_value) <= -0.18:
         lower_confirmations += 1
         confirmation_reasons.append("水位价值偏下盘")
+    if signal_value(market_elasticity) <= -0.12:
+        lower_confirmations += 1
+        confirmation_reasons.append("资金/盘口弹性偏下盘")
     if snapshot and snapshot.available and signal_value(snapshot) <= -0.18 and weighted_score < 0.10:
         lower_confirmations += 1
         confirmation_reasons.append("快照趋势偏下盘")
@@ -4551,14 +4830,27 @@ def model_upper_trap_score_adjustment(
     if lower_confirmations <= 0:
         return weighted_score, None
 
+    okooo_source = match.raw.get("_source") == "okooo"
+    asian_lower_count, asian_lower_reasons = asian_lower_confirmation_cluster(lookup)
+    if okooo_source and asian_lower_count <= 0:
+        guarded_shift = clamp(pressure * 0.46 + 0.020, 0.045, 0.13)
+        adjusted = max(weighted_score - guarded_shift, LOWER_THRESHOLD + 0.005)
+        if adjusted < weighted_score:
+            reason = "、".join(confirmation_reasons[:3])
+            return adjusted, f"模型层热门陷阱降级 {guarded_shift:.3f}（{reason}；缺少亚盘下盘确认，不反打）"
+        return weighted_score, None
+
     positive_snapshot_guard = bool(snapshot and snapshot.available and signal_value(snapshot) >= 0.25)
-    core_lower_cluster = (
-        lower_confirmations >= 2
-        or signal_value(market) <= -0.12
-        or signal_value(handicap) <= -0.12
-        or signal_value(fair_line) <= -0.08
-        or signal_value(water_value) <= -0.18
-    )
+    if okooo_source:
+        core_lower_cluster = asian_lower_count >= 2 or (asian_lower_count >= 1 and lower_confirmations >= 2)
+    else:
+        core_lower_cluster = (
+            lower_confirmations >= 2
+            or signal_value(market) <= -0.12
+            or signal_value(handicap) <= -0.12
+            or signal_value(fair_line) <= -0.08
+            or signal_value(water_value) <= -0.18
+        )
     if positive_snapshot_guard and not core_lower_cluster and weighted_score > 0:
         guarded_shift = pressure * 0.42 + 0.025
         guarded_shift = clamp(guarded_shift, 0.05, 0.13)
@@ -4615,15 +4907,40 @@ def model_upper_trap_score_adjustment(
     if adjusted >= weighted_score:
         return weighted_score, None
     reason = "、".join(confirmation_reasons[:3])
+    if okooo_source and asian_lower_reasons:
+        reason = "、".join(asian_lower_reasons[:3])
     return adjusted, f"模型层热门陷阱回撤 {shift:.3f}（{reason}）"
 
 
 def recommendation_from_score(score: float) -> str:
-    if score > UPPER_THRESHOLD:
+    if score >= MODEL_DIRECTION_EPSILON:
         return "上盘"
-    if score < LOWER_THRESHOLD:
+    if score <= -MODEL_DIRECTION_EPSILON:
         return "下盘"
     return "观望"
+
+
+def score_strength_label(score: float) -> str:
+    abs_score = abs(score)
+    if abs_score < MODEL_DIRECTION_EPSILON:
+        return "无明显"
+    if abs_score < UPPER_THRESHOLD:
+        return "轻微"
+    if abs_score < STRONG_THRESHOLD:
+        return "中等"
+    return "强烈"
+
+
+def model_decision_reason(weighted_score: float, recommendation: str, available_weight: float) -> str:
+    strength = score_strength_label(weighted_score)
+    if recommendation == "观望":
+        reason = f"模型综合分 {weighted_score:+.3f}，方向不足 {MODEL_DIRECTION_EPSILON:.3f}，观望"
+    else:
+        reason = f"模型综合分 {weighted_score:+.3f}，直接推荐{recommendation}，强度{strength}"
+    if available_weight < 0.50:
+        reason += "；可用信号偏少，置信度已按数据完整度压低"
+    reason += "；未再叠加购买门槛"
+    return reason
 
 
 def snapshot_stop_update_lift(match: Match, snapshot_trend: Signal | None) -> bool:
@@ -4694,13 +5011,14 @@ MODEL_WAIT_SINGLE_CORE_ABS_FLOOR = 0.18
 
 
 def purchase_core_signals_confirm_when_model_wait(
-    lookup: dict[str, Signal], want_upper: bool, abs_adjusted: float
+    match: Match, lookup: dict[str, Signal], want_upper: bool, abs_adjusted: float
 ) -> bool:
     if abs_adjusted < MODEL_WAIT_PURCHASE_ABS_FLOOR:
         return False
     need = 1 if want_upper else -1
     euro = lookup.get("欧赔/Kelly")
     ah = lookup.get("亚盘水位")
+    bookmaker = lookup.get("公司一致性")
 
     def dir3(sig: Signal | None) -> int:
         if sig is None or not sig.available:
@@ -4712,9 +5030,29 @@ def purchase_core_signals_confirm_when_model_wait(
         return 0
 
     de, dh = dir3(euro), dir3(ah)
+    if want_upper:
+        asian_upper_count, _asian_upper_reasons = asian_upper_confirmation_cluster(lookup)
+        if asian_upper_count >= 2 and abs_adjusted >= 0.10:
+            return True
+    else:
+        asian_lower_count, _asian_lower_reasons = asian_lower_confirmation_cluster(lookup)
+        if (
+            asian_lower_count >= 2
+            and signal_value(ah) <= -0.10
+            and signal_value(bookmaker) <= -0.12
+            and abs_adjusted >= 0.10
+        ):
+            return True
     if not want_upper:
         bifa = lookup.get("必发指数")
         external = lookup.get("外部赔率/实力校验")
+        fallback_or_missing_asian = bool(
+            (ah and "静态亚盘均值兜底" in ah.reason)
+            or bookmaker is None
+            or not bookmaker.available
+        )
+        if match.raw.get("_source") == "okooo" and asian_lower_count < 2 and fallback_or_missing_asian:
+            return False
         fallback_handicap_lower = bool(
             ah
             and ah.available
@@ -4891,6 +5229,7 @@ def purchase_decision_from_signals(
     bifa = lookup.get("必发指数")
     trade = lookup.get("必发成交走势")
     fair_line = lookup.get("盘口合理性")
+    market_elasticity = lookup.get("资金/盘口弹性")
     strong_upper_consensus = (
         weighted_score > 0.10
         and signal_value(handicap) >= 0.40
@@ -4905,6 +5244,30 @@ def purchase_decision_from_signals(
     strong_upper_protected = strong_upper_consensus or strong_upper_consensus_euro
 
     cover_risk = lookup.get("赢盘门槛风险")
+    deep_asian_lower_count, deep_asian_lower_reasons = asian_lower_confirmation_cluster(lookup)
+    deep_asian_upper_count, _deep_asian_upper_reasons = asian_upper_confirmation_cluster(lookup)
+    okooo_deep_cover_block = (
+        match.raw.get("_source") == "okooo"
+        and depth >= 1.25
+        and deep_asian_lower_count >= 2
+        and deep_asian_upper_count < 2
+        and not strong_upper_protected
+        and weighted_score > -LEAN_THRESHOLD
+    )
+    if okooo_deep_cover_block:
+        deep_cover_pressure = clamp(
+            0.08
+            + 0.035 * min(deep_asian_lower_count, 4)
+            + 0.12 * clamp(abs(min(signal_value(handicap), 0.0)) - 0.10, 0, 0.45)
+            + 0.10 * clamp(abs(min(signal_value(bookmaker_consensus), 0.0)) - 0.12, 0, 0.45),
+            0.10,
+            0.28,
+        )
+        if signal_value(euro_kelly) >= 0.35 or signal_value(bifa) >= 0.45:
+            reasons.append("深盘必发/欧赔仅确认胜负，需服从亚盘打穿确认")
+        adjusted_score -= deep_cover_pressure
+        reasons.append(f"深盘亚盘确认不足修正 -{deep_cover_pressure:.2f}（{'、'.join(deep_asian_lower_reasons[:3])}）")
+
     if (
         secondary_enabled
         and cover_risk
@@ -4956,7 +5319,6 @@ def purchase_decision_from_signals(
         adjusted_score += market_shift
         reasons.append(f"盘口防守/背离修正 {market_shift:+.2f}")
 
-    market_elasticity = lookup.get("资金/盘口弹性")
     if secondary_enabled and market_elasticity and market_elasticity.available and abs(market_elasticity.score) >= 0.12:
         elasticity_shift = 0.12 * market_elasticity.score
         elasticity_direction = math.copysign(1.0, market_elasticity.score)
@@ -4986,7 +5348,13 @@ def purchase_decision_from_signals(
         reasons.append(f"高低水价值修正 {value_shift:+.2f}")
 
     external_consensus = lookup.get("外部赔率/实力校验")
-    if secondary_enabled and external_consensus and external_consensus.available and abs(external_consensus.score) >= 0.12:
+    if (
+        secondary_enabled
+        and match.raw.get("_source") != "okooo"
+        and external_consensus
+        and external_consensus.available
+        and abs(external_consensus.score) >= 0.12
+    ):
         external_shift = 0.10 * external_consensus.score
         adjusted_score += external_shift
         reasons.append(f"外部赔率/实力修正 {external_shift:+.2f}")
@@ -5130,6 +5498,30 @@ def purchase_decision_from_signals(
         reasons.append("购买优势过低，观望不买")
         side = "观望"
 
+    fallback_or_missing_asian = bool(
+        (handicap and "静态亚盘均值兜底" in handicap.reason)
+        or bookmaker_consensus is None
+        or not bookmaker_consensus.available
+    )
+    if (
+        side == "下盘"
+        and match.raw.get("_source") == "okooo"
+        and deep_asian_lower_count < 2
+        and fallback_or_missing_asian
+        and (
+            model_recommendation == "观望"
+            or abs(weighted_score) < 0.16
+            or signal_value(euro_kelly) >= 0.10
+            or signal_value(bifa) >= 0.25
+        )
+    ):
+        reasons.append("下盘缺少真实亚盘/公司确认，风险信号只降级观望")
+        side = "观望"
+
+    if side == "上盘" and okooo_deep_cover_block and adjusted_score < 0.18:
+        reasons.append("深盘亚盘/公司未确认打穿，剩余上盘优势不足，观望不买")
+        side = "观望"
+
     # 整数一球盘：上盘净胜 1 常为走水；综合分未拉开且赢盘门槛/平局风险已明显预警时，不强吃上盘。
     lv_one = line_value(match.asian_line)
     if (
@@ -5149,7 +5541,7 @@ def purchase_decision_from_signals(
     if (
         model_recommendation == "观望"
         and side in ("上盘", "下盘")
-        and not purchase_core_signals_confirm_when_model_wait(lookup, side == "上盘", abs(adjusted_score))
+        and not purchase_core_signals_confirm_when_model_wait(match, lookup, side == "上盘", abs(adjusted_score))
     ):
         reasons.append("模型观望且欧赔/Kelly与亚盘未同向确认或购买优势不足，不买")
         side = "观望"
@@ -5163,12 +5555,12 @@ def purchase_decision_from_signals(
     model_wait_reverse_confirmed = (
         attempted_reverse
         and model_recommendation == "观望"
-        and purchase_core_signals_confirm_when_model_wait(lookup, side == "上盘", abs(adjusted_score))
+        and purchase_core_signals_confirm_when_model_wait(match, lookup, side == "上盘", abs(adjusted_score))
     )
     model_direction_reverse_confirmed = (
         attempted_reverse
         and model_recommendation in ("上盘", "下盘")
-        and purchase_core_signals_confirm_when_model_wait(lookup, side == "上盘", abs(adjusted_score))
+        and purchase_core_signals_confirm_when_model_wait(match, lookup, side == "上盘", abs(adjusted_score))
     )
     if attempted_reverse and (
         (model_recommendation == "观望" and not model_wait_reverse_confirmed)
@@ -5327,17 +5719,10 @@ def print_upcoming(matches: list[Match], limit: int) -> None:
 
 def print_analysis(result: AnalysisResult, verbose: bool = False) -> None:
     match = result.match
-    if result.model_recommendation in ("上盘", "下盘"):
-        model_text = f"{result.model_recommendation}({side_team(result.model_recommendation, result.upper_team, result.lower_team)})"
-    elif result.lean == "无明显倾向":
-        model_text = "观望(无明显倾向)"
-    else:
-        model_text = f"观望(倾向{result.lean}:{result.lean_team})"
     print(
         f"{match.event_id} | {format_local(match.match_time)} | {match.home} vs {match.away} | "
         f"盘口 {match.asian_line} | 推荐 {purchase_display_text(result)} | "
-        f"模型 {model_text} | 置信度 {result.confidence}% | 完整度 {result.completeness}% | "
-        f"score {result.score:+.3f} | purchase {result.purchase_score:+.3f}"
+        f"置信度 {result.confidence}% | 完整度 {result.completeness}% | score {result.score:+.3f}"
     )
     print(f"  [DECISION] {result.decision_reason}")
     for signal in result.signals:
@@ -5351,12 +5736,8 @@ def print_analysis(result: AnalysisResult, verbose: bool = False) -> None:
 
 def purchase_display_text(result: AnalysisResult) -> str:
     if result.purchase_side == "观望":
-        if result.lean == "无明显倾向":
-            return "观望(无明显倾向)"
-        return f"观望(倾向{result.lean}:{result.lean_team})"
-    if abs(result.purchase_score) < 0.06:
-        return f"{result.purchase_side}(低优势:{result.purchase_team})"
-    return f"{result.purchase_side}({result.purchase_team})"
+        return "观望(无明显倾向)"
+    return f"{result.purchase_side}({result.strength}:{result.purchase_team})"
 
 
 def print_snapshot_saved(path: Path, result: AnalysisResult) -> None:
@@ -5395,8 +5776,8 @@ def print_snapshot_trend(store: SnapshotStore, event_id: int) -> int:
     print(f"  时间: {first.get('fetched_at')} -> {last.get('fetched_at')}")
     print(
         f"  score: {first_metrics['score']:+.3f} -> {last_metrics['score']:+.3f} "
-        f"({score_delta:+.3f}) | 当前购买方 {result_info.get('purchase_side', result_info.get('recommendation', '未知'))} "
-        f"| 模型 {result_info.get('model_recommendation', result_info.get('recommendation', '未知'))}"
+        f"({score_delta:+.3f}) | 当前推荐 {result_info.get('recommendation', '未知')} "
+        f"| 强度 {result_info.get('strength', '未知')}"
     )
     print(
         f"  必发热度: {first_metrics['heat_edge']:+.3f} -> {last_metrics['heat_edge']:+.3f} "
@@ -6149,10 +6530,9 @@ def build_parser() -> argparse.ArgumentParser:
             "      查看后续可接入的公开数据源。\n\n"
             "输出说明:\n"
             "  默认会用楚旗 live-bifa 页面补充必发指数/成交走势；如需只看 SPDEX，请加 --no-chuqi。\n"
-            "  推荐 上盘/下盘: 分数超过购买阈值，给出购买方。\n"
-            "  推荐 观望(倾向...): 有方向倾向，但置信度或信号一致性不足。\n"
-            "  推荐 观望(无明显倾向): |score| < 0.05，方向信号太弱。\n"
-            "  score > 0 偏上盘，score < 0 偏下盘；默认阈值为 +/-0.12。\n"
+            "  推荐 上盘/下盘(轻微|中等|强烈:球队): 直接按模型综合分给出亚盘方向和强度。\n"
+            "  推荐 观望(无明显倾向): |score| < 0.015，方向信号接近噪声。\n"
+            "  score > 0 偏上盘，score < 0 偏下盘；0.12/0.25 用于区分中等和强烈。\n"
             "  算法会综合盘口深度、健康/危险大热、平局风险、盘口合理性、公司一致性、\n"
             "  深盘打穿能力、赢盘门槛风险、高低水价值和本地快照趋势；\n"
             "  高水只有在模型概率高于市场隐含概率时才加分，低水偏贵且缺少溢价会扣分。\n"

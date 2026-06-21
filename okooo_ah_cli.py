@@ -170,7 +170,7 @@ _VALIDATE_SNAPSHOT_ROWSPEC: tuple[tuple[int, str], ...] = (
     (54, "left"),  # match
     (8, "right"),  # line
     (6, "left"),  # rec
-    (6, "left"),  # model
+    (8, "left"),  # strength
     (10, "right"),  # score
     (9, "right"),  # scoreline
     (6, "left"),  # out
@@ -187,7 +187,7 @@ def _validate_snapshot_rule_line() -> str:
 
 
 def _format_validate_snapshot_header() -> str:
-    titles = ("event_id", "match", "line", "rec", "model", "score", "scoreline", "out")
+    titles = ("event_id", "match", "line", "rec", "strength", "score", "scoreline", "out")
     cells = [_pad_display_cell(t, w, align="left") for t, (w, _) in zip(titles, _VALIDATE_SNAPSHOT_ROWSPEC)]
     return "| " + _VALIDATE_SNAPSHOT_COL_SEP.join(cells) + " |"
 
@@ -258,7 +258,7 @@ def run_validate_snapshots_from_dir(
                     f"{match.home} vs {match.away}",
                     str(match.asian_line),
                     res.recommendation,
-                    res.model_recommendation,
+                    res.strength,
                     f"{res.score:+.3f}",
                     f"{hg}-{ag}",
                     out,
