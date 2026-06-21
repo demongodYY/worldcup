@@ -24,6 +24,61 @@ from worldcup_ah_cli import DataError
 class OkoooAhCliBetfaParseTests(unittest.TestCase):
     """okooo_ah_cli.parse_betfa_html：已赛比分行（无 VS）与未赛行兼容。"""
 
+    def test_asian_line_number_parses_multi_goal_half_lines_before_ball_half(self) -> None:
+        from okooo_ah_cli import asian_line_number
+
+        cases = [
+            ("平/半", -0.25),
+            ("平手/半球", -0.25),
+            ("平半", -0.25),
+            ("半球", -0.5),
+            ("半", -0.5),
+            ("半/一", -0.75),
+            ("半球/一球", -0.75),
+            ("半一", -0.75),
+            ("一球", -1.0),
+            ("一", -1.0),
+            ("一/球半", -1.25),
+            ("一球/球半", -1.25),
+            ("一球球半", -1.25),
+            ("球半", -1.5),
+            ("球半/两", -1.75),
+            ("球半/两球", -1.75),
+            ("球半两球", -1.75),
+            ("两球", -2.0),
+            ("两", -2.0),
+            ("两/两半", -2.25),
+            ("两球/两球半", -2.25),
+            ("两球两球半", -2.25),
+            ("两半", -2.5),
+            ("两球半", -2.5),
+            ("两半/三", -2.75),
+            ("两球半/三球", -2.75),
+            ("两球半三球", -2.75),
+            ("三球", -3.0),
+            ("三", -3.0),
+            ("三/三半", -3.25),
+            ("三球/三球半", -3.25),
+            ("三球三球半", -3.25),
+            ("三半", -3.5),
+            ("三球半", -3.5),
+            ("三半/四", -3.75),
+            ("三球半/四球", -3.75),
+            ("三球半四球", -3.75),
+            ("四球", -4.0),
+            ("四", -4.0),
+            ("受平半", 0.25),
+            ("受一球/球半", 1.25),
+            ("受一球球半", 1.25),
+            ("受球半两球", 1.75),
+            ("受两球两球半", 2.25),
+            ("受两球半三球", 2.75),
+            ("受两球半", 2.5),
+        ]
+        for label, expected in cases:
+            with self.subTest(label=label):
+                self.assertAlmostEqual(asian_line_number(label), expected)
+
     def test_parse_betfa_finished_match_without_vs(self) -> None:
         from okooo_ah_cli import parse_betfa_html
 

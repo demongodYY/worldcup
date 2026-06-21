@@ -704,36 +704,38 @@ def asian_line_number(text: str) -> float:
         return 0.0
     receive = "受" in t
     t = t.replace("受", "").replace("让", "")
-    if "平手" in t or t == "平":
+    if t in ("平手", "平"):
         base = 0.0
-    elif "半/一" in t:
-        base = 0.75
-    elif "一/球半" in t:
-        base = 1.25
-    elif "球半/两" in t:
-        base = 1.75
-    elif "两/两半" in t:
-        base = 2.25
-    elif "两半/三" in t:
+    elif "两球半/三球" in t or "两球半三球" in t or "两半/三" in t or "两半三" in t:
         base = 2.75
-    elif "三/三半" in t:
-        base = 3.25
-    elif "三半/四" in t:
+    elif "两球/两球半" in t or "两球两球半" in t or "两/两半" in t or "两两半" in t:
+        base = 2.25
+    elif "三球半/四球" in t or "三球半四球" in t or "三半/四" in t or "三半四" in t:
         base = 3.75
-    elif "四/四半" in t:
+    elif "三球/三球半" in t or "三球三球半" in t or "三/三半" in t or "三三半" in t:
+        base = 3.25
+    elif "四球半/五球" in t or "四球半五球" in t or "四半/五" in t or "四半五" in t:
+        base = 4.75
+    elif "四球/四球半" in t or "四球四球半" in t or "四/四半" in t or "四四半" in t:
         base = 4.25
-    elif "平/半" in t:
+    elif "半球/一球" in t or "半球一球" in t or "半/一" in t or "半一" in t:
+        base = 0.75
+    elif "一球/球半" in t or "一球球半" in t or "一/球半" in t or "一球半" in t:
+        base = 1.25
+    elif "球半/两球" in t or "球半两球" in t or "球半/两" in t or "球半两" in t:
+        base = 1.75
+    elif "平手/半球" in t or "平手半球" in t or "平/半" in t or "平半" in t:
         base = 0.25
     elif "半球" in t or t == "半":
         base = 0.5
+    elif "四球半" in t or "四半" in t:
+        base = 4.5
+    elif "三球半" in t or "三半" in t:
+        base = 3.5
+    elif "两球半" in t or "两半" in t:
+        base = 2.5
     elif "球半" in t:
         base = 1.5
-    elif "两半" in t:
-        base = 2.5
-    elif "三半" in t:
-        base = 3.5
-    elif "四半" in t:
-        base = 4.5
     elif "一球" in t or t == "一":
         base = 1.0
     elif "两球" in t or t == "两":
