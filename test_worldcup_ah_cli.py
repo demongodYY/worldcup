@@ -1872,7 +1872,7 @@ class WorldCupAhCliTests(unittest.TestCase):
 
     def test_watch_schedule_catches_up_latest_missed_window(self):
         now = datetime(2026, 6, 13, 0, 0, tzinfo=timezone.utc)
-        match = sample_match(event_id=456, match_time=now + timedelta(hours=3))
+        match = sample_match(event_id=456, match_time=now + timedelta(hours=3, minutes=50))
         tasks = build_scheduled_tasks([match], now=now, horizon=timedelta(hours=24))
         catch_up_tasks = [task for task in tasks if task.is_catch_up]
 
@@ -1880,14 +1880,13 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertIn("T-4h", catch_up_tasks[0].label)
         self.assertEqual(catch_up_tasks[0].run_at, now)
         self.assertTrue(catch_up_tasks[0].do_predict)
-        self.assertTrue(any(task.label.startswith("T-3h") and task.do_predict for task in tasks))
         self.assertTrue(any(task.label.startswith("T-2h") and task.do_predict for task in tasks))
         self.assertTrue(any(task.label.startswith("T-60m") and task.do_predict for task in tasks))
 
     def test_watch_schedule_skips_completed_window(self):
         now = datetime(2026, 6, 13, 0, 0, tzinfo=timezone.utc)
-        match = sample_match(event_id=789, match_time=now + timedelta(hours=3))
-        completed_key = f"{match.event_id}:{match.match_time.isoformat()}:T-4h 观察热度/水位背离"
+        match = sample_match(event_id=789, match_time=now + timedelta(hours=3, minutes=50))
+        completed_key = f"{match.event_id}:{match.match_time.isoformat()}:T-4h 追踪热度/盘口修正"
         tasks = build_scheduled_tasks(
             [match],
             now=now,

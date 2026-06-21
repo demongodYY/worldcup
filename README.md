@@ -256,11 +256,11 @@ flowchart TD
 `watch` 会按这些赛前窗口自动保存快照：
 
 ```text
-T-24h, T-8h, T-4h, T-3h, T-2h, T-60m, T-30m, T-15m
+T-24h, T-8h, T-4h, T-2h, T-60m, T-30m
 ```
 
 - `T-24h` 到 `T-2h`：建立基线，观察热度、盘口、水位和赔率趋势。
-- `T-60m` 到 `T-15m`：临场确认，重点看成交走势、盘口防守和 score 是否反向。
+- `T-60m` 和 `T-30m`：临场确认，重点看成交走势、盘口防守和 score 是否反向。
 - 默认写入 `.okooo_snapshots/{match_id}.jsonl`。
 - `trend --match-id` 可查看本地历史趋势。
 - `watch --once` 可以只执行当前到期任务，适合放在外部调度器里。
