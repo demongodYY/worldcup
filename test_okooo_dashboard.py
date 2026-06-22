@@ -9,6 +9,7 @@ from tools.okooo_dashboard_server import (
     build_snapshot_events,
     recommendation_outcome,
     summarize_validate_stats,
+    validate_record_sort_key,
 )
 
 
@@ -112,6 +113,18 @@ class OkoooDashboardTests(unittest.TestCase):
         outcome, margin = recommendation_outcome("下盘", "主队", "客队", "主队", "客队", "-1", 1, 0)
         self.assertEqual(outcome, "push")
         self.assertAlmostEqual(margin, 0.0)
+
+    def test_validate_records_sort_by_snapshot_time_descending(self) -> None:
+        records = [
+            {"event_id": 1, "last_fetched_at": "2026-06-20T10:00:00+00:00"},
+            {"event_id": 2, "last_fetched_at": "2026-06-22T10:00:00+00:00"},
+            {"event_id": 3, "match_time": "2026-06-21T10:00:00+00:00"},
+            {"event_id": 4, "outcome": "missing"},
+        ]
+
+        ordered = sorted(records, key=validate_record_sort_key, reverse=True)
+
+        self.assertEqual([record["event_id"] for record in ordered], [2, 3, 1, 4])
 
 
 if __name__ == "__main__":

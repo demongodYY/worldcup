@@ -388,6 +388,14 @@ def summarize_validate_stats(records: list[dict[str, Any]]) -> dict[str, Any]:
     return stats
 
 
+def validate_record_sort_key(record: dict[str, Any]) -> tuple[str, int]:
+    try:
+        event_id = int(record.get("event_id") or 0)
+    except (TypeError, ValueError):
+        event_id = 0
+    return str(record.get("last_fetched_at") or record.get("match_time") or ""), event_id
+
+
 def build_validate_records(snapshot_root: Path, scores_json: Path | None) -> dict[str, Any]:
     effective_scores = scores_json or DEFAULT_OKOOO_VALIDATE_SCORES_PATH
     scores = load_okooo_validate_scores(effective_scores)
@@ -395,6 +403,7 @@ def build_validate_records(snapshot_root: Path, scores_json: Path | None) -> dic
         replay_validate_result(snapshot_root, event_id, home_goals, away_goals)
         for event_id, (home_goals, away_goals) in sorted(scores.items())
     ]
+    records = sorted(records, key=validate_record_sort_key, reverse=True)
     return {
         "scores_json": str(effective_scores),
         "records": records,
