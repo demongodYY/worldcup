@@ -58,6 +58,7 @@ WEIGHTS = {
 }
 
 OKOOO_INTERNAL_SIGNAL_NAMES = {
+    "盘口合理性",
     "盘口深度/打穿能力",
     "外部赔率/实力校验",
     "高低水价值",
@@ -468,11 +469,11 @@ class Signal:
 SIGNAL_SUMMARY_FOCUS = {
     "必发指数": "必发静态热度、成交额、盈亏和价格是否互相确认",
     "必发成交走势": "临场成交速率、价量变化和两边资金节奏",
-    "亚盘水位": "盘口公司是否用降水、升水或分歧来防守某一边",
+    "亚盘水位": "价格预判盘口、实际盘口深浅与水位走势是否互相确认",
     "欧赔/Kelly": "欧赔变化和 Kelly 风险是否确认同一方向",
     "市场平衡/背离": "必发热度、盘口、欧赔、成交等信号是否同向",
     "平局风险": "平局或小胜对上盘赢盘的拖累",
-    "盘口合理性": "实际盘口相对赔率估算盘口是否过深或偏浅",
+    "盘口合理性": "内部计算：实际盘口相对赔率估盘口是否过深或偏浅",
     "公司一致性": "主流公司盘口水位是否形成共识",
     "盘口深度/打穿能力": "当前盘口深度下，上盘是否具备打穿条件",
     "赢盘门槛风险": "上盘打穿盘口所需确认是否不足",
@@ -1715,10 +1716,17 @@ class Predictor:
         handicap_rows = self._handicap_rows(match, warnings)
         bifa_signal = self._bifa_signal(match, upper_team, lower_team)
         trade_signal = self._trade_signal(match, upper_team, lower_team, warnings, snapshot_context)
-        handicap_signal = self._handicap_signal(match, upper_team, lower_team, handicap_rows, snapshot_context)
+        fair_line_signal = self._fair_line_signal(match, upper_team, lower_team, handicap_rows)
+        handicap_signal = self._handicap_signal(
+            match,
+            upper_team,
+            lower_team,
+            handicap_rows,
+            snapshot_context,
+            fair_line_signal,
+        )
         euro_kelly_signal = self._euro_kelly_signal(match, upper_team, lower_team, warnings)
         draw_risk_signal = self._draw_risk_signal(match, upper_team, lower_team)
-        fair_line_signal = self._fair_line_signal(match, upper_team, lower_team, handicap_rows)
         bookmaker_consensus_signal = self._bookmaker_consensus_signal(match, upper_team, handicap_rows)
         depth_profile_signal = self._depth_profile_signal(
             match,
@@ -2096,6 +2104,7 @@ class Predictor:
         lower_team: str,
         rows: list[HandicapRow],
         snapshot_context: SnapshotContext | None,
+        fair_line_signal: Signal | None = None,
     ) -> Signal:
         if not rows:
             return unavailable_signal("亚盘水位", WEIGHTS["asian_handicap"], "该盘口暂无公司数据")
@@ -2180,6 +2189,14 @@ class Predictor:
             else:
                 score = clamp(score * 0.52 + 0.26, -1, 0.22)
                 reasons.append("深盘欧赔挺上盘，热背离对亚盘的负分回拉")
+        if (
+            match.raw.get("_source") == "okooo"
+            and fair_line_signal is not None
+            and fair_line_signal.available
+        ):
+            reasons.append(
+                f"盘口合理性并入参考：{fair_line_signal.reason}；水位分保持 {score:+.3f}"
+            )
         return Signal(
             "亚盘水位",
             score,

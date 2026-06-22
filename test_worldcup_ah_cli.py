@@ -1346,11 +1346,14 @@ class WorldCupAhCliTests(unittest.TestCase):
             sample_match(home="突尼斯", away="日本", asian_line="1.5", raw=raw)
         )
         signal_names = {signal.name for signal in result.signals}
+        handicap_signal = next(signal for signal in result.signals if signal.name == "亚盘水位")
         market_signal = next(signal for signal in result.signals if signal.name == "市场平衡/背离")
 
+        self.assertNotIn("盘口合理性", signal_names)
         self.assertNotIn("高低水价值", signal_names)
         self.assertNotIn("外部赔率/实力校验", signal_names)
         self.assertNotIn("盘口深度/打穿能力", signal_names)
+        self.assertIn("盘口合理性并入", handicap_signal.reason)
         self.assertNotIn("高低水价值", market_signal.reason)
         self.assertNotIn("外部赔率/实力", market_signal.reason)
         self.assertNotIn("盘口深度模型", market_signal.reason)
