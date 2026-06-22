@@ -200,6 +200,8 @@
     .search-row {
       padding: 12px;
       border-bottom: 1px solid var(--line);
+      display: grid;
+      gap: 8px;
     }
 
     .search-input {
@@ -582,6 +584,11 @@
             <span class="badge soft" id="matchCount">0 场</span>
           </div>
           <div class="search-row">
+            <div class="filter-group" id="snapshotStatusFilters">
+              <button class="metric-tab active" type="button" data-status-filter="all">全部</button>
+              <button class="metric-tab" type="button" data-status-filter="finished">已完赛</button>
+              <button class="metric-tab" type="button" data-status-filter="unfinished">未完赛</button>
+            </div>
             <input class="search-input" id="searchInput" placeholder="搜索球队 / event_id" autocomplete="off">
           </div>
           <div class="match-list" id="matchList"></div>
@@ -641,6 +648,7 @@
       selectedId: null,
       metric: "score",
       tab: "trend",
+      snapshotStatusFilter: "all",
       validateFilter: "all",
       predictionById: new Map(),
       loadingPredict: false
@@ -691,6 +699,11 @@
       }).format(d);
     }
 
+    function timeValue(iso) {
+      const d = new Date(iso || "");
+      return Number.isNaN(d.getTime()) ? Number.NEGATIVE_INFINITY : d.getTime();
+    }
+
     function classForSide(side) {
       if (side === "上盘") return "upper";
       if (side === "下盘") return "lower";
@@ -716,9 +729,20 @@
       }[outcome] || "-";
     }
 
+    function recommendationTag(item) {
+      const side = item?.purchase_side || item?.recommendation || "-";
+      return item?.strength ? `${side} · ${item.strength}` : side;
+    }
+
+    function recommendationText(item) {
+      const team = item?.purchase_team ? ` · ${item.purchase_team}` : "";
+      return `${recommendationTag(item)}${team}`;
+    }
+
     function selectedEvent() {
-      if (!state.data || !state.data.snapshots.length) return null;
-      return state.data.snapshots.find((item) => item.event_id === state.selectedId) || state.data.snapshots[0];
+      const rows = filteredSnapshots();
+      if (!rows.length) return null;
+      return rows.find((item) => item.event_id === state.selectedId) || rows[0];
     }
 
     function statHtml(label, value, extra = "") {
@@ -768,7 +792,11 @@
 
     function renderSnapshotStats() {
       const snapshots = state.data?.snapshots || [];
-      const latest = snapshots[0];
+      const latestSnapshot = snapshots.reduce(
+        (best, item) => (!best || timeValue(item.last_fetched_at) > timeValue(best.last_fetched_at) ? item : best),
+        null
+      );
+      const latestMatch = snapshots[0];
       const directionCount = snapshots.filter((item) => item.last_result.purchase_side !== "观望").length;
       const avgCompleteness = snapshots.length
         ? Math.round(snapshots.reduce((sum, item) => sum + Number(item.last_result.completeness || 0), 0) / snapshots.length)
@@ -777,15 +805,28 @@
         statHtml("快照比赛", `${snapshots.length}`),
         statHtml("有方向推荐", `${directionCount}`),
         statHtml("平均完整度", `${avgCompleteness}%`),
-        statHtml("最近快照", latest ? shortTime(latest.last_fetched_at) : "-"),
-        statHtml("最近场次", latest ? `${latest.home} vs ${latest.away}` : "-")
+        statHtml("最近快照", latestSnapshot ? shortTime(latestSnapshot.last_fetched_at) : "-"),
+        statHtml("最新开赛", latestMatch ? `${latestMatch.home} vs ${latestMatch.away}` : "-")
       ].join("");
       el("matchCount").textContent = `${snapshots.length} 场`;
     }
 
+    function isFinishedSnapshot(item) {
+      return item?.is_finished === true || item?.match_status === "finished" || Boolean(item?.validation?.scoreline);
+    }
+
     function filteredSnapshots() {
       const q = el("searchInput").value.trim().toLowerCase();
-      const rows = state.data?.snapshots || [];
+      let rows = [...(state.data?.snapshots || [])].sort((a, b) => {
+        const byTime = timeValue(b.match_time) - timeValue(a.match_time);
+        if (byTime) return byTime;
+        return Number(b.event_id || 0) - Number(a.event_id || 0);
+      });
+      if (state.snapshotStatusFilter !== "all") {
+        rows = rows.filter((item) =>
+          state.snapshotStatusFilter === "finished" ? isFinishedSnapshot(item) : !isFinishedSnapshot(item)
+        );
+      }
       if (!q) return rows;
       return rows.filter((item) => {
         const haystack = `${item.event_id} ${item.home} ${item.away} ${item.league_name}`.toLowerCase();
@@ -795,9 +836,14 @@
 
     function renderMatchList() {
       const rows = filteredSnapshots();
+      const total = state.data?.snapshots?.length || 0;
+      el("matchCount").textContent = rows.length === total ? `${total} 场` : `${rows.length}/${total} 场`;
       if (!rows.length) {
         el("matchList").innerHTML = `<div class="empty">没有匹配的快照比赛</div>`;
         return;
+      }
+      if (!rows.some((item) => item.event_id === state.selectedId)) {
+        state.selectedId = rows[0].event_id;
       }
       el("matchList").innerHTML = rows.map((item) => {
         const result = item.last_result;
@@ -818,7 +864,7 @@
                 ${validate}
               </span>
             </span>
-            <span class="score-pill ${sideClass}">${escapeHtml(result.purchase_side)} ${fmt(result.score, 2)}</span>
+            <span class="score-pill ${sideClass}">${escapeHtml(recommendationTag(result))} ${fmt(result.score, 2)}</span>
           </button>
         `;
       }).join("");
@@ -852,7 +898,7 @@
         </div>
 
         <div class="detail-grid">
-          ${statHtml("最新推荐", `${result.purchase_side}${result.purchase_team ? ` · ${result.purchase_team}` : ""}`)}
+          ${statHtml("最新推荐", recommendationText(result))}
           ${statHtml("重放 score", fmt(result.score, 3), `变化 ${fmt(item.score_delta, 3)}`)}
           ${statHtml("置信 / 完整度", `${result.confidence}% / ${result.completeness}%`)}
           ${statHtml("盘口", `${item.asian_line || "0"}`, `深度变化 ${fmt(item.line_depth_delta, 2)}`)}
@@ -884,7 +930,7 @@
                   ${item.series.map((point) => `
                     <tr>
                       <td>${shortTime(point.fetched_at)}</td>
-                      <td>${escapeHtml(point.purchase_side)}${point.purchase_team ? ` · ${escapeHtml(point.purchase_team)}` : ""}</td>
+                      <td>${escapeHtml(recommendationText(point))}</td>
                       <td class="${Number(point.score) >= 0 ? "positive" : "negative"}">${fmt(point.score, 3)}</td>
                       <td>${fmt(point.heat_edge, 3)}</td>
                       <td>${fmt(point.amount_edge, 3)}</td>
@@ -1038,12 +1084,12 @@
       el("predictResult").classList.add("visible");
       el("predictResult").innerHTML = `
         <div class="detail-grid">
-          ${statHtml("最新预测", `${result.purchase_side}${result.purchase_team ? ` · ${result.purchase_team}` : ""}`)}
+          ${statHtml("最新预测", recommendationText(result))}
           ${statHtml("最新预测 score", fmt(result.score, 3), result.strength)}
           ${statHtml("置信 / 完整度", `${result.confidence}% / ${result.completeness}%`)}
           ${statHtml("状态", data.saved ? "已存入快照" : "未存入快照")}
         </div>
-        <span class="badge ${sideClass}">${escapeHtml(result.purchase_side)}</span>
+        <span class="badge ${sideClass}">${escapeHtml(recommendationTag(result))}</span>
         <span class="notice">${escapeHtml(result.decision_reason || "")}</span>
         <div class="signals" style="margin-top: 10px;">${renderSignals(result.signals)}</div>
         <div class="predict-actions" style="margin-top: 12px;">${saveButton}</div>
@@ -1115,7 +1161,18 @@
 
     function bindStaticEvents() {
       el("reloadBtn").addEventListener("click", () => loadDashboard(true));
-      el("searchInput").addEventListener("input", renderMatchList);
+      el("searchInput").addEventListener("input", () => {
+        renderMatchList();
+        renderDetail();
+      });
+      document.querySelectorAll("[data-status-filter]").forEach((node) => {
+        node.addEventListener("click", () => {
+          state.snapshotStatusFilter = node.dataset.statusFilter;
+          document.querySelectorAll("[data-status-filter]").forEach((btn) => btn.classList.toggle("active", btn === node));
+          renderMatchList();
+          renderDetail();
+        });
+      });
       document.querySelectorAll(".tab").forEach((node) => {
         node.addEventListener("click", () => {
           state.tab = node.dataset.tab;

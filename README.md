@@ -1,6 +1,6 @@
 # WorldCup 亚盘推荐工具
 
-当前推荐只用两个入口：
+当前推荐主线以澳客为主，另外保留 Titan007 做单场交叉校验：
 
 1. `okooo_ah_cli.py`：主力入口。直接抓澳客的必发、盘口、欧赔/Kelly、胜负指数、差异分析和必发成交明细，数据最完整，适合预测、保存快照和赛前滚动观察。
 2. `scripts/titan007_one_match.py`：单场交叉校验入口。用 Titan007 的赛程、亚盘矩阵、百家欧赔补充观察，并默认合并澳客必发数据，适合知道球探 `ScheduleID` 后快速跑一场。
@@ -8,24 +8,6 @@
 底层逻辑：**钱往哪边去之后，盘口和交易市场有没有被迫承认这个方向；只有资金热度、成交走势、盘口水位、赔率/Kelly 和风险门槛相互确认时才给推荐，出现背离就降级观望或反向。**
 
 两者最终都复用同一套 `Predictor` 推荐算法，所以输出里的推荐方向、`score`、强度分层、信号名称和信号总结口径一致。
-
-## SPDEX + 楚旗备用入口
-
-`worldcup_ah_cli.py` 仍可作为 SPDEX 备用入口使用：SPDEX 负责赛程、亚盘、欧赔/Kelly 和静态必发字段；楚旗 `live-bifa` 可补充必发指数、成交额、盈亏、必发赔率和成交曲线。
-
-```bash
-python3 worldcup_ah_cli.py upcoming --limit 10
-python3 worldcup_ah_cli.py predict --event-id 35595801 --verbose
-python3 worldcup_ah_cli.py predict --event-id 35595801 --chuqi-id CHUQI_LIVE_BIFA_ID --verbose
-python3 worldcup_ah_cli.py sources
-```
-
-说明：
-
-- 默认会尝试楚旗补充源；如需只看 SPDEX，加全局参数 `--no-chuqi`，例如 `python3 worldcup_ah_cli.py --no-chuqi predict --event-id 35595801`。
-- 楚旗列表页可能出现验证码，程序会自动跳过；单场详情页 `https://live.chuqi.com/football/live-bifa/{id}/` 当前可解析。
-- 如果你已知道楚旗详情页 ID，可用 `--chuqi-id` 手动指定。程序会校验队名，不匹配就拒绝合并，避免把别的比赛数据混入预测。
-- 楚旗只补必发交易数据，不提供完整亚盘公司水位；亚盘购买方向仍以 SPDEX/澳客/Titan007 的盘口源为准。
 
 ## 快速开始
 
@@ -194,9 +176,9 @@ flowchart LR
     Weighted --> Final{"模型综合分 score"}
     Momentum["临场score变化\n当前 vs 上一快照/首条快照\n只做解释"] --> Final
 
-    Final -->|score >= +0.015| BuyUpper["推荐上盘\n轻微/中等/强烈"]
-    Final -->|score <= -0.015| BuyLower["推荐下盘\n轻微/中等/强烈"]
-    Final -->|接近 0| Watch["观望(无明显倾向)"]
+    Final -->|"score >= +0.015"| BuyUpper["推荐上盘\n轻微/中等/强烈"]
+    Final -->|"score <= -0.015"| BuyLower["推荐下盘\n轻微/中等/强烈"]
+    Final -->|"score 接近 0"| Watch["观望(无明显倾向)"]
 ```
 
 算法流程图：
@@ -217,9 +199,9 @@ flowchart TD
     PostAdj --> Complete["计算完整度\ncompleteness = available_weight / 0.95"]
 
     PostAdj --> Model{"模型方向\n按修正后 score 正负"}
-    Model -->|score >= +0.015| ModelUpper["推荐上盘"]
-    Model -->|score <= -0.015| ModelLower["推荐下盘"]
-    Model -->|abs(score) < 0.015| ModelWatch["观望"]
+    Model -->|"score >= +0.015"| ModelUpper["推荐上盘"]
+    Model -->|"score <= -0.015"| ModelLower["推荐下盘"]
+    Model -->|"abs(score) < 0.015"| ModelWatch["观望"]
 
     PostAdj --> Momentum["临场score变化\n当前score vs 上一快照/首条快照"]
     Complete --> Quality["数据质量\n覆盖度解释和置信度参考"]
@@ -352,6 +334,24 @@ Titan007 入口仍使用同一套 `Predictor`，但数据质量和澳客主入�
 - 已经知道球探 `ScheduleID`，想快速看一场。
 - 澳客页面暂时不可用，想用球探亚盘/欧赔做兜底。
 - 想用不同数据源交叉确认澳客推荐方向。
+
+## SPDEX + 楚旗备用备注
+
+`worldcup_ah_cli.py` 现在只作为备用入口：SPDEX 负责赛程、亚盘、欧赔/Kelly 和静态必发字段；楚旗 `live-bifa` 可补充必发指数、成交额、盈亏、必发赔率和成交曲线。日常优先用澳客主入口，SPDEX/楚旗更适合澳客临时不可用或需要额外交叉观察时使用。
+
+```bash
+python3 worldcup_ah_cli.py upcoming --limit 10
+python3 worldcup_ah_cli.py predict --event-id 35595801 --verbose
+python3 worldcup_ah_cli.py predict --event-id 35595801 --chuqi-id CHUQI_LIVE_BIFA_ID --verbose
+python3 worldcup_ah_cli.py sources
+```
+
+说明：
+
+- 默认会尝试楚旗补充源；如需只看 SPDEX，加全局参数 `--no-chuqi`，例如 `python3 worldcup_ah_cli.py --no-chuqi predict --event-id 35595801`。
+- 楚旗列表页可能出现验证码，程序会自动跳过；单场详情页 `https://live.chuqi.com/football/live-bifa/{id}/` 当前可解析。
+- 如果你已知道楚旗详情页 ID，可用 `--chuqi-id` 手动指定。程序会校验队名，不匹配就拒绝合并，避免把别的比赛数据混入预测。
+- 楚旗只补必发交易数据，不提供完整亚盘公司水位；亚盘购买方向仍以 SPDEX/澳客/Titan007 的盘口源为准。
 
 ## 推荐工作流
 

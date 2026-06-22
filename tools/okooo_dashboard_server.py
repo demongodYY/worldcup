@@ -95,6 +95,25 @@ def as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def timestamp_sort_value(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return float("-inf")
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return float("-inf")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def snapshot_event_sort_key(event: dict[str, Any]) -> tuple[float, int]:
+    return timestamp_sort_value(event.get("match_time")), as_int(event.get("event_id"))
+
+
 def infer_strength(score: Any, explicit: Any = None) -> str:
     if explicit:
         return str(explicit)
@@ -263,7 +282,7 @@ def build_snapshot_events(snapshot_root: Path) -> list[dict[str, Any]]:
             "series": [record_point(record) for record in replayed_records],
         }
         events.append(event)
-    return sorted(events, key=lambda item: (item["last_fetched_at"], item["event_id"]), reverse=True)
+    return sorted(events, key=snapshot_event_sort_key, reverse=True)
 
 
 def margin_for_upper(home_goals: int, away_goals: int, line: float, upper: str, home: str, away: str) -> float:
@@ -417,6 +436,9 @@ def build_dashboard_payload(snapshot_root: Path, scores_json: Path | None) -> di
     validation_by_id = {record.get("event_id"): record for record in validation["records"]}
     for event in snapshots:
         validation_record = validation_by_id.get(event["event_id"])
+        is_finished = bool(validation_record and validation_record.get("scoreline"))
+        event["is_finished"] = is_finished
+        event["match_status"] = "finished" if is_finished else "unfinished"
         if validation_record:
             event["validation"] = {
                 "outcome": validation_record.get("outcome"),

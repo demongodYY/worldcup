@@ -13,16 +13,24 @@ from tools.okooo_dashboard_server import (
 )
 
 
-def snapshot_record(fetched_at: str, score: float, *, home_index: float, away_index: float) -> dict:
+def snapshot_record(
+    fetched_at: str,
+    score: float,
+    *,
+    home_index: float,
+    away_index: float,
+    event_id: int = 42,
+    match_time: str = "2026-06-20T12:00:00+00:00",
+) -> dict:
     return {
         "schema": 1,
         "fetched_at": fetched_at,
         "match": {
-            "event_id": 42,
+            "event_id": event_id,
             "home": "主队",
             "away": "客队",
             "league_name": "世界杯",
-            "match_time": "2026-06-20T12:00:00+00:00",
+            "match_time": match_time,
             "asian_line": "-0.5",
             "is_stop_update": False,
             "raw": {
@@ -40,7 +48,7 @@ def snapshot_record(fetched_at: str, score: float, *, home_index: float, away_in
             },
         },
         "result": {
-            "event_id": 42,
+            "event_id": event_id,
             "match": "主队 vs 客队",
             "recommendation": "上盘",
             "purchase_side": "上盘",
@@ -84,6 +92,31 @@ class OkoooDashboardTests(unittest.TestCase):
         self.assertEqual(len(event["series"]), 2)
         self.assertEqual(event["last_result"]["score"], event["series"][-1]["score"])
         self.assertIn(event["last_result"]["purchase_side"], {"上盘", "下盘", "观望"})
+
+    def test_build_snapshot_events_sort_by_match_time_descending(self) -> None:
+        with TemporaryDirectory() as tmp:
+            old_match = snapshot_record(
+                "2026-06-22T10:00:00+00:00",
+                0.08,
+                home_index=55,
+                away_index=30,
+                event_id=1,
+                match_time="2026-06-20T12:00:00+00:00",
+            )
+            new_match = snapshot_record(
+                "2026-06-20T10:00:00+00:00",
+                0.18,
+                home_index=67,
+                away_index=24,
+                event_id=2,
+                match_time="2026-06-22T12:00:00+00:00",
+            )
+            (Path(tmp) / "1.jsonl").write_text(json.dumps(old_match, ensure_ascii=False), encoding="utf-8")
+            (Path(tmp) / "2.jsonl").write_text(json.dumps(new_match, ensure_ascii=False), encoding="utf-8")
+
+            events = build_snapshot_events(Path(tmp))
+
+        self.assertEqual([event["event_id"] for event in events], [2, 1])
 
     def test_summarize_validate_stats_counts_outcomes(self) -> None:
         stats = summarize_validate_stats(
