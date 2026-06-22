@@ -603,16 +603,12 @@ class AnalysisResult:
 
     @property
     def lean(self) -> str:
-        if abs(self.score) < MODEL_DIRECTION_EPSILON:
-            return "无明显倾向"
         if self.score < 0:
             return "下盘"
         return "上盘"
 
     @property
     def lean_team(self) -> str:
-        if self.lean == "无明显倾向":
-            return ""
         if self.lean == "下盘":
             return self.lower_team
         return self.upper_team
@@ -1846,6 +1842,9 @@ class Predictor:
                 available_weight,
                 euro_kelly_signal,
                 external_consensus_signal,
+                market_balance_signal,
+                handicap_signal,
+                cover_risk_signal,
                 trade_signal,
                 snapshot_context,
             )
@@ -1867,16 +1866,17 @@ class Predictor:
 
         snapshot_stop_lift = snapshot_stop_update_lift(match, snapshot_trend_signal)
         if available_weight < 0.50:
+            model_recommendation = recommendation_from_score(weighted_score)
+            model_confidence = min(
+                confidence_from_score(weighted_score, completeness, model_recommendation),
+                45,
+            )
             if snapshot_stop_lift:
-                model_recommendation = recommendation_from_score(weighted_score)
-                model_confidence = confidence_from_score(weighted_score, completeness, model_recommendation)
                 warnings.append(
-                    "临场数据停更且可用信号权重偏低；模型方向仍按综合分阈值计算，并请结合本地快照趋势理解"
+                    "临场数据停更且可用信号权重偏低；模型方向仍按综合分二选一计算，并请结合本地快照趋势理解"
                 )
             else:
-                model_recommendation = "观望"
-                model_confidence = clamp_int(int(35 * completeness / 100), 0, 45)
-                warnings.append("可用信号不足，未达到最低分析权重")
+                warnings.append("可用信号不足，仍按综合分给出二选一方向，置信度已压低")
         else:
             model_recommendation = recommendation_from_score(weighted_score)
             model_confidence = confidence_from_score(weighted_score, completeness, model_recommendation)
@@ -4737,6 +4737,9 @@ def marginal_deep_upper_cover_score_lift(
     available_weight: float,
     euro_kelly_signal: Signal,
     external_consensus_signal: Signal,
+    market_balance_signal: Signal,
+    handicap_signal: Signal,
+    cover_risk_signal: Signal,
     trade_signal: Signal,
     snapshot_context: SnapshotContext | None,
 ) -> tuple[float, str | None]:
@@ -4763,6 +4766,16 @@ def marginal_deep_upper_cover_score_lift(
         return weighted_score, None
     if not euro_flat_ok and ext < 0.06:
         return weighted_score, None
+    if match.raw.get("_source") == "okooo":
+        blockers: list[str] = []
+        if handicap_signal.available and handicap_signal.score <= -0.18:
+            blockers.append("亚盘水位反向")
+        if market_balance_signal.available and market_balance_signal.score <= -0.12:
+            blockers.append("市场平衡反向")
+        if cover_risk_signal.available and cover_risk_signal.score <= -0.20:
+            blockers.append("赢盘门槛反向")
+        if blockers:
+            return weighted_score, "深让净胜边际补强跳过（" + "、".join(blockers[:3]) + "）"
     euro_factor = clamp((max(es, 0.0) - 0.30) / 0.30, 0.0, 1.0) if not euro_flat_ok else 0.35
     external_factor = clamp((ext - 0.06) / 0.22, 0.0, 1.0)
     depth_factor = clamp((depth - 1.25) / 1.25, 0.0, 1.0)
@@ -4873,7 +4886,15 @@ def model_upper_trap_score_adjustment(
 
     okooo_source = match.raw.get("_source") == "okooo"
     asian_lower_count, asian_lower_reasons = asian_lower_confirmation_cluster(lookup)
+    strong_positive_snapshot_guard = bool(
+        snapshot
+        and snapshot.available
+        and signal_value(snapshot) >= 0.50
+        and weighted_score > 0
+    )
     if okooo_source and asian_lower_count <= 0:
+        if strong_positive_snapshot_guard:
+            return weighted_score, "模型层热门陷阱保护：快照趋势强烈偏上且缺少亚盘下盘确认，不反向扣分"
         guarded_shift = clamp(pressure * 0.46 + 0.020, 0.045, 0.13)
         adjusted = max(weighted_score - guarded_shift, LOWER_THRESHOLD + 0.005)
         if adjusted < weighted_score:
@@ -4954,17 +4975,13 @@ def model_upper_trap_score_adjustment(
 
 
 def recommendation_from_score(score: float) -> str:
-    if score >= MODEL_DIRECTION_EPSILON:
+    if score >= 0:
         return "上盘"
-    if score <= -MODEL_DIRECTION_EPSILON:
-        return "下盘"
-    return "观望"
+    return "下盘"
 
 
 def score_strength_label(score: float) -> str:
     abs_score = abs(score)
-    if abs_score < MODEL_DIRECTION_EPSILON:
-        return "无明显"
     if abs_score < UPPER_THRESHOLD:
         return "轻微"
     if abs_score < STRONG_THRESHOLD:
@@ -6570,8 +6587,7 @@ def build_parser() -> argparse.ArgumentParser:
             "输出说明:\n"
             "  默认会用楚旗 live-bifa 页面补充必发指数/成交走势；如需只看 SPDEX，请加 --no-chuqi。\n"
             "  推荐 上盘/下盘(轻微|中等|强烈:球队): 直接按模型综合分给出亚盘方向和强度。\n"
-            "  推荐 观望(无明显倾向): |score| < 0.015，方向信号接近噪声。\n"
-            "  score > 0 偏上盘，score < 0 偏下盘；0.12/0.25 用于区分中等和强烈。\n"
+            "  score >= 0 偏上盘，score < 0 偏下盘；0.12/0.25 用于区分中等和强烈。\n"
             "  算法会综合盘口深度、健康/危险大热、平局风险、盘口合理性、公司一致性、\n"
             "  深盘打穿能力、赢盘门槛风险、高低水价值和本地快照趋势；\n"
             "  高水只有在模型概率高于市场隐含概率时才加分，低水偏贵且缺少溢价会扣分。\n"

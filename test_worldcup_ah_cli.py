@@ -33,6 +33,7 @@ from worldcup_ah_cli import (
     parse_chuqi_match_refs,
     parse_match,
     match_from_dict,
+    marginal_deep_upper_cover_score_lift,
     model_upper_trap_score_adjustment,
     price_volume_point_to_dict,
     purchase_decision_from_signals,
@@ -509,7 +510,10 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertEqual(recommendation_from_score(-0.13), "下盘")
         self.assertEqual(recommendation_from_score(0.11), "上盘")
         self.assertEqual(recommendation_from_score(0.02), "上盘")
-        self.assertEqual(recommendation_from_score(0.01), "观望")
+        self.assertEqual(recommendation_from_score(0.01), "上盘")
+        self.assertEqual(recommendation_from_score(0.0), "上盘")
+        self.assertEqual(recommendation_from_score(-0.01), "下盘")
+        self.assertEqual(score_strength_label(0.0), "轻微")
         self.assertEqual(score_strength_label(0.02), "轻微")
         self.assertEqual(score_strength_label(0.13), "中等")
         self.assertEqual(score_strength_label(-0.28), "强烈")
@@ -638,16 +642,16 @@ class WorldCupAhCliTests(unittest.TestCase):
     def test_empty_handicap_data_degrades_to_watch_without_crashing(self):
         predictor = Predictor(FakeClient(handicap_rows=[]))
         result = predictor.analyze(sample_match())
-        self.assertIn(result.recommendation, {"上盘", "下盘", "观望"})
+        self.assertIn(result.recommendation, {"上盘", "下盘"})
         self.assertLess(result.completeness, 100)
         self.assertTrue(any(signal.name == "亚盘水位" and not signal.available for signal in result.signals))
 
     def test_network_failures_degrade_to_watch(self):
         predictor = Predictor(FakeClient(fail=True))
         result = predictor.analyze(sample_match())
-        self.assertEqual(result.recommendation, "观望")
-        self.assertEqual(result.model_recommendation, "观望")
-        self.assertLessEqual(result.confidence, 35)
+        self.assertIn(result.recommendation, {"上盘", "下盘"})
+        self.assertEqual(result.model_recommendation, result.recommendation)
+        self.assertLessEqual(result.confidence, 45)
         self.assertTrue(result.warnings)
 
     def test_stopped_match_keeps_model_confidence_for_review(self):
@@ -814,11 +818,11 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertGreater(market_signal.score, 0)
         self.assertIn("主动防守", market_signal.reason)
 
-    def test_result_always_exposes_lean_even_when_watch(self):
+    def test_result_always_exposes_binary_lean(self):
         predictor = Predictor(FakeClient(handicap_rows=[]))
         result = predictor.analyze(sample_match())
         data = result.to_dict()
-        self.assertIn(result.lean, {"上盘", "下盘", "无明显倾向"})
+        self.assertIn(result.lean, {"上盘", "下盘"})
         self.assertIn("lean", data)
         self.assertIn("lean_team", data)
         self.assertIn("purchase_side", data)
@@ -845,7 +849,7 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertIn("压制上盘(加纳)", risk_summary)
         self.assertNotIn("偏下盘", risk_summary)
 
-    def test_tiny_score_has_no_clear_lean(self):
+    def test_tiny_score_still_has_binary_lean(self):
         match = sample_match()
         result = AnalysisResult(
             match=match,
@@ -858,8 +862,8 @@ class WorldCupAhCliTests(unittest.TestCase):
             signals=[],
             warnings=[],
         )
-        self.assertEqual(result.lean, "无明显倾向")
-        self.assertEqual(result.lean_team, "")
+        self.assertEqual(result.lean, "上盘")
+        self.assertEqual(result.lean_team, match.home)
 
     def test_purchase_display_marks_tiny_binary_edge(self):
         match = sample_match()
@@ -1575,6 +1579,7 @@ class WorldCupAhCliTests(unittest.TestCase):
 
     def test_positive_snapshot_prevents_single_euro_trap_from_flipping_lower(self):
         raw = {
+            "_source": "okooo",
             "BfIndexHome": 76.84,
             "BfIndexDraw": 12.84,
             "BfIndexAway": 10.32,
@@ -1604,8 +1609,27 @@ class WorldCupAhCliTests(unittest.TestCase):
 
         adjusted, note = model_upper_trap_score_adjustment(match, 0.079, signals)
 
-        self.assertGreater(adjusted, -0.12)
-        self.assertIn("仅单项下盘确认", note)
+        self.assertEqual(adjusted, 0.079)
+        self.assertIn("快照趋势强烈偏上", note)
+
+    def test_deep_upper_lift_skips_when_ah_cover_signals_are_reversed(self):
+        match = sample_match(raw={"_source": "okooo"}, asian_line="-1.25")
+
+        adjusted, note = marginal_deep_upper_cover_score_lift(
+            match,
+            -0.01,
+            0.80,
+            Signal("欧赔/Kelly", 0.55, 0.06, True, "欧赔确认胜负"),
+            Signal("外部赔率/实力校验", 0.20, 0.02, True, "外部支持上盘"),
+            Signal("市场平衡/背离", -0.16, 0.055, True, "市场反向"),
+            Signal("亚盘水位", -0.42, 0.20, True, "亚盘反向"),
+            Signal("赢盘门槛风险", -0.23, 0.06, True, "门槛反向"),
+            Signal("必发成交走势", 0.16, 0.09, True, "成交略偏上"),
+            None,
+        )
+
+        self.assertEqual(adjusted, -0.01)
+        self.assertIn("补强跳过", note)
 
     def test_static_handicap_fallback_trap_does_not_force_lower_against_external_support(self):
         raw = {
