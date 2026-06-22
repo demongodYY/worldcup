@@ -2344,7 +2344,9 @@ class Predictor:
             probability_reason = "缺少平局价格，盘口估算保守降权"
         actual_depth = line_depth(match.asian_line)
         upper_water = average_upper_water(rows, match, upper_team)
+        lower_water = average_team_water(rows, match, lower_team)
         has_upper_water = upper_water > 0
+        water_edge = lower_water - upper_water if has_upper_water and lower_water > 0 else 0.0
         gap = fair_depth - actual_depth
         heat_edge = score_bifa_heat_edge(match, upper_team, lower_team)
         index_edge, amount_edge = bifa_index_amount_edges(match, upper_team, lower_team)
@@ -2406,6 +2408,10 @@ class Predictor:
             elif 0 < upper_water <= 1.82:
                 score = 0.08
                 interpretation = "盘口匹配且上盘低水，轻微偏上盘"
+            elif 0 < upper_water <= 1.90 and water_edge >= 0.06:
+                low_water_strength = clamp((water_edge - 0.06) / 0.16, 0, 1)
+                score = clamp(0.04 + 0.07 * low_water_strength, 0, 0.11)
+                interpretation = "盘口匹配且上盘相对低水，弱上盘确认"
 
         if not has_upper_water:
             score *= 0.45
@@ -2452,6 +2458,9 @@ class Predictor:
             else:
                 score = clamp(score + bump, -1, 0.10)
                 interpretation += f"；深盘强队胜赔概率仍明显领先，盘口合理性负分回拉 {bump:.2f}"
+        water_reason = f"上盘均水 {upper_water:.3g}"
+        if lower_water > 0:
+            water_reason = f"上下盘均水 {upper_water:.3g}/{lower_water:.3g}"
         return Signal(
             "盘口合理性",
             score,
@@ -2459,7 +2468,7 @@ class Predictor:
             True,
             (
                 f"价格估算合理盘口约 {fair_depth:.2f}，实际盘口 {actual_depth:.2f}，"
-                f"上盘均水 {upper_water:.3g}；{probability_reason}；{interpretation}"
+                f"{water_reason}；{probability_reason}；{interpretation}"
             ),
         )
 
@@ -2480,14 +2489,18 @@ class Predictor:
         avg = sum(scores) / len(scores)
         dispersion = score_dispersion(scores)
         consistency = clamp(1.0 - dispersion / 0.55, 0.25, 1.0)
-        mixed_penalty = 0.20 if positives and negatives else 0.0
         adjusted = avg * consistency
-        if mixed_penalty and adjusted:
-            adjusted = math.copysign(max(abs(adjusted) - mixed_penalty, 0.0), adjusted)
-        consensus_note = ""
         consensus_direction = 1 if positives > negatives else -1 if negatives > positives else 0
         consensus_count = max(positives, negatives)
         consensus_share = consensus_count / len(scores)
+        minority_share = min(positives, negatives) / len(scores)
+        margin_share = abs(positives - negatives) / len(scores)
+        mixed_penalty = 0.0
+        if positives and negatives:
+            mixed_penalty = clamp(0.14 * minority_share - 0.08 * margin_share, 0.0, 0.12)
+        if mixed_penalty and adjusted:
+            adjusted = math.copysign(max(abs(adjusted) - mixed_penalty, 0.0), adjusted)
+        consensus_note = ""
         if consensus_direction and consensus_count >= 5 and consensus_share >= 0.75 and dispersion <= 0.30:
             consensus_floor = clamp(
                 0.30 + 0.40 * (consensus_share - 0.75) + 0.20 * max(0.0, 0.22 - dispersion),
@@ -2501,6 +2514,19 @@ class Predictor:
             elif abs(adjusted) < 0.08:
                 adjusted = consensus_direction * consensus_floor * 0.75
                 consensus_note = f"；多数公司同向但水位幅度弱，强度下限折减 {consensus_floor * 0.75:.2f}"
+        elif consensus_direction and consensus_count >= 5 and consensus_share >= 0.625 and dispersion <= 0.55:
+            consensus_floor = clamp(
+                0.06 + 0.32 * (consensus_share - 0.625) + 0.10 * max(0.0, 0.45 - dispersion),
+                0.06,
+                0.18,
+            )
+            if adjusted * consensus_direction > 0:
+                if abs(adjusted) < consensus_floor:
+                    adjusted = consensus_direction * consensus_floor
+                    consensus_note = f"；多数公司同向，弱强度下限 {consensus_floor:.2f}"
+            elif abs(adjusted) < 0.06:
+                adjusted = consensus_direction * consensus_floor * 0.85
+                consensus_note = f"；多数公司同向但水位分歧较高，弱强度下限折减 {consensus_floor * 0.85:.2f}"
         score = clamp(adjusted, -1, 1)
         return Signal(
             "公司一致性",

@@ -1220,6 +1220,29 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertGreater(fair_signal.score, -0.20)
         self.assertIn("缺少上盘水位", fair_signal.reason)
 
+    def test_matched_fair_line_with_relative_low_water_confirms_upper(self):
+        raw = {
+            **sample_match().raw,
+            "EuroAvrHome": 6.60,
+            "EuroAvrDraw": 4.00,
+            "EuroAvrAway": 1.62,
+            "BfOddsHome": 6.60,
+            "BfOddsDraw": 4.00,
+            "BfOddsAway": 1.62,
+        }
+        match = sample_match(home="新西兰", away="埃及", asian_line="0.75", raw=raw)
+        upper_team, lower_team = upper_lower_teams(match)
+        rows = [
+            HandicapRow(1, "Bet365", 2.05, 1.80, 1.90, 1.95, 0.97, None, init_line=0.75, latest_line=0.75),
+            HandicapRow(2, "澳门彩票", 2.04, 1.80, 2.10, 1.74, 0.97, None, init_line=0.50, latest_line=0.75),
+            HandicapRow(3, "皇冠", 1.98, 1.94, 1.97, 1.85, 0.97, None, init_line=0.75, latest_line=0.75),
+        ]
+
+        fair_signal = Predictor(FakeClient())._fair_line_signal(match, upper_team, lower_team, rows)
+
+        self.assertGreater(fair_signal.score, 0.04)
+        self.assertIn("上盘相对低水", fair_signal.reason)
+
     def test_market_balance_neutral_conflict_is_not_called_same_direction(self):
         raw = {
             **sample_match().raw,
@@ -1278,6 +1301,25 @@ class WorldCupAhCliTests(unittest.TestCase):
         signal = Predictor(FakeClient())._bookmaker_consensus_signal(match, "日本", rows)
 
         self.assertLessEqual(signal.score, -0.30)
+        self.assertIn("多数公司同向", signal.reason)
+
+    def test_bookmaker_consensus_clear_split_majority_keeps_direction(self):
+        match = sample_match(home="新西兰", away="埃及", asian_line="0.75")
+        rows = [
+            HandicapRow(1, "Bet365", 2.05, 1.80, 1.90, 1.95, 0.97, 0, init_line=0.75, latest_line=0.75),
+            HandicapRow(2, "澳门彩票", 2.04, 1.80, 2.10, 1.74, 0.97, 1, init_line=0.50, latest_line=0.75),
+            HandicapRow(3, "皇冠", 2.09, 1.80, 1.97, 1.85, 0.97, 2, init_line=0.75, latest_line=0.75),
+            HandicapRow(4, "Pinnacle", 2.07, 1.82, 1.90, 1.95, 0.97, 3, init_line=0.75, latest_line=0.75),
+            HandicapRow(5, "伟德国际", 1.98, 1.72, 1.84, 1.83, 0.97, 4, init_line=0.75, latest_line=0.75),
+            HandicapRow(6, "利记", 2.11, 1.81, 2.03, 1.81, 0.97, 5, init_line=0.75, latest_line=0.75),
+            HandicapRow(7, "Interwetten", 1.70, 2.05, 2.10, 1.73, 0.97, 6, init_line=0.50, latest_line=1.00),
+            HandicapRow(8, "12bet.com", 1.80, 2.04, 1.95, 1.89, 0.97, 7, init_line=0.75, latest_line=1.00),
+        ]
+
+        signal = Predictor(FakeClient())._bookmaker_consensus_signal(match, "埃及", rows)
+
+        self.assertGreater(signal.score, 0.08)
+        self.assertIn("上盘6，下盘2", signal.reason)
         self.assertIn("多数公司同向", signal.reason)
 
     def test_okooo_output_hides_derived_noise_signals(self):
