@@ -24,18 +24,18 @@ from okooo_ah_cli import (  # noqa: E402
     DEFAULT_OKOOO_VALIDATE_SCORES_PATH,
     OKOOO_DEFAULT_ISSUE,
     OkoooClient,
-    ValidateReplaySnapshotStore,
     attach_snapshot_replay_fields,
     cookie_from_env,
     load_okooo_validate_scores,
+    median_snapshot_prediction_dict,
+    replay_snapshot_result_at,
+    replay_snapshot_results,
     snapshot_dir as resolve_okooo_snapshot_dir,
 )
 from worldcup_ah_cli import (  # noqa: E402
     AnalysisResult,
     DataError,
     Match,
-    OkoooSnapshotReplayClient,
-    Predictor,
     SnapshotStore,
     line_value,
     load_dotenv_file,
@@ -147,6 +147,9 @@ def normalize_result_dict(result: dict[str, Any]) -> dict[str, Any]:
         "decision_reason": result.get("decision_reason") or "",
         "warnings": result.get("warnings") if isinstance(result.get("warnings"), list) else [],
         "signals": result.get("signals") if isinstance(result.get("signals"), list) else [],
+        "snapshot_median_count": result.get("snapshot_median_count"),
+        "snapshot_median_total_count": result.get("snapshot_median_total_count"),
+        "last_replay_score": result.get("last_replay_score"),
     }
 
 
@@ -204,11 +207,7 @@ def replay_snapshot_result(snapshot_root: Path, event_id: int, records: list[dic
     that point, while SnapshotStore history excludes the current point so trend
     signals never look ahead.
     """
-    current_records = records[: index + 1]
-    match = match_from_dict(current_records[-1]["match"])
-    client = OkoooSnapshotReplayClient(current_records)
-    store = ValidateReplaySnapshotStore(snapshot_root, event_id, current_records[:-1])
-    return Predictor(client, store).analyze(match)
+    return replay_snapshot_result_at(snapshot_root, event_id, records, index)
 
 
 def replayed_snapshot_records(snapshot_root: Path, event_id: int, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -243,7 +242,9 @@ def build_snapshot_events(snapshot_root: Path) -> list[dict[str, Any]]:
         first_metrics = snapshot_metrics(first)
         last_metrics = snapshot_metrics(last)
         match = last.get("match") if isinstance(last.get("match"), dict) else {}
-        result = last.get("result") if isinstance(last.get("result"), dict) else {}
+        result = median_snapshot_prediction_dict(
+            [record["result"] for record in replayed_records if isinstance(record.get("result"), dict)]
+        )
         normalized = normalize_result_dict(result)
         score_delta = last_metrics["score"] - first_metrics["score"]
         heat_delta = last_metrics["heat_edge"] - first_metrics["heat_edge"]
@@ -343,11 +344,13 @@ def replay_validate_result(snapshot_root: Path, event_id: int, home_goals: int, 
         }
     try:
         match = match_from_dict(records[-1]["match"])
-        result = replay_snapshot_result(snapshot_root, event_id, records, len(records) - 1)
+        result = median_snapshot_prediction_dict(
+            [item.to_dict() for item in replay_snapshot_results(snapshot_root, event_id, records)]
+        )
         outcome, margin = recommendation_outcome(
-            result.recommendation,
-            result.upper_team,
-            result.lower_team,
+            str(result.get("recommendation") or ""),
+            str(result.get("upper_team") or ""),
+            str(result.get("lower_team") or ""),
             match.home,
             match.away,
             match.asian_line,
@@ -367,16 +370,19 @@ def replay_validate_result(snapshot_root: Path, event_id: int, home_goals: int, 
             "away": match.away,
             "match_time": match.match_time.isoformat(),
             "asian_line": match.asian_line,
-            "recommendation": result.recommendation,
-            "purchase_side": result.purchase_side,
-            "purchase_team": result.purchase_team,
-            "model_recommendation": result.model_recommendation,
-            "strength": result.strength,
-            "score": round(result.score, 4),
-            "confidence": result.confidence,
-            "completeness": result.completeness,
-            "upper_team": result.upper_team,
-            "lower_team": result.lower_team,
+            "recommendation": result.get("recommendation"),
+            "purchase_side": result.get("purchase_side"),
+            "purchase_team": result.get("purchase_team"),
+            "model_recommendation": result.get("model_recommendation"),
+            "strength": result.get("strength"),
+            "score": result.get("score"),
+            "confidence": result.get("confidence"),
+            "completeness": result.get("completeness"),
+            "upper_team": result.get("upper_team"),
+            "lower_team": result.get("lower_team"),
+            "snapshot_median_count": result.get("snapshot_median_count"),
+            "snapshot_median_total_count": result.get("snapshot_median_total_count"),
+            "last_replay_score": result.get("last_replay_score"),
             "last_fetched_at": records[-1].get("fetched_at") or "",
         }
     except Exception as exc:  # dashboard should show one bad row, not blank the whole page
@@ -451,6 +457,9 @@ def build_dashboard_payload(snapshot_root: Path, scores_json: Path | None) -> di
                 "score": validation_record.get("score"),
                 "confidence": validation_record.get("confidence"),
                 "completeness": validation_record.get("completeness"),
+                "snapshot_median_count": validation_record.get("snapshot_median_count"),
+                "snapshot_median_total_count": validation_record.get("snapshot_median_total_count"),
+                "last_replay_score": validation_record.get("last_replay_score"),
             }
         else:
             event["validation"] = None

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import os
 import re
 import ssl
@@ -34,6 +35,7 @@ from zoneinfo import ZoneInfo
 _REPO_ROOT = Path(__file__).resolve().parent
 
 from worldcup_ah_cli import (
+    AnalysisResult,
     DataError,
     EuroTrendPoint,
     HandicapRow,
@@ -59,6 +61,7 @@ from worldcup_ah_cli import (
     print_analysis,
     print_snapshot_saved,
     print_snapshot_trend,
+    score_strength_label,
     side_key,
     upper_lower_teams,
 )
@@ -68,6 +71,7 @@ OKOOO_BASE_URL = "https://www.okooo.cn"
 OKOOO_DEFAULT_ISSUE = "dqjc"
 OKOOO_TZ = ZoneInfo("Asia/Shanghai")
 OKOOO_SNAPSHOT_DIR = str(_REPO_ROOT / ".okooo_snapshots")
+SNAPSHOT_MEDIAN_WINDOW = 2
 
 # 默认复盘比分表；编辑该 JSON 即可增删赛果，无需改代码
 DEFAULT_OKOOO_VALIDATE_SCORES_PATH = _REPO_ROOT / "tools" / "okooo_validate_scores.json"
@@ -212,6 +216,99 @@ class ValidateReplaySnapshotStore(SnapshotStore):
         return super().load_event(event_id)
 
 
+def replay_snapshot_result_at(
+    snapshot_root: Path, event_id: int, records: list[dict[str, Any]], index: int
+) -> AnalysisResult:
+    """Replay one snapshot point with only earlier records as trend history."""
+    current_records = records[: index + 1]
+    match = match_from_dict(current_records[-1]["match"])
+    client = OkoooSnapshotReplayClient(current_records)
+    store = ValidateReplaySnapshotStore(snapshot_root, event_id, current_records[:-1])
+    return Predictor(client, store).analyze(match)
+
+
+def replay_snapshot_results(snapshot_root: Path, event_id: int, records: list[dict[str, Any]]) -> list[AnalysisResult]:
+    out: list[AnalysisResult] = []
+    for idx in range(len(records)):
+        out.append(replay_snapshot_result_at(snapshot_root, event_id, records, idx))
+    return out
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _median_int(values: list[Any], default: int) -> int:
+    nums = [_finite_float(value) for value in values]
+    usable = [num for num in nums if num is not None]
+    if not usable:
+        return default
+    return int(round(median(usable)))
+
+
+def _recommendation_from_median_score(score: float) -> str:
+    return "上盘" if score >= 0 else "下盘"
+
+
+def median_snapshot_prediction_dict(
+    result_dicts: list[dict[str, Any]], *, window: int = SNAPSHOT_MEDIAN_WINDOW
+) -> dict[str, Any]:
+    """Aggregate replayed snapshot predictions by median score.
+
+    The last replay result still supplies metadata such as teams, match id and
+    signals, while the final side/strength/score use the median of recent
+    replayed snapshot scores for that event.
+    """
+    usable = [item for item in result_dicts if isinstance(item, dict) and _finite_float(item.get("score")) is not None]
+    if not usable:
+        raise DataError("no usable replay scores for median snapshot prediction")
+    sampled = usable[-window:] if window > 0 else usable
+    last = dict(usable[-1])
+    scores = [_finite_float(item.get("score")) for item in sampled]
+    median_score = float(median([score for score in scores if score is not None]))
+    recommendation = _recommendation_from_median_score(median_score)
+    upper_team = str(last.get("upper_team") or "")
+    lower_team = str(last.get("lower_team") or "")
+    purchase_team = upper_team if recommendation == "上盘" else lower_team
+    last_score = _finite_float(last.get("score"))
+    last_confidence = int(_finite_float(last.get("confidence")) or 0)
+    last_completeness = int(_finite_float(last.get("completeness")) or 0)
+    last.update(
+        {
+            "recommendation": recommendation,
+            "purchase_side": recommendation,
+            "purchase_team": purchase_team,
+            "model_recommendation": recommendation,
+            "score": round(median_score, 4),
+            "purchase_score": round(median_score, 4),
+            "strength": score_strength_label(median_score),
+            "confidence": _median_int([item.get("confidence") for item in sampled], last_confidence),
+            "model_confidence": _median_int(
+                [item.get("model_confidence", item.get("confidence")) for item in sampled], last_confidence
+            ),
+            "completeness": _median_int([item.get("completeness") for item in sampled], last_completeness),
+            "decision_reason": (
+                f"快照中位数：最近 {len(sampled)}/{len(usable)} 次 replay score 中位数 {median_score:+.3f}，"
+                f"最后一条 {last_score if last_score is not None else median_score:+.3f}，推荐{recommendation}"
+            ),
+            "snapshot_median_count": len(sampled),
+            "snapshot_median_total_count": len(usable),
+            "last_replay_score": round(last_score if last_score is not None else median_score, 4),
+        }
+    )
+    return last
+
+
+def median_snapshot_prediction_from_results(results: list[AnalysisResult]) -> dict[str, Any]:
+    return median_snapshot_prediction_dict([result.to_dict() for result in results])
+
+
 def run_validate_snapshots_from_dir(
     snapshot_root: Path, scores: dict[int, tuple[int, int]], *, fail_on_miss: bool = True
 ) -> int:
@@ -232,13 +329,11 @@ def run_validate_snapshots_from_dir(
         if not lines:
             continue
         match = match_from_dict(lines[-1]["match"])
-        client = OkoooSnapshotReplayClient(lines)
-        store = ValidateReplaySnapshotStore(snapshot_root, eid, lines[:-1])
-        res = Predictor(client, store).analyze(match)
+        median_result = median_snapshot_prediction_from_results(replay_snapshot_results(snapshot_root, eid, lines))
         out, _margin = _replay_recommendation_outcome(
-            res.recommendation,
-            res.upper_team,
-            res.lower_team,
+            str(median_result.get("recommendation") or ""),
+            str(median_result.get("upper_team") or ""),
+            str(median_result.get("lower_team") or ""),
             match.home,
             match.away,
             match.asian_line,
@@ -257,9 +352,9 @@ def run_validate_snapshots_from_dir(
                     str(eid),
                     f"{match.home} vs {match.away}",
                     str(match.asian_line),
-                    res.recommendation,
-                    res.strength,
-                    f"{res.score:+.3f}",
+                    str(median_result.get("recommendation") or ""),
+                    str(median_result.get("strength") or ""),
+                    f"{float(median_result.get('score') or 0):+.3f}",
                     f"{hg}-{ag}",
                     out,
                 )

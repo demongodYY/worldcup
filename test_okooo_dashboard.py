@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from statistics import median
 from tempfile import TemporaryDirectory
 
 from tools.okooo_dashboard_server import (
@@ -90,7 +91,9 @@ class OkoooDashboardTests(unittest.TestCase):
         self.assertEqual(event["event_id"], 42)
         self.assertEqual(event["snapshot_count"], 2)
         self.assertEqual(len(event["series"]), 2)
-        self.assertEqual(event["last_result"]["score"], event["series"][-1]["score"])
+        self.assertEqual(event["last_result"]["score"], round(median(point["score"] for point in event["series"]), 4))
+        self.assertEqual(event["last_result"]["snapshot_median_count"], 2)
+        self.assertEqual(event["last_result"]["snapshot_median_total_count"], 2)
         self.assertIn(event["last_result"]["purchase_side"], {"上盘", "下盘", "观望"})
 
     def test_build_snapshot_events_sort_by_match_time_descending(self) -> None:

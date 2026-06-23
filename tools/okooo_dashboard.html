@@ -885,6 +885,9 @@
       }
       const result = item.last_result;
       const sideClass = classForSide(result.purchase_side);
+      const scoreNote = result.snapshot_median_count
+        ? `中位数 ${result.snapshot_median_count}/${result.snapshot_median_total_count || result.snapshot_median_count} 条；末条 ${fmt(result.last_replay_score, 3)}`
+        : `变化 ${fmt(item.score_delta, 3)}`;
       const validation = item.validation
         ? `<span class="badge ${classForOutcome(item.validation.outcome)}">${outcomeText(item.validation.outcome)} ${escapeHtml(item.validation.scoreline)}</span>`
         : `<span class="badge soft">未录入比分</span>`;
@@ -899,7 +902,7 @@
 
         <div class="detail-grid">
           ${statHtml("最新推荐", recommendationText(result))}
-          ${statHtml("重放 score", fmt(result.score, 3), `变化 ${fmt(item.score_delta, 3)}`)}
+          ${statHtml("重放 score", fmt(result.score, 3), scoreNote)}
           ${statHtml("置信 / 完整度", `${result.confidence}% / ${result.completeness}%`)}
           ${statHtml("盘口", `${item.asian_line || "0"}`, `深度变化 ${fmt(item.line_depth_delta, 2)}`)}
         </div>
