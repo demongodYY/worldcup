@@ -36,6 +36,7 @@ from worldcup_ah_cli import (  # noqa: E402
     AnalysisResult,
     DataError,
     Match,
+    Predictor,
     SnapshotStore,
     line_value,
     load_dotenv_file,
