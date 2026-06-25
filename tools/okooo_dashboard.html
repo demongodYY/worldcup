@@ -604,17 +604,17 @@
       <div class="summary-strip" id="validateStats"></div>
       <div class="panel">
         <div class="panel-head">
-          <div class="panel-title">Validate 复盘记录</div>
+          <div class="panel-title">Validate 复盘记录 · 末两条合格赛前快照中位数</div>
           <span class="badge soft" id="validateCount">0 条</span>
         </div>
         <div class="panel-body">
           <div class="validate-tools">
             <div class="filter-group">
               <button class="metric-tab active" type="button" data-filter="all">全部</button>
-              <button class="metric-tab" type="button" data-filter="hit">命中</button>
-              <button class="metric-tab" type="button" data-filter="miss">未中</button>
-              <button class="metric-tab" type="button" data-filter="na">观望</button>
-              <button class="metric-tab" type="button" data-filter="missing">缺快照</button>
+              <button class="metric-tab" type="button" data-filter="hit">全赢 / 半赢</button>
+              <button class="metric-tab" type="button" data-filter="miss">半输 / 全输</button>
+              <button class="metric-tab" type="button" data-filter="push">走水</button>
+              <button class="metric-tab" type="button" data-filter="missing">排除 / 不足两条</button>
             </div>
             <span class="muted" id="scoresPath"></span>
           </div>
@@ -623,14 +623,15 @@
               <thead>
                 <tr>
                   <th>event_id</th>
+                  <th>末两条时点</th>
                   <th>对阵</th>
                   <th>盘口</th>
                   <th>推荐</th>
                   <th>模型</th>
-                  <th>重放 score</th>
+                  <th>末两条中位数</th>
                   <th>比分</th>
                   <th>结果</th>
-                  <th>margin</th>
+                  <th>收益</th>
                   <th>快照时间</th>
                 </tr>
               </thead>
@@ -711,8 +712,8 @@
     }
 
     function classForOutcome(outcome) {
-      if (outcome === "hit") return "hit";
-      if (outcome === "miss") return "miss";
+      if (outcome === "hit" || outcome === "full_win" || outcome === "half_win") return "hit";
+      if (outcome === "miss" || outcome === "full_loss" || outcome === "half_loss") return "miss";
       if (outcome === "push") return "push";
       if (outcome === "na") return "na";
       return "soft";
@@ -722,8 +723,13 @@
       return {
         hit: "命中",
         miss: "未中",
+        full_win: "全赢",
+        half_win: "半赢",
+        half_loss: "半输",
+        full_loss: "全输",
         push: "走水",
         na: "观望",
+        excluded: "排除",
         missing: "缺快照",
         error: "错误"
       }[outcome] || "-";
@@ -1129,11 +1135,12 @@
       const validation = state.data?.validation;
       const stats = validation?.stats || {};
       el("validateStats").innerHTML = [
-        statHtml("记录", `${stats.total || 0}`),
-        statHtml("命中", `${stats.hit || 0}`),
-        statHtml("未中", `${stats.miss || 0}`),
-        statHtml("观望 / 走水", `${(stats.na || 0) + (stats.push || 0)}`),
-        statHtml("方向命中率", stats.accuracy === null || stats.accuracy === undefined ? "-" : pct(stats.accuracy))
+        statHtml("有效下注", `${stats.roi_bets || 0}`),
+        statHtml("全赢 / 半赢", `${stats.full_win || 0} / ${stats.half_win || 0}`),
+        statHtml("半输 / 全输", `${stats.half_loss || 0} / ${stats.full_loss || 0}`),
+        statHtml("净收益", stats.roi_bets ? `${fmt(stats.net_profit, 3)}u` : "-"),
+        statHtml("ROI", stats.roi === null || stats.roi === undefined ? "-" : pct(stats.roi)),
+        statHtml("排除 / 不足", `${stats.excluded || 0} / ${stats.missing || 0}`)
       ].join("");
       el("validateCount").textContent = `${stats.total || 0} 条`;
       el("scoresPath").textContent = validation?.scores_json || "";
@@ -1143,23 +1150,30 @@
       const rows = state.data?.validation?.records || [];
       const filtered = rows.filter((row) => {
         if (state.validateFilter === "all") return true;
-        if (state.validateFilter === "missing") return row.outcome === "missing" || row.status === "empty";
+        if (state.validateFilter === "missing") {
+          return row.outcome === "missing" || row.outcome === "excluded" || row.status === "insufficient_snapshots";
+        }
+        if (state.validateFilter === "hit") return row.outcome === "full_win" || row.outcome === "half_win";
+        if (state.validateFilter === "miss") return row.outcome === "full_loss" || row.outcome === "half_loss";
         return row.outcome === state.validateFilter;
       });
       el("validateRows").innerHTML = filtered.map((row) => `
         <tr>
           <td>${escapeHtml(row.event_id)}</td>
+          <td>${row.snapshot_median_count
+            ? `T-${Math.round(Number(row.first_minutes_before || 0))} / T-${Math.round(Number(row.latest_minutes_before || 0))}`
+            : "-"}</td>
           <td>${escapeHtml(row.match || "")}</td>
-          <td>${escapeHtml(row.asian_line || "")}</td>
+          <td>${escapeHtml(row.asian_line || "")}${row.decimal_odds ? ` @ ${fmt(row.decimal_odds, 2)}` : ""}</td>
           <td>${escapeHtml(row.recommendation || "")}${row.purchase_team ? ` · ${escapeHtml(row.purchase_team)}` : ""}</td>
           <td>${escapeHtml(row.model_recommendation || "")}</td>
           <td class="${Number(row.score || 0) >= 0 ? "positive" : "negative"}">${row.score === undefined ? "-" : fmt(row.score, 3)}</td>
           <td>${escapeHtml(row.scoreline || "")}</td>
           <td><span class="badge ${classForOutcome(row.outcome)}">${outcomeText(row.outcome)}</span></td>
-          <td>${row.margin === undefined ? "-" : fmt(row.margin, 3)}</td>
+          <td>${row.profit === undefined || row.profit === null ? "-" : `${fmt(row.profit, 3)}u`}</td>
           <td>${shortTime(row.last_fetched_at)}</td>
         </tr>
-      `).join("") || `<tr><td colspan="10"><div class="empty">没有匹配记录</div></td></tr>`;
+      `).join("") || `<tr><td colspan="11"><div class="empty">没有匹配记录</div></td></tr>`;
     }
 
     function bindStaticEvents() {

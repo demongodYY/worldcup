@@ -90,27 +90,22 @@ def _merge_like_build_match(
         raw.setdefault("_okooo_euro_prob_draw", _implied(ed))
         raw.setdefault("_okooo_euro_prob_away", _implied(ea))
 
-    # 指数页未抓时补齐常用占位，避免 Predictor 缺键
-    raw.setdefault("_okooo_zhishu_home", 0.88)
-    raw.setdefault("_okooo_zhishu_draw", 0.86)
-    raw.setdefault("_okooo_zhishu_away", 0.82)
-    raw.setdefault("_okooo_zhishu_initial_home", raw["_okooo_zhishu_home"])
-    raw.setdefault("_okooo_zhishu_initial_draw", raw["_okooo_zhishu_draw"])
-    raw.setdefault("_okooo_zhishu_initial_away", raw["_okooo_zhishu_away"])
-    raw.setdefault("_okooo_zhishu_tips", "胜 平")
-    raw.setdefault("_okooo_popularity_home", 50.0)
-    raw.setdefault("_okooo_popularity_draw", 28.0)
-    raw.setdefault("_okooo_popularity_away", 22.0)
-    raw.setdefault("_okooo_probability_home", raw.get("_okooo_euro_prob_home", 33.0))
-    raw.setdefault("_okooo_probability_draw", raw.get("_okooo_euro_prob_draw", 33.0))
-    raw.setdefault("_okooo_probability_away", raw.get("_okooo_euro_prob_away", 33.0))
-    raw.setdefault("_okooo_diff_home", 10.0)
-    raw.setdefault("_okooo_diff_draw", 5.0)
-    raw.setdefault("_okooo_diff_away", 10.0)
-    raw.setdefault("_okooo_cold_home", 0.0)
-    raw.setdefault("_okooo_cold_draw", 0.0)
-    raw.setdefault("_okooo_cold_away", 0.0)
-    raw.setdefault("_okooo_chayi_tips", "胜 平")
+    # 历史导入只保留真实抓到的字段。缺失项由 Predictor 标记 unavailable，
+    # 不再填固定占位值，以免回测把人工常数误当成赛前市场信息。
+    expected_optional = (
+        "_okooo_zhishu_home",
+        "_okooo_zhishu_draw",
+        "_okooo_zhishu_away",
+        "_okooo_popularity_home",
+        "_okooo_popularity_draw",
+        "_okooo_popularity_away",
+        "_okooo_diff_home",
+        "_okooo_diff_draw",
+        "_okooo_diff_away",
+    )
+    raw["_validation_missing_fields"] = [key for key in expected_optional if key not in raw]
+    raw["_validation_eligible"] = False
+    raw["_validation_exclusion_reason"] = "historical_post_match_import"
 
     from worldcup_ah_cli import Match
 
@@ -206,7 +201,13 @@ def main() -> None:
         rec = {
             "fetched_at": now,
             "match": _merge_like_build_match(base, hcaps.get(oid), euros.get(oid)),
-            "schema": 1,
+            "schema": 2,
+            "provenance": {
+                "kind": "historical_import",
+                "validation_eligible": False,
+                "reason": "historical_post_match_import",
+                "issue": issue,
+            },
         }
         out = snap_dir / f"{oid}.jsonl"
         out.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")

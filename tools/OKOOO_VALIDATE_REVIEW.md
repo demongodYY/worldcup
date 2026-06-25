@@ -12,6 +12,17 @@ python3 okooo_ah_cli.py --no-dotenv validate-snapshots
 python3 okooo_ah_cli.py --no-dotenv validate-snapshots --allow-miss
 ```
 
+## P0 验证口径（2026-06-25 起）
+
+- 每场只验证一次：取最后两条合格赛前快照，以两次预测 score 的中位数决定方向。
+- 结算使用两条中最新一条的真实盘口和水位；不足两条的比赛不进入验证。
+- 四分之一盘拆成两半结算，输出全赢、半赢、走水、半输、全输。
+- 按预测时刻水位计算一单位下注净收益和 ROI；缺水位时方向仍可展示，但收益标为 unavailable。
+- 赛后快照、历史导入和旧版固定占位字段自动排除。
+- `--walk-forward` 只读取快照当时保存的预测，并要求版本与 `tools/okooo_model_freeze.json` 一致。
+
+当前本地历史重放：全赢 17、半赢 3、走水 2、半输 1、全输 7，净收益 **+9.447u / 30 注，ROI 31.5%**。历史重放仍属于样本内验证，正式结论以后续冻结版本 walk-forward 为准。
+
 **对阵来源**：表中 `event_id` 与比分须能对照 [FIFA 世界杯官方赛程](https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/scores-fixtures) 及公开战报核实。此前一批「历史复盘」页签下的 Jun12–14 合成快照曾绑定错误对阵，已从本仓库比分表与快照中移除。
 
 ### 2026-06-15 竞彩页导入（betfa + 盘口 + 凯利）
@@ -25,7 +36,7 @@ python3 okooo_ah_cli.py --no-dotenv validate-snapshots --allow-miss
 | 1315894 | 沙特 vs 乌拉圭 | 1-1 |
 | 1315888 | 伊朗 vs 新西兰 | 2-2 |
 
-## 最近一次全量重放（当前 `worldcup_ah_cli`）
+## 旧版全量重放（已废弃口径，仅留档）
 
 | event_id | 对阵 | 模型/推荐 | 比分 | 有方向时 |
 |----------|------|-------------|------|----------|

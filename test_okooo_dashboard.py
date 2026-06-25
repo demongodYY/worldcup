@@ -124,9 +124,9 @@ class OkoooDashboardTests(unittest.TestCase):
     def test_summarize_validate_stats_counts_outcomes(self) -> None:
         stats = summarize_validate_stats(
             [
-                {"outcome": "hit"},
-                {"outcome": "hit"},
-                {"outcome": "miss"},
+                {"outcome": "full_win", "profit": 0.9},
+                {"outcome": "half_win", "profit": 0.45},
+                {"outcome": "full_loss", "profit": -1.0},
                 {"outcome": "push"},
                 {"outcome": "na"},
                 {"status": "missing", "outcome": "missing"},
@@ -135,15 +135,20 @@ class OkoooDashboardTests(unittest.TestCase):
 
         self.assertEqual(stats["hit"], 2)
         self.assertEqual(stats["miss"], 1)
+        self.assertEqual(stats["full_win"], 1)
+        self.assertEqual(stats["half_win"], 1)
+        self.assertEqual(stats["full_loss"], 1)
         self.assertEqual(stats["push"], 1)
         self.assertEqual(stats["na"], 1)
         self.assertEqual(stats["missing"], 1)
         self.assertEqual(stats["directional"], 3)
         self.assertAlmostEqual(stats["accuracy"], 0.6667)
+        self.assertAlmostEqual(stats["net_profit"], 0.35)
+        self.assertAlmostEqual(stats["roi"], 0.1167)
 
     def test_recommendation_outcome_settles_against_upper_margin(self) -> None:
         outcome, margin = recommendation_outcome("上盘", "主队", "客队", "主队", "客队", "-0.5", 1, 0)
-        self.assertEqual(outcome, "hit")
+        self.assertEqual(outcome, "full_win")
         self.assertAlmostEqual(margin, 0.5)
 
         outcome, margin = recommendation_outcome("下盘", "主队", "客队", "主队", "客队", "-1", 1, 0)

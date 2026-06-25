@@ -1,0 +1,8 @@
+{
+  "model_version": "okooo-ah-p0-2026-06-25",
+  "model_fingerprint": "d1ed480242fddee40cb6144b3042bd87dc30d290af36fbb317d86de4d50598f7",
+  "frozen_at": "2026-06-25T00:00:00+08:00",
+  "validation_policy": "last_two_eligible_prematch_snapshots_median",
+  "settlement_market": "latest_of_two_snapshot_line_and_price",
+  "notes": "P0 validation freeze. Walk-forward must use the last two stored eligible pre-match predictions with this exact model version and source fingerprint."
+}

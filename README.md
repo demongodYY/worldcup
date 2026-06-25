@@ -74,7 +74,22 @@ python3 okooo_ah_cli.py watch --world-cup --horizon-hours 72 --interval 120 --ve
 python3 okooo_ah_cli.py --no-dotenv validate-snapshots
 ```
 
-`validate-snapshots`：不访问网络，只读本地 `.okooo_snapshots` 与 `tools/okooo_validate_scores.json`，用当前 `Predictor` 重放并对照已知比分；新保存的澳客快照会携带公司盘口行、欧赔/Kelly 趋势点和已缓存的必发成交走势，旧快照缺少这些字段时会退回快照均水/首末值兜底。复盘表格式与统计说明见 `tools/OKOOO_VALIDATE_REVIEW.md`。存在有方向但未中场次时默认 **退出码 1**；仅打印统计可加 `--allow-miss`。
+`validate-snapshots`：不访问网络，只读本地 `.okooo_snapshots` 与 `tools/okooo_validate_scores.json`。每场取最后两条合格赛前快照，以两次预测 score 的中位数决定方向，并使用最新一条快照当时的真实盘口和水位结算；输出全赢、半赢、走水、半输、全输、单位净收益和 ROI。不足两条、赛后快照、历史导入和固定占位字段不会进入验证；缺失水位显示 unavailable，不进入 ROI。存在半输/全输时默认 **退出码 1**；仅打印统计可加 `--allow-miss`。
+
+历史研究可用当前代码重放：
+
+```bash
+python3 okooo_ah_cli.py --no-dotenv validate-snapshots --allow-miss
+```
+
+正式的后续比赛采用冻结模型 walk-forward，只读取预测当时已经保存的结果，不允许未来代码重写旧预测：
+
+```bash
+python3 okooo_ah_cli.py --no-dotenv validate-snapshots \
+  --walk-forward --allow-miss
+```
+
+冻结版本和代码指纹记录在 `tools/okooo_model_freeze.json`。新快照使用 schema 2，写入模型版本、代码指纹、距离开赛分钟数，以及预测时刻真实盘口和水位。
 
 重要参数：
 

@@ -20,11 +20,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from asian_handicap_validation import settle_asian_handicap, summarize_settlements  # noqa: E402
 from okooo_ah_cli import (  # noqa: E402
     DEFAULT_OKOOO_VALIDATE_SCORES_PATH,
     OKOOO_DEFAULT_ISSUE,
     OkoooClient,
     attach_snapshot_replay_fields,
+    build_validate_snapshot_records,
     cookie_from_env,
     load_okooo_validate_scores,
     median_snapshot_prediction_dict,
@@ -288,11 +290,8 @@ def build_snapshot_events(snapshot_root: Path) -> list[dict[str, Any]]:
 
 
 def margin_for_upper(home_goals: int, away_goals: int, line: float, upper: str, home: str, away: str) -> float:
-    if upper == home:
-        return float(home_goals - away_goals) + line
-    if upper == away:
-        return float(away_goals - home_goals) - line
-    raise ValueError(f"upper_team {upper!r} not in {home!r} / {away!r}")
+    settlement = settle_asian_handicap("上盘", upper, home, away, line, home_goals, away_goals)
+    return settlement.margin
 
 
 def recommendation_outcome(
@@ -305,111 +304,41 @@ def recommendation_outcome(
     home_goals: int,
     away_goals: int,
 ) -> tuple[str, float]:
-    if recommendation == "观望":
-        return "na", 0.0
-    margin = margin_for_upper(home_goals, away_goals, line_value(line_text), upper, home, away)
-    eps = 1e-9
-    if recommendation == "上盘":
-        if margin > eps:
-            return "hit", margin
-        if margin < -eps:
-            return "miss", margin
-        return "push", margin
-    if recommendation == "下盘":
-        if margin < -eps:
-            return "hit", margin
-        if margin > eps:
-            return "miss", margin
-        return "push", margin
-    return "na", margin
+    settlement = settle_asian_handicap(
+        recommendation,
+        upper,
+        home,
+        away,
+        line_value(line_text),
+        home_goals,
+        away_goals,
+    )
+    return settlement.outcome, settlement.margin
 
 
 def replay_validate_result(snapshot_root: Path, event_id: int, home_goals: int, away_goals: int) -> dict[str, Any]:
-    path = snapshot_root / f"{event_id}.jsonl"
-    if not path.is_file():
+    rows = build_validate_snapshot_records(
+        snapshot_root,
+        {event_id: (home_goals, away_goals)},
+        mode="replay",
+    )
+    if not rows:
         return {
             "event_id": event_id,
             "status": "missing",
             "outcome": "missing",
             "scoreline": f"{home_goals}-{away_goals}",
-            "match": f"(missing {path.name})",
         }
-    records = read_jsonl(path)
-    if not records:
-        return {
-            "event_id": event_id,
-            "status": "empty",
-            "outcome": "missing",
-            "scoreline": f"{home_goals}-{away_goals}",
-            "match": f"(empty {path.name})",
-        }
-    try:
-        match = match_from_dict(records[-1]["match"])
-        result = median_snapshot_prediction_dict(
-            [item.to_dict() for item in replay_snapshot_results(snapshot_root, event_id, records)]
-        )
-        outcome, margin = recommendation_outcome(
-            str(result.get("recommendation") or ""),
-            str(result.get("upper_team") or ""),
-            str(result.get("lower_team") or ""),
-            match.home,
-            match.away,
-            match.asian_line,
-            home_goals,
-            away_goals,
-        )
-        return {
-            "event_id": event_id,
-            "status": "ok",
-            "outcome": outcome,
-            "margin": round(margin, 4),
-            "scoreline": f"{home_goals}-{away_goals}",
-            "home_goals": home_goals,
-            "away_goals": away_goals,
-            "match": f"{match.home} vs {match.away}",
-            "home": match.home,
-            "away": match.away,
-            "match_time": match.match_time.isoformat(),
-            "asian_line": match.asian_line,
-            "recommendation": result.get("recommendation"),
-            "purchase_side": result.get("purchase_side"),
-            "purchase_team": result.get("purchase_team"),
-            "model_recommendation": result.get("model_recommendation"),
-            "strength": result.get("strength"),
-            "score": result.get("score"),
-            "confidence": result.get("confidence"),
-            "completeness": result.get("completeness"),
-            "upper_team": result.get("upper_team"),
-            "lower_team": result.get("lower_team"),
-            "snapshot_median_count": result.get("snapshot_median_count"),
-            "snapshot_median_total_count": result.get("snapshot_median_total_count"),
-            "last_replay_score": result.get("last_replay_score"),
-            "last_fetched_at": records[-1].get("fetched_at") or "",
-        }
-    except Exception as exc:  # dashboard should show one bad row, not blank the whole page
-        return {
-            "event_id": event_id,
-            "status": "error",
-            "outcome": "error",
-            "scoreline": f"{home_goals}-{away_goals}",
-            "match": path.name,
-            "error": str(exc),
-        }
+    row = dict(rows[0])
+    row["last_fetched_at"] = row.get("fetched_at") or ""
+    return row
 
 
 def summarize_validate_stats(records: list[dict[str, Any]]) -> dict[str, Any]:
-    stats = {"hit": 0, "miss": 0, "push": 0, "na": 0, "missing": 0, "error": 0}
-    for record in records:
-        outcome = str(record.get("outcome") or "")
-        if outcome in stats:
-            stats[outcome] += 1
-        elif record.get("status") in ("missing", "empty"):
-            stats["missing"] += 1
-        elif record.get("status") == "error":
-            stats["error"] += 1
-    directional = stats["hit"] + stats["miss"]
-    stats["directional"] = directional
-    stats["accuracy"] = round(stats["hit"] / directional, 4) if directional else None
+    stats = summarize_settlements(records)
+    stats["hit"] = stats["full_win"] + stats["half_win"]
+    stats["miss"] = stats["half_loss"] + stats["full_loss"]
+    stats["accuracy"] = stats["positive_rate"]
     stats["total"] = len(records)
     return stats
 
@@ -425,13 +354,17 @@ def validate_record_sort_key(record: dict[str, Any]) -> tuple[str, int]:
 def build_validate_records(snapshot_root: Path, scores_json: Path | None) -> dict[str, Any]:
     effective_scores = scores_json or DEFAULT_OKOOO_VALIDATE_SCORES_PATH
     scores = load_okooo_validate_scores(effective_scores)
-    records = [
-        replay_validate_result(snapshot_root, event_id, home_goals, away_goals)
-        for event_id, (home_goals, away_goals) in sorted(scores.items())
-    ]
+    records = build_validate_snapshot_records(
+        snapshot_root,
+        scores,
+        mode="replay",
+    )
+    for record in records:
+        record["last_fetched_at"] = record.get("fetched_at") or ""
     records = sorted(records, key=validate_record_sort_key, reverse=True)
     return {
         "scores_json": str(effective_scores),
+        "aggregation": "last_two_median",
         "records": records,
         "stats": summarize_validate_stats(records),
     }

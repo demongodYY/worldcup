@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from difflib import SequenceMatcher
+import hashlib
 import html as html_lib
 import http.client
 import json
@@ -28,6 +29,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from asian_handicap_validation import normalize_asian_decimal_odds
 
 
 SPDEX_BASE_URL = "https://app.spdex.com/spdexapi"
@@ -89,6 +92,7 @@ LOWER_THRESHOLD = -0.12
 LEAN_THRESHOLD = 0.05
 MODEL_DIRECTION_EPSILON = 0.015
 STRONG_THRESHOLD = 0.25
+MODEL_VERSION = "okooo-ah-p0-2026-06-25"
 
 TOP_BOOKMAKERS = ("PinnacleSports", "Bet365", "Singbet", "IBC", "Ysb88")
 MATCH_LIST_HOT_MODES = (1, None)
@@ -101,6 +105,11 @@ SCHEDULE_WINDOWS = (
     ("T-60m 首次正式推荐", timedelta(minutes=60), True),
     ("T-30m 复核", timedelta(minutes=30), True),
 )
+
+
+def model_source_fingerprint() -> str:
+    """Fingerprint the frozen scoring implementation written into new snapshots."""
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def default_env_file_path() -> Path:
@@ -631,8 +640,22 @@ class AnalysisResult:
             return self.lower_team
         return ""
 
+    @property
+    def purchase_raw_price(self) -> float | None:
+        key = side_key(self.match, self.purchase_team)
+        if key not in ("Home", "Away"):
+            return None
+        value = to_float_or_none(self.match.raw.get(f"AsianAvr{key}"))
+        return value if value is not None and value > 0 else None
+
+    @property
+    def purchase_decimal_odds(self) -> float | None:
+        return normalize_asian_decimal_odds(self.purchase_raw_price)
+
     def to_dict(self) -> dict[str, Any]:
         return {
+            "model_version": MODEL_VERSION,
+            "model_fingerprint": model_source_fingerprint(),
             "event_id": self.match.event_id,
             "match": f"{self.match.home} vs {self.match.away}",
             "match_time": self.match.match_time.isoformat(),
@@ -642,6 +665,8 @@ class AnalysisResult:
             "recommendation": self.recommendation,
             "purchase_side": self.purchase_side,
             "purchase_team": self.purchase_team,
+            "purchase_raw_price": self.purchase_raw_price,
+            "purchase_decimal_odds": self.purchase_decimal_odds,
             "purchase_score": round(self.purchase_score, 4),
             "model_recommendation": self.model_recommendation,
             "model_confidence": self.model_confidence,
@@ -1634,9 +1659,28 @@ class SnapshotStore:
     def save(self, result: "AnalysisResult", fetched_at: datetime | None = None) -> Path:
         fetched_at = fetched_at or datetime.now(timezone.utc)
         self.root.mkdir(parents=True, exist_ok=True)
+        before_minutes = (result.match.match_time - fetched_at).total_seconds() / 60.0
+        home_price = to_float_or_none(result.match.raw.get("AsianAvrHome"))
+        away_price = to_float_or_none(result.match.raw.get("AsianAvrAway"))
+        fingerprint = model_source_fingerprint()
         record = {
-            "schema": 1,
+            "schema": 2,
             "fetched_at": fetched_at.isoformat(),
+            "model_version": MODEL_VERSION,
+            "model_fingerprint": fingerprint,
+            "minutes_before_kickoff": round(before_minutes, 3),
+            "provenance": {
+                "kind": "live_snapshot",
+                "validation_eligible": before_minutes > 0,
+                "reason": "" if before_minutes > 0 else "post_kickoff",
+            },
+            "market": {
+                "asian_line": result.match.asian_line,
+                "home_raw_price": home_price,
+                "away_raw_price": away_price,
+                "home_decimal_odds": normalize_asian_decimal_odds(home_price),
+                "away_decimal_odds": normalize_asian_decimal_odds(away_price),
+            },
             "match": match_to_dict(result.match),
             "result": result.to_dict(),
         }

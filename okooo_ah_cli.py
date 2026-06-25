@@ -31,6 +31,15 @@ from statistics import median
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from asian_handicap_validation import (
+    LOSS_OUTCOMES,
+    selected_asian_price,
+    select_last_eligible_snapshots,
+    settle_asian_handicap,
+    snapshot_validation_issues,
+    summarize_settlements,
+)
+
 # 本脚本所在目录即仓库根；默认快照与比分表相对此目录解析，避免当前工作目录不在仓库根时找不到路径。
 _REPO_ROOT = Path(__file__).resolve().parent
 
@@ -75,6 +84,7 @@ SNAPSHOT_MEDIAN_WINDOW = 2
 
 # 默认复盘比分表；编辑该 JSON 即可增删赛果，无需改代码
 DEFAULT_OKOOO_VALIDATE_SCORES_PATH = _REPO_ROOT / "tools" / "okooo_validate_scores.json"
+DEFAULT_OKOOO_MODEL_FREEZE_PATH = _REPO_ROOT / "tools" / "okooo_model_freeze.json"
 
 
 def load_okooo_validate_scores(path: Path | None) -> dict[int, tuple[int, int]]:
@@ -93,35 +103,29 @@ def load_okooo_validate_scores(path: Path | None) -> dict[int, tuple[int, int]]:
     return out
 
 
-def _replay_margin_for_upper(h: int, a: int, line: float, upper: str, home: str, away: str) -> float:
-    if upper == home:
-        return float(h - a) + line
-    if upper == away:
-        return float(a - h) - line
-    raise ValueError(f"upper_team {upper!r} not in {home!r} / {away!r}")
-
-
 def _replay_recommendation_outcome(
-    rec: str, upper: str, lower: str, home: str, away: str, line_txt: str, hg: int, ag: int
-) -> tuple[str, float]:
-    if rec == "观望":
-        return "na", 0.0
-    line = line_value(line_txt)
-    m = _replay_margin_for_upper(hg, ag, line, upper, home, away)
-    eps = 1e-9
-    if rec == "上盘":
-        if m > eps:
-            return "hit", m
-        if m < -eps:
-            return "miss", m
-        return "push", m
-    if rec == "下盘":
-        if m < -eps:
-            return "hit", m
-        if m > eps:
-            return "miss", m
-        return "push", m
-    return "na", m
+    rec: str,
+    upper: str,
+    lower: str,
+    home: str,
+    away: str,
+    line_txt: str,
+    hg: int,
+    ag: int,
+    *,
+    decimal_odds: float | None = None,
+) -> tuple[str, float, float, float | None]:
+    settlement = settle_asian_handicap(
+        rec,
+        upper,
+        home,
+        away,
+        line_value(line_txt),
+        hg,
+        ag,
+        decimal_odds=decimal_odds,
+    )
+    return settlement.outcome, settlement.margin, settlement.unit_result, settlement.profit
 
 
 def _text_display_width(s: str) -> int:
@@ -171,13 +175,16 @@ def _truncate_display(s: str, max_width: int) -> str:
 # (列内容显示宽度, 数据对齐)；表头左对齐垫满列宽。列间用 | 便于扫读。
 _VALIDATE_SNAPSHOT_ROWSPEC: tuple[tuple[int, str], ...] = (
     (10, "right"),  # event_id
-    (54, "left"),  # match
-    (8, "right"),  # line
+    (7, "right"),  # samples
+    (8, "right"),  # latest
+    (38, "left"),  # match
+    (7, "right"),  # line
+    (7, "right"),  # odds
     (6, "left"),  # rec
-    (8, "left"),  # strength
-    (10, "right"),  # score
-    (9, "right"),  # scoreline
-    (6, "left"),  # out
+    (8, "right"),  # score
+    (7, "right"),  # scoreline
+    (10, "left"),  # out
+    (8, "right"),  # profit
 )
 _VALIDATE_SNAPSHOT_COL_SEP = " | "
 
@@ -191,7 +198,7 @@ def _validate_snapshot_rule_line() -> str:
 
 
 def _format_validate_snapshot_header() -> str:
-    titles = ("event_id", "match", "line", "rec", "strength", "score", "scoreline", "out")
+    titles = ("event_id", "samples", "latest", "match", "line", "odds", "rec", "score", "scoreline", "out", "pnl")
     cells = [_pad_display_cell(t, w, align="left") for t, (w, _) in zip(titles, _VALIDATE_SNAPSHOT_ROWSPEC)]
     return "| " + _VALIDATE_SNAPSHOT_COL_SEP.join(cells) + " |"
 
@@ -199,7 +206,7 @@ def _format_validate_snapshot_header() -> str:
 def _format_validate_snapshot_row(values: tuple[str, ...]) -> str:
     cells: list[str] = []
     for i, (v, (w, a)) in enumerate(zip(values, _VALIDATE_SNAPSHOT_ROWSPEC)):
-        s = _truncate_display(v, w) if i == 1 and _text_display_width(v) > w else v
+        s = _truncate_display(v, w) if i == 3 and _text_display_width(v) > w else v
         cells.append(_pad_display_cell(s, w, align=a))
     return "| " + _VALIDATE_SNAPSHOT_COL_SEP.join(cells) + " |"
 
@@ -309,65 +316,223 @@ def median_snapshot_prediction_from_results(results: list[AnalysisResult]) -> di
     return median_snapshot_prediction_dict([result.to_dict() for result in results])
 
 
-def run_validate_snapshots_from_dir(
-    snapshot_root: Path, scores: dict[int, tuple[int, int]], *, fail_on_miss: bool = True
-) -> int:
-    """仅用 ``snapshot_root`` 下各场 jsonl 的 match 基础数据 + ``Predictor`` 重放，对照已知比分（不访问澳客网）。"""
-    hit = miss = na = 0
-    print(_format_validate_snapshot_header())
-    print(_validate_snapshot_rule_line())
+def load_model_freeze(path: Path | None = None) -> dict[str, Any]:
+    effective = path or DEFAULT_OKOOO_MODEL_FREEZE_PATH
+    if not effective.is_file():
+        raise FileNotFoundError(f"模型冻结清单不存在: {effective}")
+    data = json.loads(effective.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise DataError(f"模型冻结清单格式错误: {effective}")
+    if not data.get("model_version") or not data.get("model_fingerprint"):
+        raise DataError(f"模型冻结清单缺少 model_version/model_fingerprint: {effective}")
+    return data
+
+
+def build_validate_snapshot_records(
+    snapshot_root: Path,
+    scores: dict[int, tuple[int, int]],
+    *,
+    mode: str = "replay",
+    freeze: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if mode not in ("replay", "walk-forward"):
+        raise ValueError(f"unsupported validation mode: {mode}")
+    expected_version = str((freeze or {}).get("model_version") or "")
+    expected_fingerprint = str((freeze or {}).get("model_fingerprint") or "")
+    output: list[dict[str, Any]] = []
+
     for eid, (hg, ag) in sorted(scores.items()):
         path = snapshot_root / f"{eid}.jsonl"
         if not path.is_file():
-            print(
-                _format_validate_snapshot_row(
-                    (str(eid), f"(missing {path.name})", "", "", "", "", "", "")
-                )
+            output.append(
+                {
+                    "event_id": eid,
+                    "status": "missing",
+                    "outcome": "missing",
+                    "scoreline": f"{hg}-{ag}",
+                    "match": f"(missing {path.name})",
+                }
             )
             continue
-        lines = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        if not lines:
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not records:
             continue
-        match = match_from_dict(lines[-1]["match"])
-        median_result = median_snapshot_prediction_from_results(replay_snapshot_results(snapshot_root, eid, lines))
-        out, _margin = _replay_recommendation_outcome(
-            str(median_result.get("recommendation") or ""),
-            str(median_result.get("upper_team") or ""),
-            str(median_result.get("lower_team") or ""),
-            match.home,
-            match.away,
-            match.asian_line,
-            hg,
-            ag,
-        )
-        if out == "hit":
-            hit += 1
-        elif out == "miss":
-            miss += 1
-        else:
-            na += 1
+
+        allowed_indices: set[int] | None = None
+        if mode == "walk-forward":
+            allowed_indices = set()
+            for index, record in enumerate(records):
+                result = record.get("result") if isinstance(record.get("result"), dict) else {}
+                version = str(record.get("model_version") or result.get("model_version") or "")
+                fingerprint = str(record.get("model_fingerprint") or result.get("model_fingerprint") or "")
+                if expected_version and version != expected_version:
+                    continue
+                if expected_fingerprint and fingerprint != expected_fingerprint:
+                    continue
+                if result:
+                    allowed_indices.add(index)
+
+        selections = select_last_eligible_snapshots(records, count=2, allowed_indices=allowed_indices)
+        if len(selections) < 2:
+            issues = sorted({issue for record in records for issue in snapshot_validation_issues(record)})
+            status = "excluded" if issues and not selections else "insufficient_snapshots"
+            output.append(
+                {
+                    "event_id": eid,
+                    "status": status,
+                    "outcome": "excluded" if status == "excluded" else "missing",
+                    "scoreline": f"{hg}-{ag}",
+                    "match": path.name,
+                    "eligible_snapshot_count": len(selections),
+                    "exclusion_reasons": issues,
+                }
+            )
+            continue
+
+        latest_selection = selections[-1]
+        latest_record = latest_selection.record
+        match = match_from_dict(latest_record["match"])
+        try:
+            if mode == "replay":
+                result_dicts = [
+                    replay_snapshot_result_at(snapshot_root, eid, records, selection.index).to_dict()
+                    for selection in selections
+                ]
+            else:
+                result_dicts = [dict(selection.record.get("result") or {}) for selection in selections]
+                if any(not result for result in result_dicts):
+                    raise DataError("walk-forward snapshot missing stored result")
+            result = median_snapshot_prediction_dict(result_dicts, window=2)
+            recommendation = str(result.get("purchase_side") or result.get("recommendation") or "")
+            price = selected_asian_price(latest_record, result, recommendation)
+            outcome, margin, unit_result, profit = _replay_recommendation_outcome(
+                recommendation,
+                str(result.get("upper_team") or ""),
+                str(result.get("lower_team") or ""),
+                match.home,
+                match.away,
+                match.asian_line,
+                hg,
+                ag,
+                decimal_odds=price,
+            )
+            output.append(
+                {
+                    "event_id": eid,
+                    "snapshot_median_count": 2,
+                    "first_minutes_before": round(selections[0].minutes_before_kickoff, 2),
+                    "latest_minutes_before": round(latest_selection.minutes_before_kickoff, 2),
+                    "first_fetched_at": selections[0].record.get("fetched_at") or "",
+                    "last_fetched_at": latest_record.get("fetched_at") or "",
+                    "status": "ok",
+                    "mode": mode,
+                    "outcome": outcome,
+                    "unit_result": unit_result,
+                    "profit": round(profit, 4) if profit is not None else None,
+                    "price_available": price is not None,
+                    "decimal_odds": round(price, 4) if price is not None else None,
+                    "margin": round(margin, 4),
+                    "scoreline": f"{hg}-{ag}",
+                    "match": f"{match.home} vs {match.away}",
+                    "home": match.home,
+                    "away": match.away,
+                    "match_time": match.match_time.isoformat(),
+                    "fetched_at": latest_record.get("fetched_at") or "",
+                    "asian_line": match.asian_line,
+                    "recommendation": recommendation,
+                    "purchase_side": recommendation,
+                    "purchase_team": result.get("purchase_team"),
+                    "model_recommendation": result.get("model_recommendation"),
+                    "strength": result.get("strength"),
+                    "score": result.get("score"),
+                    "confidence": result.get("confidence"),
+                    "completeness": result.get("completeness"),
+                    "upper_team": result.get("upper_team"),
+                    "lower_team": result.get("lower_team"),
+                    "model_version": latest_record.get("model_version") or result.get("model_version"),
+                    "model_fingerprint": latest_record.get("model_fingerprint") or result.get("model_fingerprint"),
+                }
+            )
+        except Exception as exc:
+            output.append(
+                {
+                    "event_id": eid,
+                    "status": "error",
+                    "outcome": "error",
+                    "scoreline": f"{hg}-{ag}",
+                    "match": path.name,
+                    "error": str(exc),
+                }
+            )
+    return output
+
+
+def run_validate_snapshots_from_dir(
+    snapshot_root: Path,
+    scores: dict[int, tuple[int, int]],
+    *,
+    fail_on_miss: bool = True,
+    mode: str = "replay",
+    freeze: dict[str, Any] | None = None,
+) -> int:
+    """Validate one last-two-snapshot median decision per event."""
+    rows = build_validate_snapshot_records(
+        snapshot_root,
+        scores,
+        mode=mode,
+        freeze=freeze,
+    )
+    outcome_text = {
+        "full_win": "全赢",
+        "half_win": "半赢",
+        "push": "走水",
+        "half_loss": "半输",
+        "full_loss": "全输",
+        "na": "观望",
+        "missing": "缺窗口",
+        "excluded": "排除",
+        "error": "错误",
+    }
+    print(f"验证模式: {mode} | 每场取最后 2 条合格赛前快照，score 中位数决定方向")
+    print(_format_validate_snapshot_header())
+    print(_validate_snapshot_rule_line())
+    for row in rows:
+        latest = row.get("latest_minutes_before")
+        odds = row.get("decimal_odds")
+        profit = row.get("profit")
         print(
             _format_validate_snapshot_row(
                 (
-                    str(eid),
-                    f"{match.home} vs {match.away}",
-                    str(match.asian_line),
-                    str(median_result.get("recommendation") or ""),
-                    str(median_result.get("strength") or ""),
-                    f"{float(median_result.get('score') or 0):+.3f}",
-                    f"{hg}-{ag}",
-                    out,
+                    str(row.get("event_id") or ""),
+                    str(row.get("snapshot_median_count") or "-"),
+                    f"T-{float(latest):.0f}" if latest is not None else "-",
+                    str(row.get("match") or ""),
+                    str(row.get("asian_line") or ""),
+                    f"{float(odds):.2f}" if odds is not None else "N/A",
+                    str(row.get("recommendation") or ""),
+                    f"{float(row.get('score') or 0):+.3f}" if row.get("score") is not None else "-",
+                    str(row.get("scoreline") or ""),
+                    outcome_text.get(str(row.get("outcome") or ""), str(row.get("outcome") or "")),
+                    f"{float(profit):+.3f}" if profit is not None else "N/A",
                 )
             )
         )
-    denom = hit + miss
-    if denom:
-        print(
-            f"\n重放：有方向 {denom} 场 命中 {hit} 未中 {miss} 观望/走水 {na} ；命中率 {hit / denom:.0%}"
+    stats = summarize_settlements(rows)
+    any_loss = any(row.get("outcome") in LOSS_OUTCOMES for row in rows)
+    print(
+        f"\n全赢 {stats['full_win']} 半赢 {stats['half_win']} 走水 {stats['push']} "
+        f"半输 {stats['half_loss']} 全输 {stats['full_loss']}；"
+        f"净收益 {stats['net_profit']:+.3f}u / {stats['roi_bets']} 注，"
+        f"ROI {stats['roi']:.1%}"
+        if stats["roi"] is not None
+        else (
+            f"\n全赢 {stats['full_win']} 半赢 {stats['half_win']} 走水 {stats['push']} "
+            f"半输 {stats['half_loss']} 全输 {stats['full_loss']}；无可用水位，ROI unavailable"
         )
-    else:
-        print("\n重放：无有效方向场次")
-    return 0 if (not fail_on_miss or miss == 0) else 1
+    )
+    if stats["missing"] or stats["excluded"]:
+        print(f"不足两条/缺快照 {stats['missing']}，排除 {stats['excluded']}")
+    return 0 if (not fail_on_miss or not any_loss) else 1
 
 
 PAGE_KINDS = {
@@ -1605,7 +1770,25 @@ def cmd_validate_snapshots(_client: OkoooClient, store: SnapshotStore, args: arg
     if not root.is_dir():
         print(f"error: snapshot directory not found: {root}", file=sys.stderr)
         return 1
-    return run_validate_snapshots_from_dir(root, scores, fail_on_miss=not args.allow_miss)
+    mode = "walk-forward" if args.walk_forward else "replay"
+    freeze: dict[str, Any] | None = None
+    if args.walk_forward:
+        try:
+            freeze = load_model_freeze(args.freeze_manifest)
+        except (FileNotFoundError, DataError, json.JSONDecodeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(
+            f"冻结模型: {freeze.get('model_version')} "
+            f"{str(freeze.get('model_fingerprint') or '')[:12]}"
+        )
+    return run_validate_snapshots_from_dir(
+        root,
+        scores,
+        fail_on_miss=not args.allow_miss,
+        mode=mode,
+        freeze=freeze,
+    )
 
 
 def attach_snapshot_replay_fields(client: OkoooClient, match: Match) -> None:
@@ -1756,7 +1939,18 @@ def build_parser() -> argparse.ArgumentParser:
     val.add_argument(
         "--allow-miss",
         action="store_true",
-        help="有「未中」方向时仍退出 0（默认：存在 miss 则退出 1，便于 CI）",
+        help="存在半输/全输时仍退出 0（默认退出 1，便于 CI）",
+    )
+    val.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="只使用快照当时保存的预测，并要求模型版本/指纹匹配冻结清单；默认用当前 Predictor 重放",
+    )
+    val.add_argument(
+        "--freeze-manifest",
+        type=Path,
+        default=DEFAULT_OKOOO_MODEL_FREEZE_PATH,
+        help="walk-forward 模型冻结清单",
     )
     val.set_defaults(func=cmd_validate_snapshots)
 

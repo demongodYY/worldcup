@@ -1791,6 +1791,11 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertEqual(len(records), 2)
         self.assertEqual(records[0]["match"]["event_id"], 123)
         self.assertIn("result", records[0])
+        self.assertEqual(records[0]["schema"], 2)
+        self.assertIn("model_version", records[0])
+        self.assertIn("model_fingerprint", records[0])
+        self.assertIn("market", records[0])
+        self.assertIn("purchase_decimal_odds", records[0]["result"])
 
     def test_snapshot_signal_history_uses_full_series(self):
         def record(trade, euro, handicap):
