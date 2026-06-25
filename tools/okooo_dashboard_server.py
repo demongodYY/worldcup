@@ -38,6 +38,7 @@ from worldcup_ah_cli import (  # noqa: E402
     AnalysisResult,
     DataError,
     Match,
+    MODEL_VERSION,
     Predictor,
     SnapshotStore,
     line_value,
@@ -399,6 +400,13 @@ def build_dashboard_payload(snapshot_root: Path, scores_json: Path | None) -> di
             event["validation"] = None
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "model": {
+            "version": MODEL_VERSION,
+            "asian_direction_weight": 0.50,
+            "trade_flow_weight": 0.135,
+            "post_fund_response_weight": 0.065,
+            "depth_risk_weight": 0.095,
+        },
         "snapshot_root": str(snapshot_root),
         "snapshots": snapshots,
         "validation": validation,

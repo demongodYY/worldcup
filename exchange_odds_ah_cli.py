@@ -488,6 +488,10 @@ def odds_api_handicap_rows(event: OddsApiEvent, asian_line: str) -> list[Handica
                 payout=0.0,
                 update_time=parse_datetime_or_none(bookmaker.get("last_update")),
                 source="external",
+                init_line=home_point,
+                latest_line=home_point,
+                init_line_known=True,
+                latest_line_known=True,
             )
         )
     return out

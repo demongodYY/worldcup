@@ -1066,10 +1066,11 @@ def parse_pankou_html(html_text: str) -> dict[int, OkoooHandicap]:
                     init_line=init_line,
                     latest_line=latest_line,
                     priority_hint=okooo_bookmaker_priority_index(name),
+                    init_line_known=True,
+                    latest_line_known=True,
                 )
             )
-            if latest_line:
-                line_values.append(latest_line)
+            line_values.append(latest_line)
             home_waters.append(latest_home)
             away_waters.append(latest_away)
         if rows:

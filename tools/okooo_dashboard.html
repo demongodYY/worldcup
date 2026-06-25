@@ -602,6 +602,20 @@
 
     <section class="content hidden" id="validateView">
       <div class="summary-strip" id="validateStats"></div>
+      <div class="panel" style="margin-bottom: 14px;">
+        <div class="panel-head">
+          <div class="panel-title">当前澳客模型结构</div>
+          <span class="badge soft" id="validateModelVersion">-</span>
+        </div>
+        <div class="panel-body">
+          <div class="summary-strip" style="margin-bottom: 0;">
+            <div class="stat"><span>亚盘方向 · 0.50</span><strong>公平盘口变化</strong><small>× 公司一致性 × 路径持续性</small></div>
+            <div class="stat"><span>交易确认 · 0.20</span><strong>异常份额 + 价格冲击</strong><small>+ 资金后盘口响应</small></div>
+            <div class="stat"><span>深度风险 · 0.095</span><strong>赢盘门槛扣减</strong><small>合理盘口与打穿能力只作风险参考</small></div>
+            <div class="stat"><span>合成方式</span><strong>一次线性合成</strong><small>澳客源不再二次 bump / 回撤 / 翻向</small></div>
+          </div>
+        </div>
+      </div>
       <div class="panel">
         <div class="panel-head">
           <div class="panel-title">Validate 复盘记录 · 末两条合格赛前快照中位数</div>
@@ -1144,6 +1158,7 @@
       ].join("");
       el("validateCount").textContent = `${stats.total || 0} 条`;
       el("scoresPath").textContent = validation?.scores_json || "";
+      el("validateModelVersion").textContent = state.data?.model?.version || "-";
     }
 
     function renderValidateRows() {
