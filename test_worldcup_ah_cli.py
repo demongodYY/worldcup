@@ -40,6 +40,7 @@ from worldcup_ah_cli import (
     price_volume_point_to_dict,
     purchase_decision_from_signals,
     purchase_display_text,
+    recent_handicap_path_axis,
     recommendation_from_score,
     require_list_payload,
     score_strength_label,
@@ -773,6 +774,122 @@ class WorldCupAhCliTests(unittest.TestCase):
         saved = handicap_row_to_dict(row)
         self.assertTrue(saved["init_line_known"])
         self.assertTrue(saved["latest_line_known"])
+
+    def test_recent_handicap_path_detects_sustained_prematch_retreat(self):
+        records = [
+            {
+                "fetched_at": "2026-06-25T16:05:00+00:00",
+                "minutes_before_kickoff": 235,
+                "match": {
+                    "home": "主队",
+                    "away": "客队",
+                    "match_time": "2026-06-25T20:00:00+00:00",
+                    "asian_line": "-1",
+                    "raw": {"AsianAvrHome": 1.85, "AsianAvrAway": 2.00},
+                },
+                "result": {"score": 0.30, "upper_team": "主队", "lower_team": "客队"},
+            },
+            {
+                "fetched_at": "2026-06-25T18:05:00+00:00",
+                "minutes_before_kickoff": 115,
+                "match": {
+                    "home": "主队",
+                    "away": "客队",
+                    "match_time": "2026-06-25T20:00:00+00:00",
+                    "asian_line": "-1",
+                    "raw": {"AsianAvrHome": 1.90, "AsianAvrAway": 1.95},
+                },
+                "result": {"score": 0.20, "upper_team": "主队", "lower_team": "客队"},
+            },
+        ]
+        context = SnapshotContext(
+            records=records,
+            first_metrics={},
+            last_metrics={},
+            signal_history_score=0.0,
+            signal_history_reason="",
+        )
+        match = sample_match(
+            asian_line="-0.75",
+            match_time=datetime(2026, 6, 25, 20, 0, tzinfo=timezone.utc),
+            raw={
+                "AsianAvrHome": 1.93,
+                "AsianAvrAway": 1.92,
+                "_snapshot_minutes_before_kickoff": 25,
+            },
+        )
+
+        score, confidence, move, reason = recent_handicap_path_axis(match, [], "主队", context)
+
+        self.assertLess(score, -0.45)
+        self.assertLess(move, -0.10)
+        self.assertGreater(confidence, 0.5)
+        self.assertIn("当前", reason)
+
+    def test_recent_path_uses_market_consensus_before_sparse_company_row(self):
+        records = [
+            {
+                "fetched_at": "2026-06-25T18:30:00+00:00",
+                "minutes_before_kickoff": 90,
+                "match": {
+                    "home": "主队",
+                    "away": "客队",
+                    "match_time": "2026-06-25T20:00:00+00:00",
+                    "asian_line": "-2.75",
+                    "raw": {"AsianAvrHome": 1.92, "AsianAvrAway": 1.93},
+                },
+                "result": {"score": 0.20, "upper_team": "主队", "lower_team": "客队"},
+            },
+            {
+                "fetched_at": "2026-06-25T19:00:00+00:00",
+                "minutes_before_kickoff": 60,
+                "match": {
+                    "home": "主队",
+                    "away": "客队",
+                    "match_time": "2026-06-25T20:00:00+00:00",
+                    "asian_line": "-2.75",
+                    "raw": {"AsianAvrHome": 1.93, "AsianAvrAway": 1.92},
+                },
+                "result": {"score": 0.20, "upper_team": "主队", "lower_team": "客队"},
+            },
+        ]
+        context = SnapshotContext(
+            records=records,
+            first_metrics={},
+            last_metrics={},
+            signal_history_score=0.0,
+            signal_history_reason="",
+        )
+        match = sample_match(
+            asian_line="-2.75",
+            match_time=datetime(2026, 6, 25, 20, 0, tzinfo=timezone.utc),
+            raw={
+                "AsianAvrHome": 1.92,
+                "AsianAvrAway": 1.93,
+                "_snapshot_minutes_before_kickoff": 25,
+            },
+        )
+        sparse_row = HandicapRow(
+            1,
+            "稀疏公司",
+            2.05,
+            1.80,
+            1.90,
+            1.95,
+            0.97,
+            None,
+            init_line=-2.25,
+            latest_line=-2.25,
+        )
+
+        _score, _confidence, move, _reason = recent_handicap_path_axis(
+            match,
+            [sparse_row],
+            "主队",
+            context,
+        )
+
+        self.assertLess(abs(move), 0.04)
 
     def test_snapshot_heat_rise_with_water_rise_penalizes_handicap(self):
         raw = {

@@ -1,8 +1,8 @@
 {
-  "model_version": "okooo-ah-fair-line-v1-2026-06-25",
-  "model_fingerprint": "e0111f4896a954b30ba9d70cde55fe6509474b8ddc40273038817fb631222bc5",
-  "frozen_at": "2026-06-25T11:28:26+08:00",
+  "model_version": "okooo-ah-fair-line-v2-2026-06-26",
+  "model_fingerprint": "8b5ae5fe8f5e51aa9b05bb8a85177e3dde927053eb200f111da1cafe2115f05c",
+  "frozen_at": "2026-06-26T07:12:48+08:00",
   "validation_policy": "last_two_eligible_prematch_snapshots_median",
   "settlement_market": "latest_of_two_snapshot_line_and_price",
-  "notes": "Fair-line v1 freeze: zero-line semantics, no-vig equivalent fair handicap, confidence/path-scaled Asian direction, abnormal trade share plus price impact and post-fund line response, with no Okooo post-score direction overrides."
+  "notes": "Fair-line v2 freeze: v1 market axis plus a consensus-based recent four-hour path reversal signal. T-90 receives stronger recency, sustained retreats can change direction, strong current company consensus caps false reversals, and current/history fair depth use the same market-average line and water basis."
 }

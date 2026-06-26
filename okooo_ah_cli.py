@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
@@ -228,7 +228,12 @@ def replay_snapshot_result_at(
 ) -> AnalysisResult:
     """Replay one snapshot point with only earlier records as trend history."""
     current_records = records[: index + 1]
-    match = match_from_dict(current_records[-1]["match"])
+    current_record = current_records[-1]
+    match = match_from_dict(current_record["match"])
+    raw = dict(match.raw)
+    raw["_snapshot_fetched_at"] = current_record.get("fetched_at")
+    raw["_snapshot_minutes_before_kickoff"] = current_record.get("minutes_before_kickoff")
+    match = replace(match, raw=raw)
     client = OkoooSnapshotReplayClient(current_records)
     store = ValidateReplaySnapshotStore(snapshot_root, event_id, current_records[:-1])
     return Predictor(client, store).analyze(match)

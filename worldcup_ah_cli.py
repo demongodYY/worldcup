@@ -93,7 +93,7 @@ LOWER_THRESHOLD = -0.12
 LEAN_THRESHOLD = 0.05
 MODEL_DIRECTION_EPSILON = 0.015
 STRONG_THRESHOLD = 0.25
-MODEL_VERSION = "okooo-ah-fair-line-v1-2026-06-25"
+MODEL_VERSION = "okooo-ah-fair-line-v2-2026-06-26"
 
 TOP_BOOKMAKERS = ("PinnacleSports", "Bet365", "Singbet", "IBC", "Ysb88")
 MATCH_LIST_HOT_MODES = (1, None)
@@ -2227,6 +2227,31 @@ class Predictor:
         positive = sum(1 for move in moves if move > 0.025)
         negative = sum(1 for move in moves if move < -0.025)
         neutral = len(moves) - positive - negative
+        directional_share = max(positive, negative) / len(moves)
+        recent_score, recent_confidence, recent_move, recent_reason = recent_handicap_path_axis(
+            match,
+            selected_rows,
+            upper_team,
+            snapshot_context,
+        )
+        recent_weight = 0.0
+        if recent_confidence > 0 and abs(recent_move) >= 0.04:
+            minutes_before = current_minutes_before_kickoff(match)
+            if minutes_before <= 90:
+                recent_weight = 0.68
+            elif minutes_before <= 180:
+                recent_weight = 0.58
+            elif minutes_before <= 360:
+                recent_weight = 0.45
+            else:
+                recent_weight = 0.30
+            if score * recent_score < 0 and abs(recent_move) >= 0.06:
+                recent_weight = min(0.76, recent_weight + 0.08)
+            current_company_market_confirmed = directional_share >= 0.70 and abs(median_move) >= 0.075
+            if current_company_market_confirmed and score * recent_score < 0:
+                recent_weight = min(recent_weight, 0.22)
+            recent_weight *= clamp(recent_confidence, 0.55, 1.0)
+            score = clamp((1.0 - recent_weight) * score + recent_weight * recent_score, -1, 1)
         reasons = [
             (
                 f"等价公平盘口中位变化 {median_move:+.3f} 球，"
@@ -2234,6 +2259,12 @@ class Predictor:
             ),
             persistence_reason,
         ]
+        if recent_weight > 0:
+            reasons.append(
+                f"{recent_reason}，临场权重 {recent_weight:.2f}；初盘累计方向降至 {1.0 - recent_weight:.2f}"
+            )
+        elif recent_confidence > 0:
+            reasons.append(f"{recent_reason}，变化不足 0.04 球，仅记录不改方向")
         if history_only:
             reasons[0] = (
                 f"公司初盘路径缺失，使用连续快照等价公平盘口变化 {median_move:+.3f} 球，"
@@ -2809,6 +2840,13 @@ class Predictor:
         price_confirm = hot_direction * score_bifa_price_edge(match, upper_team, lower_team)
         payout_confirm = hot_direction * score_bifa_payout_edge(match, upper_team, lower_team)
         market_response, market_confidence, fair_move, market_moves = handicap_market_axis(match, rows, hot_team)
+        recent_response, recent_confidence, recent_move, recent_reason = recent_handicap_path_axis(
+            match,
+            rows,
+            upper_team,
+            snapshot_context,
+        )
+        recent_hot_response = recent_response * hot_direction
         reaction = 0.0
         reasons: list[str] = [f"{hot_team}热度 {heat_edge:+.2f}"]
         okooo_source = match.raw.get("_source") == "okooo"
@@ -2822,11 +2860,19 @@ class Predictor:
 
         if market_moves:
             response_weight = 0.52 if okooo_source else 0.42
-            reaction += response_weight * market_response
+            response_score = market_response
+            if recent_confidence > 0 and abs(recent_move) >= 0.04:
+                cumulative_hot_response = market_response
+                response_score = 0.30 * cumulative_hot_response + 0.70 * recent_hot_response
+            reaction += response_weight * response_score
             reasons.append(
                 f"资金后等价公平盘口变化 {fair_move:+.3f}，"
-                f"公司可信度 {market_confidence:.2f}，响应 {market_response:+.2f}"
+                f"公司可信度 {market_confidence:.2f}，累计响应 {market_response:+.2f}"
             )
+            if recent_confidence > 0 and abs(recent_move) >= 0.04:
+                reasons.append(
+                    f"临场资金后盘口响应 {recent_hot_response:+.2f}：{recent_reason}"
+                )
         else:
             reaction -= 0.10
             reasons.append("资金后缺少可用盘口响应")
@@ -2837,15 +2883,6 @@ class Predictor:
         elif payout_confirm > 0.12:
             reaction += 0.04 if okooo_source else 0.08
             reasons.append("盈亏压力支持热门方")
-
-        if snapshot_context and snapshot_context.available:
-            heat_delta = snapshot_context.heat_delta * hot_direction
-            history_fair_move = snapshot_equivalent_fair_move(snapshot_context)
-            hot_history_move = None if history_fair_move is None else history_fair_move * hot_direction
-            if heat_delta > 0.06 and hot_history_move is not None:
-                history_response = clamp(hot_history_move / 0.25, -1, 1)
-                reaction += 0.24 * history_response
-                reasons.append(f"连续快照资金后公平盘口响应 {hot_history_move:+.3f}")
 
         score = hot_direction * clamp(reaction, -1, 1)
         return Signal(
@@ -3978,6 +4015,20 @@ def handicap_row_equivalent_fair_move(match: Match, row: HandicapRow, team: str)
     return latest_depth - initial_depth
 
 
+def handicap_row_current_equivalent_depth(match: Match, row: HandicapRow, team: str) -> float | None:
+    if not handicap_latest_line_known(row):
+        return None
+    team_is_home = team == match.home
+    team_price = row.sec_a if team_is_home else row.sec_b
+    opponent_price = row.sec_b if team_is_home else row.sec_a
+    return equivalent_fair_handicap_depth(
+        row.latest_line,
+        team_is_home,
+        team_price,
+        opponent_price,
+    )
+
+
 def handicap_market_axis(
     match: Match,
     rows: list[HandicapRow],
@@ -4016,6 +4067,101 @@ def snapshot_equivalent_fair_depth(metrics: dict[str, float]) -> float | None:
         return None
     probability = clamp(probability, 0.08, 0.92)
     return metrics.get("line_depth", 0.0) + 0.55 * math.log(probability / (1.0 - probability))
+
+
+def snapshot_minutes_before_kickoff(record: dict[str, Any]) -> float | None:
+    stored = optional_float(record.get("minutes_before_kickoff"))
+    if stored is not None:
+        return stored
+    fetched_at = snapshot_record_time(record)
+    match_info = record.get("match")
+    if fetched_at is None or not isinstance(match_info, dict):
+        return None
+    match_time = parse_datetime_or_none(match_info.get("match_time"))
+    if match_time is None:
+        return None
+    return (match_time - fetched_at).total_seconds() / 60.0
+
+
+def current_minutes_before_kickoff(match: Match) -> float:
+    stored = optional_float(match.raw.get("_snapshot_minutes_before_kickoff"))
+    if stored is not None:
+        return stored
+    replay_fetched_at = parse_datetime_or_none(match.raw.get("_snapshot_fetched_at"))
+    if replay_fetched_at is not None:
+        return (match.match_time - replay_fetched_at).total_seconds() / 60.0
+    return (match.match_time - datetime.now(timezone.utc)).total_seconds() / 60.0
+
+
+def recent_handicap_path_axis(
+    match: Match,
+    rows: list[HandicapRow],
+    upper_team: str,
+    snapshot_context: SnapshotContext | None,
+) -> tuple[float, float, float, str]:
+    """Recent market direction, emphasizing the last four hours over the opening line."""
+    if snapshot_context is None or not snapshot_context.records:
+        return 0.0, 0.0, 0.0, "缺少临场快照路径"
+
+    team_is_home = upper_team == match.home
+    upper_key = side_key(match, upper_team)
+    lower_team = match.away if team_is_home else match.home
+    lower_key = side_key(match, lower_team)
+    upper_water = first_positive(match.raw.get(f"AsianAvr{upper_key}"))
+    lower_water = first_positive(match.raw.get(f"AsianAvr{lower_key}"))
+    current_depth = equivalent_fair_handicap_depth(
+        line_value(match.asian_line),
+        team_is_home,
+        upper_water,
+        lower_water,
+    )
+    if current_depth is None:
+        current_depths = [
+            depth
+            for row in rows
+            if (depth := handicap_row_current_equivalent_depth(match, row, upper_team)) is not None
+        ]
+        current_depth = median_float(current_depths) if current_depths else None
+    if current_depth is None:
+        return 0.0, 0.0, 0.0, "当前等价公平盘口不可用"
+
+    current_minutes = current_minutes_before_kickoff(match)
+    history: list[tuple[float | None, float]] = []
+    for record in snapshot_context.records:
+        depth = snapshot_equivalent_fair_depth(snapshot_metrics(record))
+        if depth is None:
+            continue
+        history.append((snapshot_minutes_before_kickoff(record), depth))
+    if not history:
+        return 0.0, 0.0, 0.0, "历史等价公平盘口不可用"
+
+    timed_recent = [
+        (minutes, depth)
+        for minutes, depth in history
+        if minutes is not None and current_minutes - 5.0 <= minutes <= current_minutes + 240.0
+    ]
+    recent = timed_recent if len(timed_recent) >= 2 else history[-3:]
+    recent_depths = [depth for _minutes, depth in recent]
+    median_reference = median_float(recent_depths)
+    first_reference = recent_depths[0]
+    last_reference = recent_depths[-1]
+    median_move = current_depth - median_reference
+    window_move = current_depth - first_reference
+    latest_move = current_depth - last_reference
+    path_move = 0.45 * median_move + 0.25 * window_move + 0.30 * latest_move
+
+    known_minutes = [minutes for minutes, _depth in recent if minutes is not None]
+    span = max(known_minutes) - min(known_minutes) if len(known_minutes) >= 2 else 60.0
+    sample_confidence = clamp(len(recent_depths) / 3.0, 0.45, 1.0)
+    span_confidence = clamp(span / 120.0, 0.45, 1.0)
+    confidence = clamp(sample_confidence * span_confidence, 0.30, 1.0)
+    score = clamp(path_move / 0.22, -1, 1) * confidence
+    reason = (
+        f"近{int(round(span))}分钟公平盘口参考中位 {median_reference:+.3f}、"
+        f"首点 {first_reference:+.3f}、上一点 {last_reference:+.3f}、当前 {current_depth:+.3f}，"
+        f"加权变化 {path_move:+.3f}，临场方向 {score:+.2f}"
+    )
+    return clamp(score, -1, 1), confidence, path_move, reason
 
 
 def handicap_path_persistence(snapshot_context: SnapshotContext | None) -> tuple[float, str]:

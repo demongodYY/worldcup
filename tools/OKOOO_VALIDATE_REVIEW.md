@@ -21,7 +21,7 @@ python3 okooo_ah_cli.py --no-dotenv validate-snapshots --allow-miss
 - 赛后快照、历史导入和旧版固定占位字段自动排除。
 - `--walk-forward` 只读取快照当时保存的预测，并要求版本与 `tools/okooo_model_freeze.json` 一致。
 
-当前本地历史重放：全赢 18、半赢 2、走水 2、半输 2、全输 8，净收益 **+8.777u / 32 注，ROI 27.4%**。修改前同批样本为 **+7.447u / 32 注，ROI 23.3%**。历史重放仍属于样本内验证，正式结论以后续冻结版本 walk-forward 为准。
+当前本地历史重放：全赢 19、半赢 2、走水 2、半输 3、全输 8，净收益 **+9.298u / 34 注，ROI 27.4%**。本轮临场路径优化前同批样本为 **+7.277u / 34 注，ROI 21.4%**。历史重放仍属于样本内验证，正式结论以后续冻结版本 walk-forward 为准。
 
 **对阵来源**：表中 `event_id` 与比分须能对照 [FIFA 世界杯官方赛程](https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/scores-fixtures) 及公开战报核实。此前一批「历史复盘」页签下的 Jun12–14 合成快照曾绑定错误对阵，已从本仓库比分表与快照中移除。
 
