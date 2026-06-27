@@ -245,9 +245,13 @@ def build_snapshot_events(snapshot_root: Path) -> list[dict[str, Any]]:
         last = replayed_records[-1]
         first_metrics = snapshot_metrics(first)
         last_metrics = snapshot_metrics(last)
-        match = last.get("match") if isinstance(last.get("match"), dict) else {}
+        match_dict = last.get("match") if isinstance(last.get("match"), dict) else {}
+        replay_results = [
+            record["result"] for record in replayed_records if isinstance(record.get("result"), dict)
+        ]
         result = median_snapshot_prediction_dict(
-            [record["result"] for record in replayed_records if isinstance(record.get("result"), dict)]
+            replay_results,
+            match=match_from_dict(match_dict) if match_dict else None,
         )
         normalized = normalize_result_dict(result)
         score_delta = last_metrics["score"] - first_metrics["score"]
@@ -264,12 +268,12 @@ def build_snapshot_events(snapshot_root: Path) -> list[dict[str, Any]]:
             signal_history_score, signal_history_reason = 0.0, "本地快照不足 2 条"
         event = {
             "event_id": event_id,
-            "home": match.get("home") or "",
-            "away": match.get("away") or "",
-            "match": f"{match.get('home') or ''} vs {match.get('away') or ''}",
-            "league_name": match.get("league_name") or "",
-            "match_time": match.get("match_time") or result.get("match_time") or "",
-            "asian_line": match.get("asian_line") or result.get("asian_line") or "",
+            "home": match_dict.get("home") or "",
+            "away": match_dict.get("away") or "",
+            "match": f"{match_dict.get('home') or ''} vs {match_dict.get('away') or ''}",
+            "league_name": match_dict.get("league_name") or "",
+            "match_time": match_dict.get("match_time") or result.get("match_time") or "",
+            "asian_line": match_dict.get("asian_line") or result.get("asian_line") or "",
             "snapshot_count": len(records),
             "first_fetched_at": first.get("fetched_at") or "",
             "last_fetched_at": last.get("fetched_at") or "",

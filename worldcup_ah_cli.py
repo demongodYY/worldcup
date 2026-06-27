@@ -91,9 +91,10 @@ OKOOO_SCORING_WEIGHT_OVERRIDES = {
 UPPER_THRESHOLD = 0.12
 LOWER_THRESHOLD = -0.12
 LEAN_THRESHOLD = 0.05
+PURCHASE_LAYER_MOMENTUM_COEFF = 0.14
 MODEL_DIRECTION_EPSILON = 0.015
 STRONG_THRESHOLD = 0.25
-MODEL_VERSION = "okooo-ah-fair-line-v2-2026-06-26"
+MODEL_VERSION = "okooo-ah-fair-line-v5-2026-06-26"
 
 TOP_BOOKMAKERS = ("PinnacleSports", "Bet365", "Singbet", "IBC", "Ysb88")
 MATCH_LIST_HOT_MODES = (1, None)
@@ -1808,6 +1809,15 @@ class Predictor:
             handicap_rows,
             snapshot_context,
         )
+        handicap_signal, market_elasticity_signal = deep_favorite_retracement_guard(
+            match,
+            upper_team,
+            handicap_signal,
+            market_elasticity_signal,
+            bifa_signal,
+            trade_signal,
+            euro_kelly_signal,
+        )
         external_consensus_signal = self._external_consensus_signal(match, upper_team, lower_team)
         water_value_signal = self._water_value_signal(
             match,
@@ -1930,6 +1940,20 @@ class Predictor:
                 )
                 if missing_asian_note:
                     warnings.append(missing_asian_note)
+            weighted_score, retreat_guard_note = deep_favorite_retracement_score_floor(
+                match,
+                weighted_score,
+                signals,
+            )
+            if retreat_guard_note:
+                warnings.append(retreat_guard_note)
+            weighted_score, shallow_trap_note = shallow_hot_favorite_trap_score_adjustment(
+                match,
+                weighted_score,
+                decision_signals_for_source(match, adjusted_signals),
+            )
+            if shallow_trap_note:
+                warnings.append(shallow_trap_note)
 
         completeness = int(round(100 * available_weight / (1 - WEIGHTS["data_quality"])))
         completeness = clamp_int(completeness, 0, 100)
@@ -2248,7 +2272,13 @@ class Predictor:
             if score * recent_score < 0 and abs(recent_move) >= 0.06:
                 recent_weight = min(0.76, recent_weight + 0.08)
             current_company_market_confirmed = directional_share >= 0.70 and abs(median_move) >= 0.075
-            if current_company_market_confirmed and score * recent_score < 0:
+            strong_extreme_reversal = (
+                score * recent_score < 0
+                and abs(recent_move) >= 0.12
+                and ("高点回撤" in recent_reason or "低点反弹" in recent_reason)
+                and ("公司强确认" in recent_reason or abs(recent_move) >= 0.22)
+            )
+            if current_company_market_confirmed and score * recent_score < 0 and not strong_extreme_reversal:
                 recent_weight = min(recent_weight, 0.22)
             recent_weight *= clamp(recent_confidence, 0.55, 1.0)
             score = clamp((1.0 - recent_weight) * score + recent_weight * recent_score, -1, 1)
@@ -4093,16 +4123,20 @@ def current_minutes_before_kickoff(match: Match) -> float:
     return (match.match_time - datetime.now(timezone.utc)).total_seconds() / 60.0
 
 
-def recent_handicap_path_axis(
+def rows_from_match_raw(match: Match, fallback_rows: list[HandicapRow] | None = None) -> list[HandicapRow]:
+    row_data = match.raw.get("_okooo_handicap_row_data")
+    if isinstance(row_data, list):
+        rows = [handicap_row_from_dict(item) for item in row_data if isinstance(item, dict)]
+        if rows:
+            return rows
+    return list(fallback_rows or [])
+
+
+def current_market_equivalent_depth(
     match: Match,
     rows: list[HandicapRow],
     upper_team: str,
-    snapshot_context: SnapshotContext | None,
-) -> tuple[float, float, float, str]:
-    """Recent market direction, emphasizing the last four hours over the opening line."""
-    if snapshot_context is None or not snapshot_context.records:
-        return 0.0, 0.0, 0.0, "缺少临场快照路径"
-
+) -> float | None:
     team_is_home = upper_team == match.home
     upper_key = side_key(match, upper_team)
     lower_team = match.away if team_is_home else match.home
@@ -4115,33 +4149,109 @@ def recent_handicap_path_axis(
         upper_water,
         lower_water,
     )
-    if current_depth is None:
-        current_depths = [
-            depth
-            for row in rows
-            if (depth := handicap_row_current_equivalent_depth(match, row, upper_team)) is not None
-        ]
-        current_depth = median_float(current_depths) if current_depths else None
+    if current_depth is not None:
+        return current_depth
+
+    current_depths = [
+        depth
+        for row in rows_from_match_raw(match, rows)
+        if (depth := handicap_row_current_equivalent_depth(match, row, upper_team)) is not None
+    ]
+    return median_float(current_depths) if current_depths else None
+
+
+def snapshot_equivalent_fair_depth_for_team(record: dict[str, Any], upper_team: str) -> float | None:
+    match_info = record.get("match")
+    if not isinstance(match_info, dict):
+        return None
+    try:
+        match = match_from_dict(match_info)
+    except (TypeError, ValueError):
+        return snapshot_equivalent_fair_depth(snapshot_metrics(record))
+    if upper_team not in (match.home, match.away):
+        return snapshot_equivalent_fair_depth(snapshot_metrics(record))
+    return current_market_equivalent_depth(match, rows_from_match_raw(match), upper_team)
+
+
+def company_extreme_reversal_confirmation(
+    match: Match,
+    rows: list[HandicapRow],
+    upper_team: str,
+    extreme_record: dict[str, Any] | None,
+    direction: float,
+) -> tuple[float, int, int, int, str]:
+    if extreme_record is None or abs(direction) < 1e-9:
+        return 0.0, 0, 0, 0, "缺少可比较公司极值点"
+    match_info = extreme_record.get("match")
+    if not isinstance(match_info, dict):
+        return 0.0, 0, 0, 0, "缺少可比较公司极值点"
+
+    extreme_match = match_from_dict(match_info)
+    if upper_team not in (extreme_match.home, extreme_match.away):
+        return 0.0, 0, 0, 0, "极值点上下盘映射不一致"
+
+    current_by_name = {row.name: row for row in rows_from_match_raw(match, rows) if row.name}
+    extreme_by_name = {row.name: row for row in rows_from_match_raw(extreme_match) if row.name}
+    aligned = 0
+    opposite = 0
+    neutral = 0
+    for name, current_row in current_by_name.items():
+        extreme_row = extreme_by_name.get(name)
+        if extreme_row is None:
+            continue
+        current_depth = handicap_row_current_equivalent_depth(match, current_row, upper_team)
+        extreme_depth = handicap_row_current_equivalent_depth(extreme_match, extreme_row, upper_team)
+        if current_depth is None or extreme_depth is None:
+            continue
+        delta = current_depth - extreme_depth
+        if delta * direction > 0.055:
+            aligned += 1
+        elif delta * direction < -0.055:
+            opposite += 1
+        else:
+            neutral += 1
+
+    total = aligned + opposite + neutral
+    if total <= 0:
+        return 0.0, 0, 0, 0, "公司极值回撤缺少共同样本"
+    share = aligned / total
+    label = "回撤" if direction < 0 else "反弹"
+    strong_note = "，公司强确认" if aligned >= 3 and share >= 0.65 else ""
+    reason = f"公司极值后{label}同向 {aligned}/{total}（反向{opposite}/中性{neutral}）{strong_note}"
+    return share, aligned, opposite, neutral, reason
+
+
+def recent_handicap_path_axis(
+    match: Match,
+    rows: list[HandicapRow],
+    upper_team: str,
+    snapshot_context: SnapshotContext | None,
+) -> tuple[float, float, float, str]:
+    """Recent market direction, emphasizing the last four hours over the opening line."""
+    if snapshot_context is None or not snapshot_context.records:
+        return 0.0, 0.0, 0.0, "缺少临场快照路径"
+
+    current_depth = current_market_equivalent_depth(match, rows, upper_team)
     if current_depth is None:
         return 0.0, 0.0, 0.0, "当前等价公平盘口不可用"
 
     current_minutes = current_minutes_before_kickoff(match)
-    history: list[tuple[float | None, float]] = []
+    history: list[tuple[float | None, float, dict[str, Any]]] = []
     for record in snapshot_context.records:
-        depth = snapshot_equivalent_fair_depth(snapshot_metrics(record))
+        depth = snapshot_equivalent_fair_depth_for_team(record, upper_team)
         if depth is None:
             continue
-        history.append((snapshot_minutes_before_kickoff(record), depth))
+        history.append((snapshot_minutes_before_kickoff(record), depth, record))
     if not history:
         return 0.0, 0.0, 0.0, "历史等价公平盘口不可用"
 
     timed_recent = [
-        (minutes, depth)
-        for minutes, depth in history
+        (minutes, depth, record)
+        for minutes, depth, record in history
         if minutes is not None and current_minutes - 5.0 <= minutes <= current_minutes + 240.0
     ]
     recent = timed_recent if len(timed_recent) >= 2 else history[-3:]
-    recent_depths = [depth for _minutes, depth in recent]
+    recent_depths = [depth for _minutes, depth, _record in recent]
     median_reference = median_float(recent_depths)
     first_reference = recent_depths[0]
     last_reference = recent_depths[-1]
@@ -4150,18 +4260,56 @@ def recent_handicap_path_axis(
     latest_move = current_depth - last_reference
     path_move = 0.45 * median_move + 0.25 * window_move + 0.30 * latest_move
 
-    known_minutes = [minutes for minutes, _depth in recent if minutes is not None]
+    known_minutes = [minutes for minutes, _depth, _record in recent if minutes is not None]
     span = max(known_minutes) - min(known_minutes) if len(known_minutes) >= 2 else 60.0
     sample_confidence = clamp(len(recent_depths) / 3.0, 0.45, 1.0)
     span_confidence = clamp(span / 120.0, 0.45, 1.0)
     confidence = clamp(sample_confidence * span_confidence, 0.30, 1.0)
-    score = clamp(path_move / 0.22, -1, 1) * confidence
+
+    peak_index, peak_depth = max(enumerate(recent_depths), key=lambda item: item[1])
+    trough_index, trough_depth = min(enumerate(recent_depths), key=lambda item: item[1])
+    peak_retreat = current_depth - peak_depth
+    trough_rally = current_depth - trough_depth
+    extreme_move = peak_retreat if abs(peak_retreat) >= abs(trough_rally) else trough_rally
+    extreme_index = peak_index if extreme_move == peak_retreat else trough_index
+    extreme_label = "高点回撤" if extreme_move < 0 else "低点反弹"
+    extreme_minutes, extreme_depth, extreme_record = recent[extreme_index]
+    extreme_weight = 0.0
+    company_reason = ""
+    if abs(extreme_move) >= 0.10:
+        extreme_weight = clamp((abs(extreme_move) - 0.08) / 0.16, 0.35, 0.75)
+        share, aligned, _opposite, _neutral, company_reason = company_extreme_reversal_confirmation(
+            match,
+            rows,
+            upper_team,
+            extreme_record,
+            math.copysign(1.0, extreme_move),
+        )
+        if aligned >= 3:
+            if share >= 0.65:
+                extreme_weight = max(extreme_weight, 0.70)
+            elif share <= 0.45:
+                extreme_weight *= 0.55
+
+    combined_move = (1.0 - extreme_weight) * path_move + extreme_weight * extreme_move
+    score = clamp(combined_move / 0.22, -1, 1) * confidence
     reason = (
         f"近{int(round(span))}分钟公平盘口参考中位 {median_reference:+.3f}、"
         f"首点 {first_reference:+.3f}、上一点 {last_reference:+.3f}、当前 {current_depth:+.3f}，"
-        f"加权变化 {path_move:+.3f}，临场方向 {score:+.2f}"
+        f"常规加权变化 {path_move:+.3f}"
     )
-    return clamp(score, -1, 1), confidence, path_move, reason
+    if extreme_weight > 0:
+        minutes_text = f"T-{int(round(extreme_minutes))}" if extreme_minutes is not None else "历史"
+        reason += (
+            f"；{extreme_label} {minutes_text} {extreme_depth:+.3f}->当前 {current_depth:+.3f} "
+            f"({extreme_move:+.3f})，极值权重 {extreme_weight:.2f}"
+        )
+        if company_reason:
+            reason += f"，{company_reason}"
+        reason += f"；合成变化 {combined_move:+.3f}，临场方向 {score:+.2f}"
+    else:
+        reason += f"，合成变化 {combined_move:+.3f}，临场方向 {score:+.2f}"
+    return clamp(score, -1, 1), confidence, combined_move, reason
 
 
 def handicap_path_persistence(snapshot_context: SnapshotContext | None) -> tuple[float, str]:
@@ -4872,6 +5020,105 @@ def okooo_missing_live_asian_model_cap(
     return capped, "缺少真实亚盘公司行，弱模型方向封顶为观望"
 
 
+def deep_favorite_retracement_guard(
+    match: Match,
+    upper_team: str,
+    handicap_signal: Signal,
+    market_elasticity_signal: Signal,
+    bifa_signal: Signal,
+    trade_signal: Signal,
+    euro_kelly_signal: Signal,
+) -> tuple[Signal, Signal]:
+    """Treat deep-favorite late line drops as cover risk unless other markets also turn."""
+    if not handicap_signal.available:
+        return handicap_signal, market_elasticity_signal
+    depth = line_depth(match.asian_line)
+    if depth < 1.5:
+        return handicap_signal, market_elasticity_signal
+    if "高点回撤" not in handicap_signal.reason or "公司强确认" not in handicap_signal.reason:
+        return handicap_signal, market_elasticity_signal
+    if handicap_signal.score > -0.20:
+        return handicap_signal, market_elasticity_signal
+    if not euro_kelly_signal.available or euro_kelly_signal.score < 0.28:
+        return handicap_signal, market_elasticity_signal
+    if trade_signal.available and trade_signal.score < -0.12:
+        return handicap_signal, market_elasticity_signal
+    if bifa_signal.available and bifa_signal.score < -0.05:
+        return handicap_signal, market_elasticity_signal
+
+    upper_key = side_key(match, upper_team)
+    upper_water = first_positive(match.raw.get(f"AsianAvr{upper_key}"))
+    if upper_water >= 2.08:
+        return handicap_signal, market_elasticity_signal
+
+    note = (
+        "深盘强队退浅保护：欧赔/Kelly和必发未同步反向，且当前盘口更易打穿；"
+        "高点回撤只降上盘强度，不直接翻成下盘"
+    )
+    adjusted_handicap = handicap_signal
+    if handicap_signal.score < -0.12:
+        adjusted_handicap = replace(
+            handicap_signal,
+            score=-0.12,
+            reason=f"{handicap_signal.reason}；{note}",
+        )
+    elif note not in handicap_signal.reason:
+        adjusted_handicap = replace(handicap_signal, reason=f"{handicap_signal.reason}；{note}")
+
+    adjusted_elasticity = market_elasticity_signal
+    if market_elasticity_signal.available and market_elasticity_signal.score < -0.04:
+        adjusted_elasticity = replace(
+            market_elasticity_signal,
+            score=-0.04,
+            reason=f"{market_elasticity_signal.reason}；{note}",
+        )
+    elif market_elasticity_signal.available and note not in market_elasticity_signal.reason:
+        adjusted_elasticity = replace(
+            market_elasticity_signal,
+            reason=f"{market_elasticity_signal.reason}；{note}",
+        )
+    return adjusted_handicap, adjusted_elasticity
+
+
+def deep_favorite_retracement_score_floor(
+    match: Match,
+    weighted_score: float,
+    signals: list[Signal],
+) -> tuple[float, str | None]:
+    """Avoid turning a still-confirmed deep favorite into a lower-side pick on a line drop alone."""
+    if weighted_score >= 0 or weighted_score <= -0.15:
+        return weighted_score, None
+    if line_depth(match.asian_line) < 1.5:
+        return weighted_score, None
+
+    lookup = {signal.name: signal for signal in signals}
+    handicap = lookup.get("亚盘水位")
+    if (
+        handicap is None
+        or not handicap.available
+        or "深盘强队退浅保护" not in handicap.reason
+    ):
+        return weighted_score, None
+
+    euro_kelly = lookup.get("欧赔/Kelly")
+    trade = lookup.get("必发成交走势")
+    bifa = lookup.get("必发指数")
+    if euro_kelly is None or not euro_kelly.available or euro_kelly.score < 0.28:
+        return weighted_score, None
+    if trade is not None and trade.available and trade.score < -0.12:
+        return weighted_score, None
+    if bifa is not None and bifa.available and bifa.score < -0.05:
+        return weighted_score, None
+
+    floored = max(weighted_score, MODEL_DIRECTION_EPSILON)
+    if floored <= weighted_score + 1e-9:
+        return weighted_score, None
+    return (
+        floored,
+        f"深盘强队退浅保护总分地板：{weighted_score:+.3f}->{floored:+.3f}，退盘仅作赢盘风险不翻下盘",
+    )
+
+
 def source_adjusted_signals(match: Match, signals: list[Signal]) -> list[Signal]:
     if match.raw.get("_source") != "okooo":
         return signals
@@ -5183,10 +5430,213 @@ def model_upper_trap_score_adjustment(
     return adjusted, f"模型层热门陷阱回撤 {shift:.3f}（{reason}）"
 
 
-def recommendation_from_score(score: float) -> str:
+def _signal_lookup_value(signal: Signal | dict[str, Any] | None) -> float:
+    if signal is None:
+        return 0.0
+    if isinstance(signal, dict):
+        if not signal.get("available"):
+            return 0.0
+        try:
+            return float(signal.get("score") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    return signal_value(signal)
+
+
+def _signal_lookup_reason(signal: Signal | dict[str, Any] | None) -> str:
+    if signal is None:
+        return ""
+    if isinstance(signal, dict):
+        return str(signal.get("reason") or "")
+    return signal.reason or ""
+
+
+def asian_matrix_unconfirmed(lookup: dict[str, Signal | dict[str, Any]]) -> bool:
+    """True when the handicap market lacks a real multi-bookmaker confirmation matrix."""
+    handicap = lookup.get("亚盘水位")
+    bookmaker = lookup.get("公司一致性")
+    if bookmaker is None or (
+        isinstance(bookmaker, dict) and not bookmaker.get("available")
+    ) or (
+        not isinstance(bookmaker, dict) and not bookmaker.available
+    ):
+        return True
+    if handicap is None or (
+        isinstance(handicap, dict) and not handicap.get("available")
+    ) or (
+        not isinstance(handicap, dict) and not handicap.available
+    ):
+        return True
+    reason = _signal_lookup_reason(handicap)
+    if "静态亚盘均值兜底" in reason:
+        return True
+    confidence_match = re.search(r"一致性可信度 ([0-9.]+)", reason)
+    if confidence_match and float(confidence_match.group(1)) <= 0.20 and re.search(
+        r"上0/下0", reason
+    ):
+        return True
+    return False
+
+
+def shallow_hot_trap_applies(
+    match: Match,
+    score: float,
+    signals: list[Signal] | list[dict[str, Any]],
+) -> bool:
+    """Shallow hot favorite with weak positive score and no Asian-book confirmation."""
+    if score <= 0 or score >= LEAN_THRESHOLD:
+        return False
+    if line_depth(match.asian_line) > 0.5:
+        return False
+    upper_team, lower_team = upper_lower_teams(match)
+    if score_bifa_heat_edge(match, upper_team, lower_team) < 0.52:
+        return False
+    lookup = (
+        {signal.name: signal for signal in signals}
+        if signals and isinstance(signals[0], Signal)
+        else {str(item.get("name")): item for item in signals if isinstance(item, dict) and item.get("name")}
+    )
+    if not asian_matrix_unconfirmed(lookup):
+        return False
+    if _signal_lookup_value(lookup.get("市场平衡/背离")) >= 0:
+        return False
+    if _signal_lookup_value(lookup.get("欧赔/Kelly")) > 0.08:
+        return False
+    return True
+
+
+def shallow_hot_favorite_trap_score_adjustment(
+    match: Match,
+    weighted_score: float,
+    signals: list[Signal],
+) -> tuple[float, str | None]:
+    """Pull weak upper scores lower using existing trap pressure and purchase-layer market shift."""
+    if not shallow_hot_trap_applies(match, weighted_score, signals):
+        return weighted_score, None
+    lookup = {signal.name: signal for signal in signals}
+    upper_team, lower_team = upper_lower_teams(match)
+    heat_edge = score_bifa_heat_edge(match, upper_team, lower_team)
+    bifa = lookup.get("必发指数")
+    trade = lookup.get("必发成交走势")
+    pressure = upper_favorite_trap_pressure_from_values(
+        match=match,
+        heat_edge=heat_edge,
+        trade_available=bool(trade and trade.available),
+        trade_edge=signal_value(trade),
+        euro_edge=signal_value(lookup.get("欧赔/Kelly")),
+        handicap_edge=signal_value(lookup.get("亚盘水位")),
+        fair_edge=signal_value(lookup.get("盘口合理性")),
+        depth_edge=signal_value(lookup.get("盘口深度/打穿能力")),
+        cover_edge=signal_value(lookup.get("赢盘门槛风险")),
+        draw_edge=signal_value(lookup.get("平局风险")),
+        bifa_reason=bifa.reason if bifa else "",
+    )
+    market = signal_value(lookup.get("市场平衡/背离"))
+    market_shift = 0.08 * market if market < 0 else 0.0
+    shift = clamp(max(pressure, 0.04) * 0.46 + 0.02 + abs(market_shift), 0.045, 0.12)
+    adjusted = weighted_score - shift
+    if adjusted >= weighted_score - 1e-9:
+        return weighted_score, None
+    return (
+        adjusted,
+        f"浅盘热门陷阱压分 -{shift:.3f}（大热缺亚盘/欧赔确认，市场平衡偏负）",
+    )
+
+
+def deep_favorite_live_recovery_applies(
+    match: Match,
+    last_score: float,
+    aggregate_score: float,
+    signals: list[Signal] | list[dict[str, Any]],
+) -> bool:
+    if aggregate_score >= 0 or last_score <= -0.06:
+        return False
+    if line_depth(match.asian_line) < 2.0:
+        return False
+    lookup = (
+        {signal.name: signal for signal in signals}
+        if signals and isinstance(signals[0], Signal)
+        else {str(item.get("name")): item for item in signals if isinstance(item, dict) and item.get("name")}
+    )
+    if _signal_lookup_value(lookup.get("欧赔/Kelly")) < 0.30:
+        return False
+    if _signal_lookup_value(lookup.get("市场平衡/背离")) <= -0.35:
+        return False
+    if _signal_lookup_value(lookup.get("临场score变化")) < 0.60:
+        return False
+    if _signal_lookup_value(lookup.get("亚盘水位")) < -0.15:
+        return False
+    return True
+
+
+def deep_favorite_live_recovery_aggregate_score(
+    median_score: float,
+    last_score: float,
+    match: Match,
+    last_signals: list[Signal] | list[dict[str, Any]],
+) -> tuple[float, str | None]:
+    """Blend median toward the recovering last snapshot; lift uses purchase-layer momentum coeff."""
+    if not deep_favorite_live_recovery_applies(match, last_score, median_score, last_signals):
+        return median_score, None
+    lookup = (
+        {signal.name: signal for signal in last_signals}
+        if last_signals and isinstance(last_signals[0], Signal)
+        else {
+            str(item.get("name")): item
+            for item in last_signals
+            if isinstance(item, dict) and item.get("name")
+        }
+    )
+    momentum = _signal_lookup_value(lookup.get("临场score变化"))
+    recovery_gap = max(last_score - median_score, 0.0)
+    live_weight = clamp(
+        0.50 + 0.35 * min(recovery_gap / LEAN_THRESHOLD, 1.0),
+        0.50,
+        0.85,
+    )
+    aggregated = (1.0 - live_weight) * median_score + live_weight * last_score
+    aggregated += PURCHASE_LAYER_MOMENTUM_COEFF * max(momentum, 0.0)
+    aggregated = clamp(aggregated, -1, 1)
+    return (
+        aggregated,
+        (
+            f"深盘强队临场修复：中位 {median_score:+.3f}、最后 {last_score:+.3f} "
+            f"按修复幅度加权 {live_weight:.2f}，临场动能 +{PURCHASE_LAYER_MOMENTUM_COEFF * max(momentum, 0.0):.3f}"
+            f" -> {aggregated:+.3f}"
+        ),
+    )
+
+
+def guarded_median_snapshot_recommendation(
+    match: Match,
+    median_score: float,
+    last_score: float | None,
+    last_signals: list[Signal] | list[dict[str, Any]],
+) -> tuple[str, float, list[str]]:
+    guarded_score = median_score
+    notes: list[str] = []
+    if last_score is not None:
+        aggregated, deep_note = deep_favorite_live_recovery_aggregate_score(
+            median_score,
+            last_score,
+            match,
+            last_signals,
+        )
+        if deep_note:
+            guarded_score = aggregated
+            notes.append(deep_note)
+    recommendation = _recommendation_from_median_score(guarded_score)
+    return recommendation, guarded_score, notes
+
+
+def _recommendation_from_median_score(score: float) -> str:
     if score >= 0:
         return "上盘"
     return "下盘"
+
+
+def recommendation_from_score(score: float) -> str:
+    return _recommendation_from_median_score(score)
 
 
 def score_strength_label(score: float) -> str:

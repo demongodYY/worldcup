@@ -22,6 +22,8 @@ from worldcup_ah_cli import (
     chuqi_trade_points_from_raw,
     current_score_momentum_signal,
     asian_no_vig_probability,
+    deep_favorite_retracement_guard,
+    deep_favorite_retracement_score_floor,
     equivalent_fair_handicap_depth,
     euro_trend_point_to_dict,
     handicap_row_to_dict,
@@ -38,6 +40,11 @@ from worldcup_ah_cli import (
     marginal_deep_upper_cover_score_lift,
     model_upper_trap_score_adjustment,
     price_volume_point_to_dict,
+    guarded_median_snapshot_recommendation,
+    deep_favorite_live_recovery_aggregate_score,
+    deep_favorite_live_recovery_applies,
+    shallow_hot_favorite_trap_score_adjustment,
+    shallow_hot_trap_applies,
     purchase_decision_from_signals,
     purchase_display_text,
     recent_handicap_path_axis,
@@ -825,6 +832,162 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertLess(move, -0.10)
         self.assertGreater(confidence, 0.5)
         self.assertIn("当前", reason)
+
+    def test_recent_handicap_path_detects_peak_retracement(self):
+        records = [
+            {
+                "fetched_at": "2026-06-25T16:05:00+00:00",
+                "minutes_before_kickoff": 235,
+                "match": {
+                    "home": "下盘队",
+                    "away": "上盘队",
+                    "match_time": "2026-06-25T20:00:00+00:00",
+                    "asian_line": "0.5",
+                    "raw": {"AsianAvrHome": 1.90, "AsianAvrAway": 1.90},
+                },
+                "result": {"score": 0.30, "upper_team": "上盘队", "lower_team": "下盘队"},
+            },
+            {
+                "fetched_at": "2026-06-25T18:05:00+00:00",
+                "minutes_before_kickoff": 115,
+                "match": {
+                    "home": "下盘队",
+                    "away": "上盘队",
+                    "match_time": "2026-06-25T20:00:00+00:00",
+                    "asian_line": "0.75",
+                    "raw": {"AsianAvrHome": 1.90, "AsianAvrAway": 1.90},
+                },
+                "result": {"score": 0.55, "upper_team": "上盘队", "lower_team": "下盘队"},
+            },
+            {
+                "fetched_at": "2026-06-25T19:05:00+00:00",
+                "minutes_before_kickoff": 55,
+                "match": {
+                    "home": "下盘队",
+                    "away": "上盘队",
+                    "match_time": "2026-06-25T20:00:00+00:00",
+                    "asian_line": "0.5",
+                    "raw": {"AsianAvrHome": 1.90, "AsianAvrAway": 1.90},
+                },
+                "result": {"score": 0.20, "upper_team": "上盘队", "lower_team": "下盘队"},
+            },
+        ]
+        context = SnapshotContext(
+            records=records,
+            first_metrics={},
+            last_metrics={},
+            signal_history_score=0.0,
+            signal_history_reason="",
+        )
+        match = sample_match(
+            home="下盘队",
+            away="上盘队",
+            asian_line="0.5",
+            match_time=datetime(2026, 6, 25, 20, 0, tzinfo=timezone.utc),
+            raw={
+                "AsianAvrHome": 1.90,
+                "AsianAvrAway": 1.90,
+                "_snapshot_minutes_before_kickoff": 25,
+            },
+        )
+
+        score, confidence, move, reason = recent_handicap_path_axis(match, [], "上盘队", context)
+
+        self.assertLess(score, -0.65)
+        self.assertLess(move, -0.16)
+        self.assertGreater(confidence, 0.5)
+        self.assertIn("高点回撤", reason)
+
+    def test_deep_favorite_retracement_guard_caps_flip(self):
+        match = sample_match(
+            asian_line="-1.5",
+            raw={
+                "AsianAvrHome": 1.85,
+                "AsianAvrAway": 1.98,
+            },
+        )
+        handicap = Signal(
+            "亚盘水位",
+            -0.72,
+            0.50,
+            True,
+            "高点回撤 T-55 +2.00->当前 +1.50 (-0.50)，公司极值后回撤同向 13/13，公司强确认",
+        )
+        elasticity = Signal("资金/盘口弹性", -0.31, 0.065, True, "临场资金后盘口响应 -1.00")
+
+        guarded_handicap, guarded_elasticity = deep_favorite_retracement_guard(
+            match,
+            "主队",
+            handicap,
+            elasticity,
+            Signal("必发指数", 0.25, 0.015, True, "强队热度未反向"),
+            Signal("必发成交走势", -0.02, 0.135, True, "成交未明显反向"),
+            Signal("欧赔/Kelly", 0.55, 0.085, True, "欧赔仍挺上盘"),
+        )
+
+        self.assertEqual(guarded_handicap.score, -0.12)
+        self.assertEqual(guarded_elasticity.score, -0.04)
+        self.assertIn("退浅保护", guarded_handicap.reason)
+
+    def test_deep_favorite_retracement_guard_skips_shallow_line(self):
+        match = sample_match(
+            asian_line="-0.5",
+            raw={
+                "AsianAvrHome": 1.85,
+                "AsianAvrAway": 1.98,
+            },
+        )
+        handicap = Signal(
+            "亚盘水位",
+            -0.72,
+            0.50,
+            True,
+            "高点回撤 T-55 +0.75->当前 +0.50 (-0.25)，公司极值后回撤同向 13/13，公司强确认",
+        )
+
+        guarded_handicap, _guarded_elasticity = deep_favorite_retracement_guard(
+            match,
+            "主队",
+            handicap,
+            Signal("资金/盘口弹性", -0.31, 0.065, True, "临场资金后盘口响应 -1.00"),
+            Signal("必发指数", 0.25, 0.015, True, "强队热度未反向"),
+            Signal("必发成交走势", -0.02, 0.135, True, "成交未明显反向"),
+            Signal("欧赔/Kelly", 0.55, 0.085, True, "欧赔仍挺上盘"),
+        )
+
+        self.assertEqual(guarded_handicap.score, -0.72)
+
+    def test_deep_favorite_retracement_score_floor_keeps_light_negative_from_flipping(self):
+        match = sample_match(asian_line="-1.5")
+
+        score, note = deep_favorite_retracement_score_floor(
+            match,
+            -0.106,
+            [
+                Signal("亚盘水位", -0.12, 0.50, True, "深盘强队退浅保护"),
+                Signal("欧赔/Kelly", 0.55, 0.085, True, "欧赔仍挺上盘"),
+                Signal("必发成交走势", -0.02, 0.135, True, "成交未明显反向"),
+                Signal("必发指数", 0.25, 0.015, True, "强队热度未反向"),
+            ],
+        )
+
+        self.assertGreater(score, 0)
+        self.assertIn("总分地板", note)
+
+    def test_deep_favorite_retracement_score_floor_allows_strong_negative(self):
+        match = sample_match(asian_line="-1.5")
+
+        score, note = deep_favorite_retracement_score_floor(
+            match,
+            -0.25,
+            [
+                Signal("亚盘水位", -0.40, 0.50, True, "深盘强队退浅保护"),
+                Signal("欧赔/Kelly", 0.55, 0.085, True, "欧赔仍挺上盘"),
+            ],
+        )
+
+        self.assertEqual(score, -0.25)
+        self.assertIsNone(note)
 
     def test_recent_path_uses_market_consensus_before_sparse_company_row(self):
         records = [
@@ -1857,6 +2020,125 @@ class WorldCupAhCliTests(unittest.TestCase):
 
         self.assertEqual(decision.side, "观望")
         self.assertIn("模型观望", decision.reason)
+
+    def test_shallow_hot_trap_score_adjustment_pulls_weak_upper_negative(self):
+        raw = {
+            "_source": "okooo",
+            "BfIndexHome": 75.82,
+            "BfIndexAway": 12.51,
+            "BfAmountHome": 2_681_094.0,
+            "BfAmountAway": 442_325.0,
+            "BfPayoutHome": -2_201_304.0,
+            "BfPayoutAway": 1_722_705.0,
+            "BfOddsHome": 2.14,
+            "BfOddsAway": 4.10,
+        }
+        match = sample_match(raw=raw, asian_line="-0.5")
+        signals = [
+            Signal("必发指数", 0.159, 0.16, True, "浅盘大热但庄家盈亏对让球方承压"),
+            Signal("必发成交走势", 0.0, 0.08, False, "近1小时成交走势不足"),
+            Signal("亚盘水位", 0.0, 0.13, True, "等价公平盘口中位变化 +0.000 球，公司同向 上0/下0/中性1，一致性可信度 0.16"),
+            Signal("欧赔/Kelly", -0.007, 0.07, True, "基本中性"),
+            Signal("市场平衡/背离", -0.105, 0.07, True, "热门陷阱"),
+            Signal("盘口合理性", 0.0, 0.05, True, "中性"),
+            Signal("盘口深度/打穿能力", 0.0, 0.03, True, "浅盘"),
+            Signal("赢盘门槛风险", 0.0, 0.05, True, "中性"),
+            Signal("平局风险", 0.0, 0.07, True, "中性"),
+            Signal("公司一致性", 0.0, 0.05, True, "中性"),
+        ]
+        self.assertTrue(shallow_hot_trap_applies(match, 0.002, signals))
+        adjusted, note = shallow_hot_favorite_trap_score_adjustment(match, 0.002, signals)
+        self.assertIsNotNone(note)
+        self.assertIn("浅盘热门陷阱压分", note or "")
+        self.assertLess(adjusted, 0.0)
+        self.assertLess(adjusted, 0.002)
+        self.assertEqual(recommendation_from_score(adjusted), "下盘")
+
+    def test_shallow_hot_trap_does_not_block_low_score_winner_with_positive_market(self):
+        raw = {
+            "_source": "okooo",
+            "BfIndexHome": 67.6,
+            "BfIndexAway": 12.5,
+            "BfAmountHome": 2_897_400.0,
+            "BfAmountAway": 536_756.0,
+            "BfPayoutHome": -1_974_243.0,
+            "BfPayoutAway": 2_029_766.0,
+            "BfOddsHome": 1.77,
+            "BfOddsAway": 5.10,
+        }
+        match = sample_match(raw=raw, asian_line="-0.5")
+        signals = [
+            Signal("必发指数", 0.556, 0.16, True, "大热"),
+            Signal("亚盘水位", 0.0, 0.13, True, "等价公平盘口中位变化 +0.000 球，公司同向 上0/下0/中性1，一致性可信度 0.16"),
+            Signal("欧赔/Kelly", 0.166, 0.07, True, "偏上"),
+            Signal("市场平衡/背离", 0.132, 0.07, True, "多信号同向偏上盘"),
+            Signal("公司一致性", 0.0, 0.05, True, "中性"),
+        ]
+        self.assertFalse(shallow_hot_trap_applies(match, 0.029, signals))
+        adjusted, note = shallow_hot_favorite_trap_score_adjustment(match, 0.029, signals)
+        self.assertIsNone(note)
+        self.assertEqual(adjusted, 0.029)
+        rec, score, _notes = guarded_median_snapshot_recommendation(match, 0.029, 0.040, signals)
+        self.assertEqual(rec, "上盘")
+        self.assertAlmostEqual(score, 0.029)
+
+    def test_deep_favorite_live_recovery_invalidates_stale_lower_median(self):
+        raw = {
+            "_source": "okooo",
+            "BfIndexHome": 88.05,
+            "BfIndexAway": 6.32,
+            "BfAmountHome": 4_870_860.0,
+            "BfAmountAway": 349_835.0,
+            "BfPayoutHome": -20_980.0,
+            "BfPayoutAway": -3_563_910.0,
+            "BfOddsHome": 1.14,
+            "BfOddsAway": 26.0,
+        }
+        match = sample_match(raw=raw, asian_line="-2.5")
+        signals = [
+            Signal("欧赔/Kelly", 0.427, 0.07, True, "临场转正"),
+            Signal("市场平衡/背离", -0.160, 0.07, True, "偏负但未极端"),
+            Signal("临场score变化", 1.0, 0.0, True, "强回升"),
+            Signal("亚盘水位", 0.0, 0.13, True, "等价公平盘口路径 +2.5"),
+        ]
+        self.assertTrue(deep_favorite_live_recovery_applies(match, -0.033, -0.101, signals))
+        aggregated, note = deep_favorite_live_recovery_aggregate_score(-0.101, -0.033, match, signals)
+        self.assertIsNotNone(note)
+        self.assertIn("深盘强队临场修复", note or "")
+        self.assertGreater(aggregated, 0.0)
+        recommendation, guarded_score, notes = guarded_median_snapshot_recommendation(
+            match, -0.101, -0.033, signals
+        )
+        self.assertEqual(recommendation, "上盘")
+        self.assertAlmostEqual(guarded_score, aggregated)
+        self.assertTrue(notes)
+
+    def test_deep_favorite_live_recovery_does_not_rescue_true_lower_case(self):
+        raw = {
+            "_source": "okooo",
+            "BfIndexHome": 86.4,
+            "BfIndexAway": 5.7,
+            "BfAmountHome": 3_915_617.0,
+            "BfAmountAway": 255_893.0,
+            "BfPayoutHome": 28_750.0,
+            "BfPayoutAway": -2_500_000.0,
+            "BfOddsHome": 1.14,
+            "BfOddsAway": 30.0,
+        }
+        match = sample_match(raw=raw, asian_line="-1.5")
+        signals = [
+            Signal("欧赔/Kelly", 0.550, 0.07, True, "偏上"),
+            Signal("市场平衡/背离", -0.902, 0.07, True, "极端偏下"),
+            Signal("临场score变化", -1.0, 0.0, True, "走弱"),
+            Signal("亚盘水位", -0.707, 0.13, True, "偏下"),
+        ]
+        self.assertFalse(deep_favorite_live_recovery_applies(match, -0.527, -0.528, signals))
+        aggregated, note = deep_favorite_live_recovery_aggregate_score(-0.528, -0.527, match, signals)
+        self.assertIsNone(note)
+        self.assertAlmostEqual(aggregated, -0.528)
+        rec, score, _notes = guarded_median_snapshot_recommendation(match, -0.528, -0.527, signals)
+        self.assertEqual(rec, "下盘")
+        self.assertLess(score, 0)
 
     def test_middle_line_cover_risk_keeps_stale_upper_pick_light(self):
         raw = {

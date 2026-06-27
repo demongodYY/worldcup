@@ -1,8 +1,8 @@
 {
-  "model_version": "okooo-ah-fair-line-v2-2026-06-26",
-  "model_fingerprint": "8b5ae5fe8f5e51aa9b05bb8a85177e3dde927053eb200f111da1cafe2115f05c",
-  "frozen_at": "2026-06-26T07:12:48+08:00",
+  "model_version": "okooo-ah-fair-line-v5-2026-06-26",
+  "model_fingerprint": "a0f169fa30c25df2b529f0c71b66afc49ae7c729cd9bae2caab126cc95553bf7",
+  "frozen_at": "2026-06-26T23:47:30+08:00",
   "validation_policy": "last_two_eligible_prematch_snapshots_median",
   "settlement_market": "latest_of_two_snapshot_line_and_price",
-  "notes": "Fair-line v2 freeze: v1 market axis plus a consensus-based recent four-hour path reversal signal. T-90 receives stronger recency, sustained retreats can change direction, strong current company consensus caps false reversals, and current/history fair depth use the same market-average line and water basis."
+  "notes": "Fair-line v5 freeze: v4 fair-line stack plus shallow-hot-favorite trap pressure at model score layer and deep-favorite live-recovery weighting at median aggregation. Historical jsonl were re-materialized via freeze-snapshots replay for walk-forward."
 }

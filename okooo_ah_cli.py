@@ -33,6 +33,8 @@ from zoneinfo import ZoneInfo
 
 from asian_handicap_validation import (
     LOSS_OUTCOMES,
+    normalize_asian_decimal_odds,
+    parse_utc_datetime,
     selected_asian_price,
     select_last_eligible_snapshots,
     settle_asian_handicap,
@@ -49,6 +51,7 @@ from worldcup_ah_cli import (
     EuroTrendPoint,
     HandicapRow,
     Match,
+    MODEL_VERSION,
     OkoooSnapshotReplayClient,
     Predictor,
     PriceVolumePoint,
@@ -59,12 +62,15 @@ from worldcup_ah_cli import (
     default_env_file_path,
     euro_trend_point_to_dict,
     format_local,
+    guarded_median_snapshot_recommendation,
     handicap_row_to_dict,
     is_ssl_verify_error,
     line_depth,
     line_value,
     load_dotenv_file,
     match_from_dict,
+    match_to_dict,
+    model_source_fingerprint,
     normalize_line_for_spdex,
     price_volume_point_to_dict,
     print_analysis,
@@ -72,6 +78,7 @@ from worldcup_ah_cli import (
     print_snapshot_trend,
     score_strength_label,
     side_key,
+    to_float_or_none,
     upper_lower_teams,
 )
 
@@ -246,6 +253,199 @@ def replay_snapshot_results(snapshot_root: Path, event_id: int, records: list[di
     return out
 
 
+def replay_snapshot_result_with_history(
+    snapshot_root: Path,
+    event_id: int,
+    source_records: list[dict[str, Any]],
+    index: int,
+    history_records: list[dict[str, Any]],
+) -> AnalysisResult:
+    """Replay one snapshot using prior frozen records as trend history."""
+    current_records = source_records[: index + 1]
+    current_record = current_records[-1]
+    match = match_from_dict(current_record["match"])
+    raw = dict(match.raw)
+    raw["_snapshot_fetched_at"] = current_record.get("fetched_at")
+    raw["_snapshot_minutes_before_kickoff"] = current_record.get("minutes_before_kickoff")
+    match = replace(match, raw=raw)
+    client = OkoooSnapshotReplayClient(current_records)
+    store = ValidateReplaySnapshotStore(snapshot_root, event_id, history_records)
+    return Predictor(client, store).analyze(match)
+
+
+def frozen_snapshot_record_from_replay(
+    original: dict[str, Any],
+    result: AnalysisResult,
+    *,
+    model_version: str,
+    model_fingerprint: str,
+) -> dict[str, Any]:
+    fetched_at = str(original.get("fetched_at") or "")
+    match = match_from_dict(original["match"])
+    fetched_dt = parse_utc_datetime(fetched_at)
+    before_minutes = (
+        (match.match_time - fetched_dt).total_seconds() / 60.0
+        if fetched_dt is not None
+        else original.get("minutes_before_kickoff")
+    )
+    if before_minutes is not None:
+        before_minutes = round(float(before_minutes), 3)
+    home_price = to_float_or_none(match.raw.get("AsianAvrHome"))
+    away_price = to_float_or_none(match.raw.get("AsianAvrAway"))
+    eligible = before_minutes is not None and float(before_minutes) > 0
+    return {
+        "schema": 2,
+        "fetched_at": fetched_at,
+        "model_version": model_version,
+        "model_fingerprint": model_fingerprint,
+        "minutes_before_kickoff": before_minutes,
+        "provenance": {
+            "kind": "freeze_replay",
+            "validation_eligible": eligible,
+            "reason": "" if eligible else "post_kickoff",
+        },
+        "market": {
+            "asian_line": match.asian_line,
+            "home_raw_price": home_price,
+            "away_raw_price": away_price,
+            "home_decimal_odds": normalize_asian_decimal_odds(home_price),
+            "away_decimal_odds": normalize_asian_decimal_odds(away_price),
+        },
+        "match": original.get("match") if isinstance(original.get("match"), dict) else match_to_dict(match),
+        "result": result.to_dict(),
+    }
+
+
+def materialize_event_freeze_snapshots(
+    snapshot_root: Path,
+    event_id: int,
+    source_records: list[dict[str, Any]],
+    *,
+    model_version: str,
+    model_fingerprint: str,
+) -> list[dict[str, Any]]:
+    frozen_records: list[dict[str, Any]] = []
+    for index in range(len(source_records)):
+        result = replay_snapshot_result_at(snapshot_root, event_id, source_records, index)
+        frozen_records.append(
+            frozen_snapshot_record_from_replay(
+                source_records[index],
+                result,
+                model_version=model_version,
+                model_fingerprint=model_fingerprint,
+            )
+        )
+    return frozen_records
+
+
+def write_model_freeze_manifest(
+    path: Path,
+    *,
+    model_version: str,
+    model_fingerprint: str,
+    notes: str,
+) -> None:
+    now_local = datetime.now(ZoneInfo("Asia/Shanghai"))
+    payload = {
+        "model_version": model_version,
+        "model_fingerprint": model_fingerprint,
+        "frozen_at": now_local.isoformat(timespec="seconds"),
+        "validation_policy": "last_two_eligible_prematch_snapshots_median",
+        "settlement_market": "latest_of_two_snapshot_line_and_price",
+        "notes": notes,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def freeze_snapshot_files(
+    snapshot_root: Path,
+    *,
+    event_ids: list[int] | None = None,
+    backup_dir: Path | None = None,
+    model_version: str | None = None,
+    model_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    effective_version = model_version or MODEL_VERSION
+    effective_fingerprint = model_fingerprint or model_source_fingerprint()
+    if backup_dir is not None:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+    paths = sorted(snapshot_root.glob("*.jsonl"))
+    if event_ids is not None:
+        wanted = {int(eid) for eid in event_ids}
+        paths = [path for path in paths if path.stem.isdigit() and int(path.stem) in wanted]
+    stats = {
+        "events": 0,
+        "records": 0,
+        "eligible_records": 0,
+        "model_version": effective_version,
+        "model_fingerprint": effective_fingerprint,
+    }
+    for path in paths:
+        if not path.stem.isdigit():
+            continue
+        event_id = int(path.stem)
+        source_records = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if not source_records:
+            continue
+        if backup_dir is not None:
+            backup_path = backup_dir / path.name
+            if not backup_path.exists():
+                backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        frozen_records = materialize_event_freeze_snapshots(
+            snapshot_root,
+            event_id,
+            source_records,
+            model_version=effective_version,
+            model_fingerprint=effective_fingerprint,
+        )
+        path.write_text(
+            "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in frozen_records),
+            encoding="utf-8",
+        )
+        stats["events"] += 1
+        stats["records"] += len(frozen_records)
+        stats["eligible_records"] += sum(
+            1 for record in frozen_records if not snapshot_validation_issues(record)
+        )
+    return stats
+
+
+def replay_history_snapshot_root(snapshot_root: Path, explicit: Path | None = None) -> Path | None:
+    if explicit is not None:
+        path = explicit.expanduser()
+        return path if path.is_dir() else None
+    candidate = snapshot_root.parent / f"{snapshot_root.name}_pre_v5_freeze"
+    return candidate if candidate.is_dir() else None
+
+
+def replay_source_records_for_event(
+    snapshot_root: Path,
+    event_id: int,
+    records: list[dict[str, Any]],
+    *,
+    history_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Use pre-freeze jsonl as replay history when available and aligned."""
+    effective_history_root = replay_history_snapshot_root(snapshot_root, history_root)
+    if effective_history_root is None:
+        return records
+    backup_path = effective_history_root / f"{event_id}.jsonl"
+    if not backup_path.is_file():
+        return records
+    backup_records = [
+        json.loads(line)
+        for line in backup_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(backup_records) != len(records):
+        return records
+    return backup_records
+
+
 def _finite_float(value: Any) -> float | None:
     try:
         number = float(value)
@@ -269,7 +469,10 @@ def _recommendation_from_median_score(score: float) -> str:
 
 
 def median_snapshot_prediction_dict(
-    result_dicts: list[dict[str, Any]], *, window: int = SNAPSHOT_MEDIAN_WINDOW
+    result_dicts: list[dict[str, Any]],
+    *,
+    window: int = SNAPSHOT_MEDIAN_WINDOW,
+    match: Match | None = None,
 ) -> dict[str, Any]:
     """Aggregate replayed snapshot predictions by median score.
 
@@ -284,11 +487,26 @@ def median_snapshot_prediction_dict(
     last = dict(usable[-1])
     scores = [_finite_float(item.get("score")) for item in sampled]
     median_score = float(median([score for score in scores if score is not None]))
-    recommendation = _recommendation_from_median_score(median_score)
     upper_team = str(last.get("upper_team") or "")
     lower_team = str(last.get("lower_team") or "")
-    purchase_team = upper_team if recommendation == "上盘" else lower_team
     last_score = _finite_float(last.get("score"))
+    last_signals = last.get("signals") if isinstance(last.get("signals"), list) else []
+    guard_notes: list[str] = []
+    guarded_score = median_score
+    if match is not None and last_score is not None:
+        recommendation, guarded_score, guard_notes = guarded_median_snapshot_recommendation(
+            match,
+            median_score,
+            last_score,
+            last_signals,
+        )
+    else:
+        recommendation = _recommendation_from_median_score(median_score)
+    purchase_team = ""
+    if recommendation == "上盘":
+        purchase_team = upper_team
+    elif recommendation == "下盘":
+        purchase_team = lower_team
     last_confidence = int(_finite_float(last.get("confidence")) or 0)
     last_completeness = int(_finite_float(last.get("completeness")) or 0)
     last.update(
@@ -297,9 +515,9 @@ def median_snapshot_prediction_dict(
             "purchase_side": recommendation,
             "purchase_team": purchase_team,
             "model_recommendation": recommendation,
-            "score": round(median_score, 4),
-            "purchase_score": round(median_score, 4),
-            "strength": score_strength_label(median_score),
+            "score": round(guarded_score, 4),
+            "purchase_score": round(guarded_score, 4),
+            "strength": score_strength_label(guarded_score),
             "confidence": _median_int([item.get("confidence") for item in sampled], last_confidence),
             "model_confidence": _median_int(
                 [item.get("model_confidence", item.get("confidence")) for item in sampled], last_confidence
@@ -307,7 +525,9 @@ def median_snapshot_prediction_dict(
             "completeness": _median_int([item.get("completeness") for item in sampled], last_completeness),
             "decision_reason": (
                 f"快照中位数：最近 {len(sampled)}/{len(usable)} 次 replay score 中位数 {median_score:+.3f}，"
-                f"最后一条 {last_score if last_score is not None else median_score:+.3f}，推荐{recommendation}"
+                f"最后一条 {last_score if last_score is not None else median_score:+.3f}，"
+                f"推荐{recommendation}（{score_strength_label(guarded_score)} {guarded_score:+.3f}）"
+                + (f"；{'；'.join(guard_notes)}" if guard_notes else "")
             ),
             "snapshot_median_count": len(sampled),
             "snapshot_median_total_count": len(usable),
@@ -339,6 +559,7 @@ def build_validate_snapshot_records(
     *,
     mode: str = "replay",
     freeze: dict[str, Any] | None = None,
+    history_snapshot_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     if mode not in ("replay", "walk-forward"):
         raise ValueError(f"unsupported validation mode: {mode}")
@@ -399,15 +620,21 @@ def build_validate_snapshot_records(
         match = match_from_dict(latest_record["match"])
         try:
             if mode == "replay":
+                replay_records = replay_source_records_for_event(
+                    snapshot_root,
+                    eid,
+                    records,
+                    history_root=history_snapshot_root,
+                )
                 result_dicts = [
-                    replay_snapshot_result_at(snapshot_root, eid, records, selection.index).to_dict()
+                    replay_snapshot_result_at(snapshot_root, eid, replay_records, selection.index).to_dict()
                     for selection in selections
                 ]
             else:
                 result_dicts = [dict(selection.record.get("result") or {}) for selection in selections]
                 if any(not result for result in result_dicts):
                     raise DataError("walk-forward snapshot missing stored result")
-            result = median_snapshot_prediction_dict(result_dicts, window=2)
+            result = median_snapshot_prediction_dict(result_dicts, window=2, match=match)
             recommendation = str(result.get("purchase_side") or result.get("recommendation") or "")
             price = selected_asian_price(latest_record, result, recommendation)
             outcome, margin, unit_result, profit = _replay_recommendation_outcome(
@@ -479,6 +706,7 @@ def run_validate_snapshots_from_dir(
     fail_on_miss: bool = True,
     mode: str = "replay",
     freeze: dict[str, Any] | None = None,
+    history_snapshot_root: Path | None = None,
 ) -> int:
     """Validate one last-two-snapshot median decision per event."""
     rows = build_validate_snapshot_records(
@@ -486,6 +714,7 @@ def run_validate_snapshots_from_dir(
         scores,
         mode=mode,
         freeze=freeze,
+        history_snapshot_root=history_snapshot_root,
     )
     outcome_text = {
         "full_win": "全赢",
@@ -1765,6 +1994,44 @@ def cmd_upcoming(client: OkoooClient, _store: SnapshotStore, args: argparse.Name
     return 0
 
 
+def cmd_freeze_snapshots(_client: OkoooClient, store: SnapshotStore, args: argparse.Namespace) -> int:
+    """Replay local snapshots with the current frozen model and rewrite schema-2 records."""
+    root = Path(store.root)
+    if not root.is_dir():
+        print(f"error: snapshot directory not found: {root}", file=sys.stderr)
+        return 1
+    event_ids: list[int] | None = None
+    if args.event_ids:
+        event_ids = list(args.event_ids)
+    backup_dir = Path(args.backup_dir).expanduser() if args.backup_dir else None
+    stats = freeze_snapshot_files(
+        root,
+        event_ids=event_ids,
+        backup_dir=backup_dir,
+    )
+    print(
+        f"已冻结 {stats['events']} 场 / {stats['records']} 条快照 "
+        f"（合格赛前 {stats['eligible_records']} 条）"
+    )
+    print(f"模型: {stats['model_version']}")
+    print(f"指纹: {stats['model_fingerprint']}")
+    if args.write_manifest:
+        notes = (
+            "Fair-line v5 freeze: v4 fair-line stack plus shallow-hot-favorite trap pressure "
+            "at model score layer and deep-favorite live-recovery weighting at median aggregation. "
+            "Historical jsonl were re-materialized via freeze-snapshots replay for walk-forward."
+        )
+        manifest_path = Path(args.freeze_manifest).expanduser()
+        write_model_freeze_manifest(
+            manifest_path,
+            model_version=str(stats["model_version"]),
+            model_fingerprint=str(stats["model_fingerprint"]),
+            notes=notes,
+        )
+        print(f"已写入冻结清单: {manifest_path}")
+    return 0
+
+
 def cmd_validate_snapshots(_client: OkoooClient, store: SnapshotStore, args: argparse.Namespace) -> int:
     """不抓取网络；只读本地快照与 ``worldcup_ah_cli.Predictor`` 算法。"""
     try:
@@ -1794,6 +2061,9 @@ def cmd_validate_snapshots(_client: OkoooClient, store: SnapshotStore, args: arg
         fail_on_miss=not args.allow_miss,
         mode=mode,
         freeze=freeze,
+        history_snapshot_root=Path(args.history_snapshot_dir).expanduser()
+        if args.history_snapshot_dir
+        else None,
     )
 
 
@@ -1958,7 +2228,43 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OKOOO_MODEL_FREEZE_PATH,
         help="walk-forward 模型冻结清单",
     )
+    val.add_argument(
+        "--history-snapshot-dir",
+        type=Path,
+        default=None,
+        help="replay 模式用于趋势历史的快照目录；默认尝试 .okooo_snapshots_pre_v5_freeze",
+    )
     val.set_defaults(func=cmd_validate_snapshots)
+
+    fr = sub.add_parser(
+        "freeze-snapshots",
+        help="用当前冻结模型重放本地 jsonl，写入 schema 2 与 model_version/fingerprint",
+    )
+    fr.add_argument(
+        "--event-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="仅处理指定 event id；默认处理快照目录下全部 jsonl",
+    )
+    fr.add_argument(
+        "--backup-dir",
+        type=Path,
+        default=None,
+        help="冻结前将原 jsonl 备份到此目录（每场仅备份一次）",
+    )
+    fr.add_argument(
+        "--write-manifest",
+        action="store_true",
+        help="同时更新 tools/okooo_model_freeze.json",
+    )
+    fr.add_argument(
+        "--freeze-manifest",
+        type=Path,
+        default=DEFAULT_OKOOO_MODEL_FREEZE_PATH,
+        help="--write-manifest 写入路径",
+    )
+    fr.set_defaults(func=cmd_freeze_snapshots)
 
     sn = sub.add_parser("snapshot", help="预测并保存一组比赛快照")
     sn.add_argument("--match-ids", type=int, nargs="+", required=True)
