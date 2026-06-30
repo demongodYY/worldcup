@@ -60,6 +60,7 @@ from worldcup_ah_cli import (
     score_snapshot_signal_history,
     set_env_file_value,
     signal_summary_text,
+    source_adjusted_signals,
     team_line_delta,
     upper_lower_teams,
 )
@@ -649,6 +650,15 @@ class WorldCupAhCliTests(unittest.TestCase):
 
         self.assertLess(abs(heat_edge), 0.18)
         self.assertIn("热度分裂已降权", bifa_signal.reason)
+
+    def test_okooo_bifa_index_is_context_only_not_direct_weight(self):
+        match = sample_match(raw={"_source": "okooo"})
+        signals = [Signal("必发指数", 0.50, 0.16, True, "热门资金集中")]
+
+        adjusted = source_adjusted_signals(match, signals)
+
+        self.assertEqual(adjusted[0].weight, 0.0)
+        self.assertIn("仅作热门/赔付压力参数", adjusted[0].reason)
 
     def test_empty_handicap_data_degrades_to_watch_without_crashing(self):
         predictor = Predictor(FakeClient(handicap_rows=[]))

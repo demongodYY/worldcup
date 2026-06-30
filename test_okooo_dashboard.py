@@ -95,6 +95,12 @@ class OkoooDashboardTests(unittest.TestCase):
         self.assertEqual(event["last_result"]["snapshot_median_count"], 2)
         self.assertEqual(event["last_result"]["snapshot_median_total_count"], 2)
         self.assertIn(event["last_result"]["purchase_side"], {"上盘", "下盘", "观望"})
+        self.assertIn("headline", event["plain_explanation"])
+        self.assertGreaterEqual(len(event["plain_explanation"]["bullets"]), 1)
+        self.assertGreaterEqual(len(event["trend_reasons"]), 1)
+        self.assertGreaterEqual(len(event["signal_deltas"]), 1)
+        self.assertTrue({row["name"] for row in event["signal_deltas"]})
+        self.assertTrue(event["series"][-1]["signal_scores"])
 
     def test_build_snapshot_events_sort_by_match_time_descending(self) -> None:
         with TemporaryDirectory() as tmp:

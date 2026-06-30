@@ -72,7 +72,7 @@ OKOOO_PURCHASE_INTERNAL_SIGNAL_NAMES = {
 }
 
 OKOOO_SCORING_WEIGHT_OVERRIDES = {
-    "必发指数": 0.015,
+    "必发指数": 0.0,
     "必发成交走势": 0.135,
     "亚盘水位": 0.50,
     "欧赔/Kelly": 0.085,
@@ -94,7 +94,7 @@ LEAN_THRESHOLD = 0.05
 PURCHASE_LAYER_MOMENTUM_COEFF = 0.14
 MODEL_DIRECTION_EPSILON = 0.015
 STRONG_THRESHOLD = 0.25
-MODEL_VERSION = "okooo-ah-fair-line-v5-2026-06-26"
+MODEL_VERSION = "okooo-ah-fair-line-v7-2026-07-01"
 
 TOP_BOOKMAKERS = ("PinnacleSports", "Bet365", "Singbet", "IBC", "Ysb88")
 MATCH_LIST_HOT_MODES = (1, None)
@@ -5130,7 +5130,7 @@ def source_adjusted_signals(match: Match, signals: list[Signal]) -> list[Signal]
             continue
         reason = signal.reason
         if override < signal.weight and "澳客同源加权降权" not in reason:
-            reason += "；澳客同源加权降权"
+            reason += "；仅作热门/赔付压力参数，不直接进入方向加权" if override == 0 else "；澳客同源加权降权"
         elif override > signal.weight and signal.name in ("亚盘水位", "公司一致性", "盘口合理性", "赢盘门槛风险", "资金/盘口弹性"):
             reason += "；澳客亚盘主导权重提升"
         adjusted.append(replace(signal, weight=override, reason=reason))

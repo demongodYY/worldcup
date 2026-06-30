@@ -1,8 +1,8 @@
 {
-  "model_version": "okooo-ah-fair-line-v5-2026-06-26",
-  "model_fingerprint": "a0f169fa30c25df2b529f0c71b66afc49ae7c729cd9bae2caab126cc95553bf7",
-  "frozen_at": "2026-06-26T23:47:30+08:00",
+  "model_version": "okooo-ah-fair-line-v7-2026-07-01",
+  "model_fingerprint": "70cc197f6ab8af52b401f04334a30770207e68bf5c3666ce4c53b6862d49609d",
+  "frozen_at": "2026-07-01T01:01:09+08:00",
   "validation_policy": "last_two_eligible_prematch_snapshots_median",
   "settlement_market": "latest_of_two_snapshot_line_and_price",
-  "notes": "Fair-line v5 freeze: v4 fair-line stack plus shallow-hot-favorite trap pressure at model score layer and deep-favorite live-recovery weighting at median aggregation. Historical jsonl were re-materialized via freeze-snapshots replay for walk-forward."
+  "notes": "Fair-line v7 freeze: v6 fair-line stack, with Bifa index changed to context-only for market confirmation, payout-pressure interpretation, market elasticity, and hot-favorite trap logic. It no longer contributes direct direction weight in Okooo scoring. Historical jsonl are sample-in validation; new matches use this freeze for walk-forward."
 }

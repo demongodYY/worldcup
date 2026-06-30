@@ -429,6 +429,99 @@
       line-height: 1.45;
     }
 
+    .reason-box {
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      padding: 12px;
+    }
+
+    .plain-box {
+      margin-top: 12px;
+      border: 1px solid #c9d8ff;
+      border-radius: 10px;
+      background: linear-gradient(180deg, #f7faff 0%, #ffffff 100%);
+      padding: 14px;
+    }
+
+    .plain-headline {
+      margin-top: 8px;
+      font-size: 16px;
+      line-height: 1.45;
+      font-weight: 800;
+    }
+
+    .plain-warning {
+      margin-top: 10px;
+      border-left: 3px solid var(--amber);
+      padding: 8px 10px;
+      background: #fff8ed;
+      color: #7a4a00;
+      border-radius: 6px;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .advanced-box {
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px 12px;
+    }
+
+    .advanced-box summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .reason-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .reason-item {
+      display: grid;
+      grid-template-columns: 8px 1fr;
+      gap: 8px;
+      align-items: start;
+      color: var(--ink);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .reason-dot {
+      width: 8px;
+      height: 8px;
+      margin-top: 6px;
+      border-radius: 999px;
+      background: var(--blue);
+    }
+
+    .delta-table {
+      margin-top: 12px;
+    }
+
+    .delta-table td,
+    .delta-table th {
+      white-space: nowrap;
+    }
+
+    .delta-table .wide {
+      min-width: 240px;
+      white-space: normal;
+    }
+
+    .micro {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
     .predict-box {
       margin-top: 14px;
       border-top: 1px solid var(--line);
@@ -931,6 +1024,12 @@
         <div class="chart-box" id="chartBox"></div>
 
         <div class="notice">${escapeHtml(item.trend_note)}；基础信号历史 ${fmt(item.signal_history_score, 3)}。${escapeHtml(renderReplayNote(item))}</div>
+        ${renderPlainExplanation(item)}
+        <details class="advanced-box">
+          <summary>高级拆解：展开看信号分数和变化</summary>
+          ${renderTrendReasons(item)}
+          ${renderSignalDeltaTable(item.signal_deltas)}
+        </details>
 
         <div class="split">
           <div>
@@ -947,6 +1046,7 @@
                     <th>盈亏</th>
                     <th>上水</th>
                     <th>深度</th>
+                    <th>欧赔</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -960,6 +1060,7 @@
                       <td>${fmt(point.payout_edge, 3)}</td>
                       <td>${fmt(point.upper_water, 3)}</td>
                       <td>${fmt(point.line_depth, 2)}</td>
+                      <td>${fmt(point.euro_edge, 3)}</td>
                     </tr>
                   `).join("")}
                 </tbody>
@@ -987,6 +1088,95 @@
       el("predictBtn").addEventListener("click", () => runPredict());
       const cached = state.predictionById.get(item.event_id);
       if (cached) renderPredictionResult(cached);
+    }
+
+    function renderPlainExplanation(item) {
+      const plain = item?.plain_explanation;
+      if (!plain) return "";
+      const bullets = plain.bullets || [];
+      return `
+        <div class="plain-box">
+          <div class="panel-title">白话解读</div>
+          <div class="plain-headline">${escapeHtml(plain.headline || "")}</div>
+          <div class="reason-list">
+            ${bullets.map((reason) => `
+              <div class="reason-item">
+                <span class="reason-dot"></span>
+                <span>${escapeHtml(reason)}</span>
+              </div>
+            `).join("")}
+          </div>
+          ${plain.warning ? `<div class="plain-warning">${escapeHtml(plain.warning)}</div>` : ""}
+        </div>
+      `;
+    }
+
+    function renderTrendReasons(item) {
+      const reasons = item?.trend_reasons || [];
+      if (!reasons.length) return "";
+      return `
+        <div class="reason-box">
+          <div class="panel-title">为什么 score 会这样变？</div>
+          <div class="reason-list">
+            ${reasons.map((reason) => `
+              <div class="reason-item">
+                <span class="reason-dot"></span>
+                <span>${escapeHtml(reason)}</span>
+              </div>
+            `).join("")}
+          </div>
+        </div>
+      `;
+    }
+
+    function scoreClass(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n) || Math.abs(n) < 0.0005) return "";
+      return n > 0 ? "positive" : "negative";
+    }
+
+    function formatNullable(value, digits = 3) {
+      return value === null || value === undefined ? "-" : fmt(value, digits);
+    }
+
+    function renderSignalDeltaTable(rows) {
+      if (!rows || !rows.length) return "";
+      return `
+        <div class="delta-table">
+          <div class="panel-title" style="margin-bottom: 8px;">信号变化拆解</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>信号</th>
+                  <th>首条</th>
+                  <th>上一条</th>
+                  <th>末条</th>
+                  <th>近期变化</th>
+                  <th>全程变化</th>
+                  <th>权重</th>
+                  <th class="wide">当前解释</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rows.map((row) => `
+                  <tr>
+                    <td>${escapeHtml(row.name || "")}</td>
+                    <td class="${scoreClass(row.first_score)}">${formatNullable(row.first_score)}</td>
+                    <td class="${scoreClass(row.previous_score)}">${formatNullable(row.previous_score)}</td>
+                    <td class="${scoreClass(row.last_score)}">${formatNullable(row.last_score)}</td>
+                    <td class="${scoreClass(row.recent_delta)}">${formatNullable(row.recent_delta)}</td>
+                    <td class="${scoreClass(row.delta)}">${formatNullable(row.delta)}</td>
+                    <td>${formatNullable(row.weight, 3)}</td>
+                    <td class="wide"><div class="micro">${escapeHtml(row.summary || row.reason || "")}</div></td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+          <div class="micro" style="margin-top: 6px;">近期变化=末条-上一条；全程变化=末条-首条。正数拉向上盘，负数拉向下盘。表格按加权变化幅度排序。</div>
+        </div>
+      `;
     }
 
     function renderSignals(signals) {
