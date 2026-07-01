@@ -835,7 +835,7 @@
         half_loss: "半输",
         full_loss: "全输",
         push: "走水",
-        na: "观望",
+        na: "无投注",
         excluded: "排除",
         missing: "缺快照",
         error: "错误"
@@ -910,13 +910,13 @@
         null
       );
       const latestMatch = snapshots[0];
-      const directionCount = snapshots.filter((item) => item.last_result.purchase_side !== "观望").length;
+      const directionCount = snapshots.filter((item) => item.last_result.purchase_side === "上盘" || item.last_result.purchase_side === "下盘").length;
       const avgCompleteness = snapshots.length
         ? Math.round(snapshots.reduce((sum, item) => sum + Number(item.last_result.completeness || 0), 0) / snapshots.length)
         : 0;
       el("snapshotStats").innerHTML = [
         statHtml("快照比赛", `${snapshots.length}`),
-        statHtml("有方向推荐", `${directionCount}`),
+        statHtml("推荐比赛", `${directionCount}`),
         statHtml("平均完整度", `${avgCompleteness}%`),
         statHtml("最近快照", latestSnapshot ? shortTime(latestSnapshot.last_fetched_at) : "-"),
         statHtml("最新开赛", latestMatch ? `${latestMatch.home} vs ${latestMatch.away}` : "-")
@@ -1338,12 +1338,20 @@
     function renderValidateStats() {
       const validation = state.data?.validation;
       const stats = validation?.stats || {};
+      const rolling = stats.rolling || {};
+      const rollingText = (item) => item?.bets ? `${pct(item.roi)} / ${fmt(item.net_profit, 2)}u` : "-";
+      const alerts = Array.isArray(stats.alerts) ? stats.alerts : [];
       el("validateStats").innerHTML = [
         statHtml("有效下注", `${stats.roi_bets || 0}`),
         statHtml("全赢 / 半赢", `${stats.full_win || 0} / ${stats.half_win || 0}`),
         statHtml("半输 / 全输", `${stats.half_loss || 0} / ${stats.full_loss || 0}`),
         statHtml("净收益", stats.roi_bets ? `${fmt(stats.net_profit, 3)}u` : "-"),
         statHtml("ROI", stats.roi === null || stats.roi === undefined ? "-" : pct(stats.roi)),
+        statHtml("近13 ROI", rollingText(rolling.last_13), `${rolling.last_13?.bets || 0} 注`),
+        statHtml("浅盘近13", rollingText(rolling.shallow_last_13), `${rolling.shallow_last_13?.bets || 0} 注`),
+        statHtml("浅盘下盘", rollingText(rolling.shallow_lower_last_13), `${rolling.shallow_lower_last_13?.bets || 0} 注`),
+        statHtml("深盘上盘", rollingText(rolling.deep_upper_last_13), `${rolling.deep_upper_last_13?.bets || 0} 注`),
+        statHtml("风险提示", alerts.length ? alerts[0] : "无近期分组报警"),
         statHtml("排除 / 不足", `${stats.excluded || 0} / ${stats.missing || 0}`)
       ].join("");
       el("validateCount").textContent = `${stats.total || 0} 条`;

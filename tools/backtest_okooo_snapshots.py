@@ -178,10 +178,10 @@ def main() -> int:
         if denom:
             print(
                 f"\n有方向推荐 {denom} 场: 命中 {hit} 未中 {miss} 走水 {push} ；"
-                f"命中率 {hit / denom:.1%}（观望未计入分母）"
+                f"命中率 {hit / denom:.1%}（无投注未计入分母）"
             )
         if na_dir:
-            print(f"观望场次（在比分表内）: {na_dir}")
+            print(f"无投注场次（在比分表内）: {na_dir}")
 
     return 0
 

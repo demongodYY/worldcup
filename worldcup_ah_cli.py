@@ -94,7 +94,7 @@ LEAN_THRESHOLD = 0.05
 PURCHASE_LAYER_MOMENTUM_COEFF = 0.14
 MODEL_DIRECTION_EPSILON = 0.015
 STRONG_THRESHOLD = 0.25
-MODEL_VERSION = "okooo-ah-fair-line-v7-2026-07-01"
+MODEL_VERSION = "okooo-ah-fair-line-v9-2026-07-01"
 
 TOP_BOOKMAKERS = ("PinnacleSports", "Bet365", "Singbet", "IBC", "Ysb88")
 MATCH_LIST_HOT_MODES = (1, None)
@@ -652,7 +652,7 @@ class AnalysisResult:
     def purchase_side(self) -> str:
         if self.recommendation in ("上盘", "下盘"):
             return self.recommendation
-        return "观望"
+        return recommendation_from_score(self.score)
 
     @property
     def purchase_team(self) -> str:
@@ -660,7 +660,7 @@ class AnalysisResult:
             return self.upper_team
         if self.purchase_side == "下盘":
             return self.lower_team
-        return ""
+        return self.lean_team
 
     @property
     def purchase_raw_price(self) -> float | None:
@@ -1954,6 +1954,13 @@ class Predictor:
             )
             if shallow_trap_note:
                 warnings.append(shallow_trap_note)
+            weighted_score, shallow_value_note = shallow_antihot_value_confirmation_guard(
+                match,
+                weighted_score,
+                decision_signals_for_source(match, adjusted_signals),
+            )
+            if shallow_value_note:
+                warnings.append(shallow_value_note)
 
         completeness = int(round(100 * available_weight / (1 - WEIGHTS["data_quality"])))
         completeness = clamp_int(completeness, 0, 100)
@@ -5016,8 +5023,8 @@ def okooo_missing_live_asian_model_cap(
     if abs(capped - weighted_score) < 1e-9:
         return weighted_score, None
     if direction_against_heat:
-        return capped, "缺少真实亚盘公司行，反热度模型方向封顶为观望"
-    return capped, "缺少真实亚盘公司行，弱模型方向封顶为观望"
+        return capped, "缺少真实亚盘公司行，反热度模型方向封顶为轻微"
+    return capped, "缺少真实亚盘公司行，弱模型方向封顶为轻微"
 
 
 def deep_favorite_retracement_guard(
@@ -5402,7 +5409,7 @@ def model_upper_trap_score_adjustment(
             return adjusted, f"模型层热门陷阱回撤 {guarded_shift:.3f}（亚盘为静态均水兜底，缺少直接下盘确认）"
         return weighted_score, None
 
-    # 强热且快照冲突，但缺少欧赔/盘口/合理线等直接下盘确认时，模型只降到观望。
+    # 强热且快照冲突，但缺少欧赔/盘口/合理线等直接下盘确认时，模型只降到轻微方向。
     if (
         snapshot
         and snapshot.available
@@ -5414,7 +5421,7 @@ def model_upper_trap_score_adjustment(
     ):
         adjusted = min(weighted_score, LEAN_THRESHOLD - 0.005)
         if adjusted < weighted_score:
-            return adjusted, "模型层热门陷阱：静态强热与快照冲突但缺少直接下盘确认，降至观望"
+            return adjusted, "模型层热门陷阱：静态强热与快照冲突但缺少直接下盘确认，降至轻微方向"
         return weighted_score, None
 
     shift = pressure * (0.86 if lower_confirmations >= 2 else 0.68) + 0.035
@@ -5543,6 +5550,127 @@ def shallow_hot_favorite_trap_score_adjustment(
     )
 
 
+def shallow_antihot_value_confirmation_guard(
+    match: Match,
+    weighted_score: float,
+    signals: list[Signal],
+) -> tuple[float, str | None]:
+    """Separate shallow favorite risk from real lower-side value.
+
+    In a shallow/quarter-ball market, a hot upper side can be dangerous, but
+    "upper risk" is not automatically "lower value".  The model is allowed to
+    keep or turn lower only when lower-side value is confirmed by several
+    independent channels; if the latest trade/snapshot flow is already
+    recovering toward the hot upper side, the output is pulled back to a light
+    upper lean instead of treating the risk cluster as a strong lower pick.
+    """
+    if match.raw.get("_source") != "okooo":
+        return weighted_score, None
+    if weighted_score >= -LEAN_THRESHOLD:
+        return weighted_score, None
+    if line_depth(match.asian_line) > 0.5:
+        return weighted_score, None
+
+    lookup = {signal.name: signal for signal in signals}
+    upper_team, lower_team = upper_lower_teams(match)
+    heat_edge = score_bifa_heat_edge(match, upper_team, lower_team)
+    if heat_edge < 0.25:
+        return weighted_score, None
+    if weighted_score * heat_edge >= 0:
+        return weighted_score, None
+
+    handicap = lookup.get("亚盘水位")
+    bookmaker = lookup.get("公司一致性")
+    trade = lookup.get("必发成交走势")
+    euro = lookup.get("欧赔/Kelly")
+    market = lookup.get("市场平衡/背离")
+    fair_line = lookup.get("盘口合理性")
+    cover_risk = lookup.get("赢盘门槛风险")
+    snapshot = lookup.get("快照趋势")
+    market_elasticity = lookup.get("资金/盘口弹性")
+    score_momentum = lookup.get("临场score变化")
+
+    lower_confirmations: list[str] = []
+    if signal_value(handicap) <= -0.22 and not (
+        handicap and "静态亚盘均值兜底" in handicap.reason
+    ):
+        lower_confirmations.append("亚盘水位")
+    if signal_value(bookmaker) <= -0.16:
+        lower_confirmations.append("公司一致性")
+    if signal_value(euro) <= -0.12:
+        lower_confirmations.append("欧赔/Kelly")
+    if signal_value(trade) <= -0.12:
+        lower_confirmations.append("成交走势")
+    if signal_value(fair_line) <= -0.08:
+        lower_confirmations.append("公平盘口")
+    if signal_value(market_elasticity) <= -0.12:
+        lower_confirmations.append("资金/盘口弹性")
+    if snapshot and snapshot.available and signal_value(snapshot) <= -0.18:
+        lower_confirmations.append("快照趋势")
+
+    upper_recovery: list[str] = []
+    if signal_value(trade) >= 0.08:
+        upper_recovery.append("成交走势回到上盘")
+    if signal_value(euro) >= 0.12:
+        upper_recovery.append("欧赔/Kelly回到上盘")
+    if signal_value(snapshot) >= 0.10:
+        upper_recovery.append("快照最近回到上盘")
+    if signal_value(score_momentum) >= 0.25:
+        upper_recovery.append("临场score回升")
+    if signal_value(market_elasticity) >= 0.08:
+        upper_recovery.append("资金后盘口响应偏上")
+
+    handicap_reason = handicap.reason if handicap else ""
+    extreme_company_strong = "公司强确认" in handicap_reason
+    extreme_company_match = re.search(r"公司极值后回撤同向\s+(\d+)/(\d+)", handicap_reason)
+    if extreme_company_match:
+        same = int(extreme_company_match.group(1))
+        total = max(int(extreme_company_match.group(2)), 1)
+        if total >= 8 and same / total >= 0.65:
+            extreme_company_strong = True
+    retracement_company_confirmed = (
+        "高点回撤" in handicap_reason
+        and extreme_company_strong
+        and (
+            signal_value(market_elasticity) <= 0.02
+            or signal_value(market) <= -0.08
+            or signal_value(handicap) <= -0.45
+        )
+    )
+    if retracement_company_confirmed:
+        return weighted_score, None
+
+    # Very coherent lower clusters are allowed to stand.  Otherwise, shallow
+    # anti-hot is only a risk warning; it should not dominate a two-way market.
+    strong_lower_cluster = (
+        len(lower_confirmations) >= 3
+        and not upper_recovery
+        and signal_value(market) <= -0.35
+        and signal_value(cover_risk) <= 0.02
+    )
+    if strong_lower_cluster:
+        return weighted_score, None
+
+    if len(lower_confirmations) >= 4 and not upper_recovery:
+        return weighted_score, None
+    if len(lower_confirmations) >= 2 and not upper_recovery:
+        return weighted_score, None
+
+    adjusted = max(weighted_score, MODEL_DIRECTION_EPSILON)
+    if adjusted <= weighted_score + 1e-9:
+        return weighted_score, None
+
+    lower_text = "、".join(lower_confirmations[:4]) if lower_confirmations else "直接下盘确认不足"
+    recovery_text = "、".join(upper_recovery[:3]) if upper_recovery else "缺少多通道下盘确认"
+    return (
+        adjusted,
+        (
+            f"浅盘反热门价值确认保护：{upper_team}是热门，但{lower_team}下盘确认不足"
+            f"（{lower_text}；{recovery_text}），从下盘风险分回拉为轻微上盘"
+        ),
+    )
+
+
 def deep_favorite_live_recovery_applies(
     match: Match,
     last_score: float,
@@ -5650,10 +5778,9 @@ def score_strength_label(score: float) -> str:
 
 def model_decision_reason(weighted_score: float, recommendation: str, available_weight: float) -> str:
     strength = score_strength_label(weighted_score)
-    if recommendation == "观望":
-        reason = f"模型综合分 {weighted_score:+.3f}，方向不足 {MODEL_DIRECTION_EPSILON:.3f}，观望"
-    else:
-        reason = f"模型综合分 {weighted_score:+.3f}，直接推荐{recommendation}，强度{strength}"
+    if recommendation not in ("上盘", "下盘"):
+        recommendation = recommendation_from_score(weighted_score)
+    reason = f"模型综合分 {weighted_score:+.3f}，直接推荐{recommendation}，强度{strength}"
     if available_weight < 0.50:
         reason += "；可用信号偏少，置信度已按数据完整度压低"
     reason += "；未再叠加购买门槛"
@@ -5721,7 +5848,7 @@ def current_score_momentum_signal(current_score: float, snapshot_context: Snapsh
     return Signal("临场score变化", momentum, 0.0, True, reason)
 
 
-# 模型为「观望」时，购买层若仍给方向，需欧赔/Kelly 与亚盘同向且购买分足够，避免弱噪声买错边
+# 模型只有轻微方向时，购买层若增强方向，需欧赔/Kelly 与亚盘同向且购买分足够，避免弱噪声买错边
 MODEL_WAIT_PURCHASE_ABS_FLOOR = 0.14
 MODEL_WAIT_CORE_SCORE_THRESH = 0.06
 MODEL_WAIT_SINGLE_CORE_ABS_FLOOR = 0.18
@@ -5915,17 +6042,20 @@ def purchase_decision_from_signals(
     depth = line_depth(match.asian_line)
 
     if available_weight < 0.50 and not snapshot_stop_lift:
-        reasons.append("可用信号不足，观望不买")
+        reasons.append("可用信号不足，方向仅按轻微分级输出")
+        side = recommendation_from_score(adjusted_score)
+        if abs(adjusted_score) < MODEL_DIRECTION_EPSILON:
+            adjusted_score = MODEL_DIRECTION_EPSILON if side == "上盘" else -MODEL_DIRECTION_EPSILON
         confidence = purchase_confidence_from_score(
             purchase_score=adjusted_score,
             completeness=completeness,
             available_weight=available_weight,
             model_recommendation=model_recommendation,
-            final_side="观望",
+            final_side=side,
             raw_score=weighted_score,
         )
         return PurchaseDecision(
-            side="观望",
+            side=side,
             score=adjusted_score,
             confidence=confidence,
             reason="；".join(reasons),
@@ -5935,7 +6065,7 @@ def purchase_decision_from_signals(
     if available_weight < 0.50 and snapshot_stop_lift:
         reasons.append("临场停更且可用权重偏低；继续应用购买门控（快照趋势已参与加权）")
 
-    secondary_enabled = abs(weighted_score) < 0.15 or model_recommendation == "观望"
+    secondary_enabled = abs(weighted_score) < 0.15 or model_recommendation not in ("上盘", "下盘")
     if secondary_enabled:
         reasons.append("原始优势较弱，启用购买门控")
 
@@ -6207,13 +6337,14 @@ def purchase_decision_from_signals(
     adjusted_score = clamp(adjusted_score, -1, 1)
     reference_side = reference_side_from_model(weighted_score, model_recommendation)
     if reference_side == "无明显倾向" and abs(adjusted_score) < 0.06:
-        side = "观望"
-        reasons.append("方向和购买优势都不足，观望不买")
+        side = recommendation_from_score(adjusted_score)
+        adjusted_score = MODEL_DIRECTION_EPSILON if side == "上盘" else -MODEL_DIRECTION_EPSILON
+        reasons.append("方向和购买优势都不足，仅输出轻微方向")
     else:
         side = "上盘" if adjusted_score > 0 else "下盘"
     if side in ("上盘", "下盘") and abs(adjusted_score) < 0.06:
-        reasons.append("购买优势过低，观望不买")
-        side = "观望"
+        reasons.append("购买优势过低，降为轻微方向")
+        adjusted_score = MODEL_DIRECTION_EPSILON if side == "上盘" else -MODEL_DIRECTION_EPSILON
 
     fallback_or_missing_asian = bool(
         (handicap and "静态亚盘均值兜底" in handicap.reason)
@@ -6226,18 +6357,18 @@ def purchase_decision_from_signals(
         and deep_asian_lower_count < 2
         and fallback_or_missing_asian
         and (
-            model_recommendation == "观望"
+            model_recommendation not in ("上盘", "下盘")
             or abs(weighted_score) < 0.16
             or signal_value(euro_kelly) >= 0.10
             or signal_value(bifa) >= 0.25
         )
     ):
-        reasons.append("下盘缺少真实亚盘/公司确认，风险信号只降级观望")
-        side = "观望"
+        reasons.append("下盘缺少真实亚盘/公司确认，风险信号只降为轻微下盘")
+        adjusted_score = -MODEL_DIRECTION_EPSILON
 
     if side == "上盘" and okooo_deep_cover_block and adjusted_score < 0.18:
-        reasons.append("深盘亚盘/公司未确认打穿，剩余上盘优势不足，观望不买")
-        side = "观望"
+        reasons.append("深盘亚盘/公司未确认打穿，剩余上盘优势不足，降为轻微上盘")
+        adjusted_score = MODEL_DIRECTION_EPSILON
 
     # 整数一球盘：上盘净胜 1 常为走水；综合分未拉开且赢盘门槛/平局风险已明显预警时，不强吃上盘。
     lv_one = line_value(match.asian_line)
@@ -6252,26 +6383,25 @@ def purchase_decision_from_signals(
         and draw_risk.score <= -0.12
         and weighted_score < 0.22
     ):
-        side = "观望"
-        reasons.append("整数一球盘：走水/净胜边界与门槛及平局风险叠加，不强吃上盘")
+        adjusted_score = MODEL_DIRECTION_EPSILON
+        reasons.append("整数一球盘：走水/净胜边界与门槛及平局风险叠加，只保留轻微上盘")
 
     if (
-        model_recommendation == "观望"
+        model_recommendation not in ("上盘", "下盘")
         and side in ("上盘", "下盘")
         and not purchase_core_signals_confirm_when_model_wait(match, lookup, side == "上盘", abs(adjusted_score))
     ):
-        reasons.append("模型观望且欧赔/Kelly与亚盘未同向确认或购买优势不足，不买")
-        side = "观望"
+        reasons.append("模型只有轻微方向，欧赔/Kelly与亚盘未同向增强；保持轻微")
+        adjusted_score = MODEL_DIRECTION_EPSILON if side == "上盘" else -MODEL_DIRECTION_EPSILON
 
     attempted_reverse = (
         reference_side in ("上盘", "下盘")
         and side != reference_side
-        and side != "观望"
         and abs(weighted_score) >= LEAN_THRESHOLD
     )
     model_wait_reverse_confirmed = (
         attempted_reverse
-        and model_recommendation == "观望"
+        and model_recommendation not in ("上盘", "下盘")
         and purchase_core_signals_confirm_when_model_wait(match, lookup, side == "上盘", abs(adjusted_score))
     )
     model_direction_reverse_confirmed = (
@@ -6280,17 +6410,19 @@ def purchase_decision_from_signals(
         and purchase_core_signals_confirm_when_model_wait(match, lookup, side == "上盘", abs(adjusted_score))
     )
     if attempted_reverse and (
-        (model_recommendation == "观望" and not model_wait_reverse_confirmed)
+        (model_recommendation not in ("上盘", "下盘") and not model_wait_reverse_confirmed)
         or (model_recommendation in ("上盘", "下盘") and not model_direction_reverse_confirmed)
         or abs(adjusted_score) < 0.10
         or (completeness < 60 and not snapshot_stop_lift)
     ):
-        reasons.append(f"二次门控尝试由{reference_side}反向到{side}，但核心确认或置信不足，观望不买")
-        side = "观望"
+        reasons.append(f"二次门控尝试由{reference_side}反向到{side}，但核心确认或置信不足，保留原轻微方向")
+        side = reference_side
+        adjusted_score = MODEL_DIRECTION_EPSILON if side == "上盘" else -MODEL_DIRECTION_EPSILON
+        attempted_reverse = False
     elif attempted_reverse:
         reasons.append(f"最终购买方向由{reference_side}反向到{side}")
-    elif model_recommendation == "观望" and side in ("上盘", "下盘"):
-        reasons.append(f"模型阈值为观望，低优势选择{side}")
+    elif model_recommendation not in ("上盘", "下盘") and side in ("上盘", "下盘"):
+        reasons.append(f"模型只有轻微方向，低优势选择{side}")
     else:
         reasons.append(f"最终购买方向保持{side}")
 
@@ -6347,23 +6479,13 @@ def purchase_confidence_from_score(
     if confidence_completeness_floor is not None:
         eff_completeness = max(eff_completeness, confidence_completeness_floor)
     eff_completeness = clamp_int(eff_completeness, 0, 100)
-    if final_side == "观望":
-        base = 28 + min(abs(raw_score), 0.35) * 55
-        if abs(purchase_score) < 0.08:
-            base -= 4
-        if cap_weight < 0.25:
-            base = min(base, 22)
-        elif cap_weight < 0.50:
-            base = min(base, 32)
-        elif cap_weight < 0.65:
-            base = min(base, 45)
-        quality_factor = 0.50 + 0.50 * (eff_completeness / 100)
-        return clamp_int(int(base * quality_factor), 0, 55)
+    if final_side not in ("上盘", "下盘"):
+        final_side = recommendation_from_score(purchase_score)
     strength = min(abs(purchase_score), 0.70)
     base = 32 + strength * 72
     if model_recommendation == final_side:
         base += 8
-    elif model_recommendation == "观望":
+    elif model_recommendation not in ("上盘", "下盘"):
         base -= 4
     else:
         base -= 8
@@ -6380,8 +6502,8 @@ def purchase_confidence_from_score(
 
 
 def confidence_from_score(score: float, completeness: int, recommendation: str) -> int:
-    if recommendation == "观望":
-        return clamp_int(int((28 + abs(score) * 40) * completeness / 100), 0, 55)
+    if recommendation not in ("上盘", "下盘"):
+        recommendation = recommendation_from_score(score)
     return clamp_int(int((42 + abs(score) * 53) * completeness / 100), 1, 95)
 
 
@@ -6450,8 +6572,6 @@ def print_analysis(result: AnalysisResult, verbose: bool = False) -> None:
 
 
 def purchase_display_text(result: AnalysisResult) -> str:
-    if result.purchase_side == "观望":
-        return "观望(无明显倾向)"
     return f"{result.purchase_side}({result.strength}:{result.purchase_team})"
 
 

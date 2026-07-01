@@ -94,7 +94,7 @@ class OkoooDashboardTests(unittest.TestCase):
         self.assertEqual(event["last_result"]["score"], round(median(point["score"] for point in event["series"]), 4))
         self.assertEqual(event["last_result"]["snapshot_median_count"], 2)
         self.assertEqual(event["last_result"]["snapshot_median_total_count"], 2)
-        self.assertIn(event["last_result"]["purchase_side"], {"上盘", "下盘", "观望"})
+        self.assertIn(event["last_result"]["purchase_side"], {"上盘", "下盘"})
         self.assertIn("headline", event["plain_explanation"])
         self.assertGreaterEqual(len(event["plain_explanation"]["bullets"]), 1)
         self.assertGreaterEqual(len(event["trend_reasons"]), 1)

@@ -127,8 +127,12 @@ def infer_strength(score: Any, explicit: Any = None) -> str:
 
 def normalize_result_dict(result: dict[str, Any]) -> dict[str, Any]:
     score = as_float(result.get("score"))
-    recommendation = str(result.get("recommendation") or result.get("purchase_side") or "观望")
-    purchase_side = str(result.get("purchase_side") or (recommendation if recommendation in ("上盘", "下盘") else "观望"))
+    recommendation = str(result.get("recommendation") or result.get("purchase_side") or "")
+    if recommendation not in ("上盘", "下盘"):
+        recommendation = "上盘" if score >= 0 else "下盘"
+    purchase_side = str(result.get("purchase_side") or recommendation)
+    if purchase_side not in ("上盘", "下盘"):
+        purchase_side = recommendation
     purchase_team = str(result.get("purchase_team") or "")
     if not purchase_team:
         if purchase_side == "上盘":
@@ -330,7 +334,9 @@ PLAIN_SIGNAL_NAMES = {
 
 
 def _plain_side_label(side: Any, result: dict[str, Any]) -> str:
-    side_text = str(side or "观望")
+    side_text = str(side or "")
+    if side_text not in ("上盘", "下盘"):
+        side_text = "上盘" if as_float(result.get("score")) >= 0 else "下盘"
     if side_text == "上盘":
         team = result.get("upper_team") or result.get("purchase_team") or ""
     elif side_text == "下盘":
@@ -542,12 +548,12 @@ def plain_trend_explanation(
     previous_score = snapshot_metrics(records[-2])["score"] if len(records) >= 2 else first_score
     last_score = snapshot_metrics(records[-1])["score"]
     recent_score_delta = last_score - previous_score
-    side = result.get("purchase_side") or result.get("recommendation") or "观望"
+    side = result.get("purchase_side") or result.get("recommendation") or ("上盘" if last_score >= 0 else "下盘")
     side_label = _plain_side_label(side, result)
     score = as_float(result.get("score"), last_score)
     strength = result.get("strength") or infer_strength(score)
-    if side == "观望" or abs(score) < 0.015:
-        headline = "这场暂时没有清晰方向，先当观望处理。"
+    if abs(score) < 0.015:
+        headline = f"这场现在只是轻微偏{side_label}，分差很小；重点看盘口/水位、欧赔和成交后面有没有一起确认。"
     else:
         headline = f"这场现在偏{side_label}，强度是{strength}；重点看盘口/水位、欧赔和成交有没有一起确认。"
 
@@ -621,7 +627,7 @@ def trend_reason_lines(
     previous_score = snapshot_metrics(records[-2])["score"] if len(records) >= 2 else first_score
     last_score = snapshot_metrics(records[-1])["score"]
     recent_score_delta = last_score - previous_score
-    side = result.get("purchase_side") or result.get("recommendation") or "观望"
+    side = result.get("purchase_side") or result.get("recommendation") or ("上盘" if last_score >= 0 else "下盘")
     team = result.get("purchase_team") or ""
     lines = [
         (
@@ -837,7 +843,99 @@ def summarize_validate_stats(records: list[dict[str, Any]]) -> dict[str, Any]:
     stats["miss"] = stats["half_loss"] + stats["full_loss"]
     stats["accuracy"] = stats["positive_rate"]
     stats["total"] = len(records)
+    stats["rolling"] = validate_rolling_summaries(records)
+    stats["alerts"] = validate_rolling_alerts(stats["rolling"])
     return stats
+
+
+def validate_record_is_bet(record: dict[str, Any]) -> bool:
+    return (
+        record.get("status") == "ok"
+        and record.get("profit") is not None
+        and record.get("outcome") not in ("missing", "excluded", "error", "na")
+    )
+
+
+def validate_roi_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    usable = [record for record in records if validate_record_is_bet(record)]
+    net_profit = sum(as_float(record.get("profit")) for record in usable)
+    outcomes: dict[str, int] = {
+        "full_win": 0,
+        "half_win": 0,
+        "push": 0,
+        "half_loss": 0,
+        "full_loss": 0,
+    }
+    for record in usable:
+        outcome = str(record.get("outcome") or "")
+        if outcome in outcomes:
+            outcomes[outcome] += 1
+    bets = len(usable)
+    return {
+        "bets": bets,
+        "net_profit": round(net_profit, 4),
+        "roi": round(net_profit / bets, 4) if bets else None,
+        **outcomes,
+    }
+
+
+def validate_depth_bucket(record: dict[str, Any]) -> str:
+    depth = abs(line_value(str(record.get("asian_line") or "0")))
+    if depth <= 0.5:
+        return "shallow"
+    if depth < 1.25:
+        return "mid"
+    return "deep"
+
+
+def validate_rolling_summaries(records: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(
+        [record for record in records if validate_record_is_bet(record)],
+        key=validate_record_sort_key,
+    )
+    last_7 = ordered[-7:]
+    last_13 = ordered[-13:]
+    shallow_last_13 = [record for record in last_13 if validate_depth_bucket(record) == "shallow"]
+    shallow_lower_last_13 = [
+        record
+        for record in shallow_last_13
+        if str(record.get("recommendation") or record.get("purchase_side") or "") == "下盘"
+    ]
+    deep_upper_last_13 = [
+        record
+        for record in last_13
+        if validate_depth_bucket(record) == "deep"
+        and str(record.get("recommendation") or record.get("purchase_side") or "") == "上盘"
+    ]
+    return {
+        "last_7": validate_roi_summary(last_7),
+        "last_13": validate_roi_summary(last_13),
+        "shallow_last_13": validate_roi_summary(shallow_last_13),
+        "shallow_lower_last_13": validate_roi_summary(shallow_lower_last_13),
+        "deep_upper_last_13": validate_roi_summary(deep_upper_last_13),
+    }
+
+
+def validate_rolling_alerts(rolling: dict[str, Any]) -> list[str]:
+    alerts: list[str] = []
+    last_13 = rolling.get("last_13") if isinstance(rolling.get("last_13"), dict) else {}
+    shallow_lower = (
+        rolling.get("shallow_lower_last_13")
+        if isinstance(rolling.get("shallow_lower_last_13"), dict)
+        else {}
+    )
+    deep_upper = (
+        rolling.get("deep_upper_last_13")
+        if isinstance(rolling.get("deep_upper_last_13"), dict)
+        else {}
+    )
+    if as_int(last_13.get("bets")) >= 8 and as_float(last_13.get("roi")) < 0:
+        alerts.append("近13注 ROI 为负，近期样本可能失效，先看分盘口表现")
+    if as_int(shallow_lower.get("bets")) >= 3 and as_float(shallow_lower.get("roi")) < 0:
+        alerts.append("浅盘下盘近期为负，需确认不是把热门风险误当下盘价值")
+    if as_int(deep_upper.get("bets")) >= 3 and as_float(deep_upper.get("roi")) < 0:
+        alerts.append("深盘上盘近期为负，需区分胜负确认和打穿确认")
+    return alerts
 
 
 def validate_record_sort_key(record: dict[str, Any]) -> tuple[str, int]:

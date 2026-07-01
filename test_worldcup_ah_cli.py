@@ -44,6 +44,7 @@ from worldcup_ah_cli import (
     deep_favorite_live_recovery_aggregate_score,
     deep_favorite_live_recovery_applies,
     shallow_hot_favorite_trap_score_adjustment,
+    shallow_antihot_value_confirmation_guard,
     shallow_hot_trap_applies,
     purchase_decision_from_signals,
     purchase_display_text,
@@ -1154,7 +1155,7 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertIn("strength", data)
         self.assertIn("summary", data["signals"][0])
         self.assertIn("总结", data["signals"][0]["summary"])
-        self.assertIn(result.purchase_side, {"上盘", "下盘", "观望"})
+        self.assertIn(result.purchase_side, {"上盘", "下盘"})
 
     def test_signal_summary_explains_direction_without_mixing_risk_signals(self):
         trade_summary = signal_summary_text(
@@ -1177,7 +1178,7 @@ class WorldCupAhCliTests(unittest.TestCase):
         match = sample_match()
         result = AnalysisResult(
             match=match,
-            recommendation="观望",
+            recommendation="上盘",
             score=0.01,
             confidence=10,
             completeness=80,
@@ -1206,11 +1207,11 @@ class WorldCupAhCliTests(unittest.TestCase):
 
         self.assertEqual(purchase_display_text(result), "下盘(轻微:客队)")
 
-    def test_purchase_display_keeps_watch_separate_from_lean(self):
+    def test_purchase_display_uses_light_binary_direction(self):
         match = sample_match()
         result = AnalysisResult(
             match=match,
-            recommendation="观望",
+            recommendation="无方向",
             score=0.08,
             confidence=28,
             completeness=90,
@@ -1221,9 +1222,9 @@ class WorldCupAhCliTests(unittest.TestCase):
             purchase_score=-0.04,
         )
 
-        self.assertEqual(purchase_display_text(result), "观望(无明显倾向)")
-        self.assertEqual(result.purchase_side, "观望")
-        self.assertEqual(result.purchase_team, "")
+        self.assertEqual(purchase_display_text(result), "上盘(轻微:主队)")
+        self.assertEqual(result.purchase_side, "上盘")
+        self.assertEqual(result.purchase_team, "主队")
 
     def test_purchase_gate_does_not_force_reverse_against_strong_consensus(self):
         match = sample_match(asian_line="-1")
@@ -1232,7 +1233,7 @@ class WorldCupAhCliTests(unittest.TestCase):
             weighted_score=0.12,
             completeness=90,
             available_weight=0.80,
-            model_recommendation="观望",
+            model_recommendation="无方向",
             signals=[
                 Signal("赢盘门槛风险", -0.60, 0.05, True, "风险高"),
                 Signal("亚盘水位", 0.52, 0.13, True, "上盘降水"),
@@ -1297,7 +1298,7 @@ class WorldCupAhCliTests(unittest.TestCase):
             weighted_score=0.04,
             completeness=88,
             available_weight=0.84,
-            model_recommendation="观望",
+            model_recommendation="无方向",
             signals=[
                 Signal("快照趋势", 0.70, 0.06, True, "历史快照偏上盘"),
                 Signal("临场score变化", -0.85, 0.0, True, "本轮跌破下盘阈值"),
@@ -1309,7 +1310,7 @@ class WorldCupAhCliTests(unittest.TestCase):
         self.assertIn("快照修正降权", decision.reason)
 
     def test_stop_update_with_snapshots_skips_low_weight_gate(self):
-        """When SPDEX stops live updates but snapshot trend is available, do not short-circuit to 观望 solely for low weight."""
+        """When SPDEX stops live updates but snapshot trend is available, do not short-circuit solely for low weight."""
         match = sample_match(is_stop_update=True)
         decision = purchase_decision_from_signals(
             match=match,
@@ -1326,18 +1327,18 @@ class WorldCupAhCliTests(unittest.TestCase):
             ],
         )
         self.assertIn("临场停更且可用权重偏低", decision.reason)
-        self.assertNotIn("可用信号不足，观望不买", decision.reason)
+        self.assertNotIn("可用信号不足，方向仅按轻微分级输出", decision.reason)
         self.assertIn(decision.side, ("上盘", "下盘"))
         self.assertGreaterEqual(decision.confidence, 38)
 
-    def test_low_confidence_reverse_becomes_watch(self):
+    def test_low_confidence_reverse_keeps_light_original_side(self):
         match = sample_match(asian_line="-0.75")
         decision = purchase_decision_from_signals(
             match=match,
             weighted_score=0.07,
             completeness=88,
             available_weight=0.80,
-            model_recommendation="观望",
+            model_recommendation="无方向",
             signals=[
                 Signal("赢盘门槛风险", -0.70, 0.05, True, "风险高"),
                 Signal("亚盘水位", -0.40, 0.13, True, "上盘升水"),
@@ -1346,12 +1347,9 @@ class WorldCupAhCliTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(decision.side, "观望")
+        self.assertEqual(decision.side, "上盘")
         self.assertFalse(decision.is_reversed)
-        self.assertRegex(
-            decision.reason,
-            r"(观望不买|未同向确认或购买优势不足|方向和购买优势都不足)",
-        )
+        self.assertIn("保留原轻微方向", decision.reason)
 
     def test_near_zero_purchase_score_does_not_default_to_lower(self):
         decision = purchase_decision_from_signals(
@@ -1359,12 +1357,12 @@ class WorldCupAhCliTests(unittest.TestCase):
             weighted_score=0.01,
             completeness=90,
             available_weight=0.80,
-            model_recommendation="观望",
+            model_recommendation="无方向",
             signals=[],
         )
 
-        self.assertEqual(decision.side, "观望")
-        self.assertIn("方向和购买优势都不足", decision.reason)
+        self.assertEqual(decision.side, "上盘")
+        self.assertIn("仅输出轻微方向", decision.reason)
 
     def test_model_wait_can_buy_upper_with_multi_source_confirmation(self):
         decision = purchase_decision_from_signals(
@@ -1372,7 +1370,7 @@ class WorldCupAhCliTests(unittest.TestCase):
             weighted_score=0.058,
             completeness=92,
             available_weight=0.87,
-            model_recommendation="观望",
+            model_recommendation="无方向",
             signals=[
                 Signal("亚盘水位", -0.01, 0.13, True, "静态亚盘均值兜底，已降权"),
                 Signal("欧赔/Kelly", 0.55, 0.07, True, "欧赔强确认上盘"),
@@ -1790,7 +1788,7 @@ class WorldCupAhCliTests(unittest.TestCase):
             weighted_score=-0.005,
             completeness=100,
             available_weight=0.95,
-            model_recommendation="观望",
+            model_recommendation="无方向",
             signals=[
                 Signal("资金/盘口弹性", 0.42, 0.05, True, "热门方降水"),
                 Signal("必发成交走势", -0.33, 0.08, True, "成交反向"),
@@ -2011,7 +2009,7 @@ class WorldCupAhCliTests(unittest.TestCase):
             weighted_score=-0.115,
             completeness=78,
             available_weight=0.74,
-            model_recommendation="观望",
+            model_recommendation="无方向",
             signals=[
                 Signal("必发指数", 0.762, 0.16, True, "强热"),
                 Signal("必发成交走势", 0.0, 0.08, False, "近1小时成交走势不足"),
@@ -2028,8 +2026,8 @@ class WorldCupAhCliTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(decision.side, "观望")
-        self.assertIn("模型观望", decision.reason)
+        self.assertEqual(decision.side, "下盘")
+        self.assertIn("保持轻微", decision.reason)
 
     def test_shallow_hot_trap_score_adjustment_pulls_weak_upper_negative(self):
         raw = {
@@ -2091,6 +2089,78 @@ class WorldCupAhCliTests(unittest.TestCase):
         rec, score, _notes = guarded_median_snapshot_recommendation(match, 0.029, 0.040, signals)
         self.assertEqual(rec, "上盘")
         self.assertAlmostEqual(score, 0.029)
+
+    def test_shallow_antihot_guard_pulls_weak_lower_to_light_upper(self):
+        match = sample_match(
+            asian_line="-0.25",
+            raw={
+                "_source": "okooo",
+                "BfIndexHome": 56.0,
+                "BfIndexAway": 12.0,
+                "BfIndexDraw": 32.0,
+                "BfAmountHome": 3_000_000.0,
+                "BfAmountAway": 600_000.0,
+                "BfAmountDraw": 1_700_000.0,
+                "BfPayoutHome": -1_000_000.0,
+                "BfPayoutAway": 2_000_000.0,
+                "BfPayoutDraw": 2_500_000.0,
+                "BfOddsHome": 2.20,
+                "BfOddsAway": 4.50,
+                "BfOddsDraw": 3.50,
+            },
+        )
+        adjusted, note = shallow_antihot_value_confirmation_guard(
+            match,
+            -0.16,
+            [
+                Signal("亚盘水位", -0.18, 0.50, True, "弱退盘，公司极值后回撤同向 3/13"),
+                Signal("公司一致性", -0.10, 0.0, True, "分歧"),
+                Signal("必发成交走势", 0.12, 0.135, True, "成交回上盘"),
+                Signal("欧赔/Kelly", 0.15, 0.085, True, "欧赔回上盘"),
+                Signal("市场平衡/背离", -0.25, 0.065, True, "热门风险"),
+                Signal("快照趋势", -0.10, 0.04, True, "弱下盘"),
+                Signal("资金/盘口弹性", 0.09, 0.065, True, "盘口响应偏上"),
+            ],
+        )
+
+        self.assertGreater(adjusted, 0)
+        self.assertIn("浅盘反热门价值确认保护", note)
+
+    def test_shallow_antihot_guard_keeps_confirmed_retracement_lower(self):
+        match = sample_match(
+            asian_line="-0.25",
+            raw={
+                "_source": "okooo",
+                "BfIndexHome": 60.0,
+                "BfIndexAway": 10.0,
+                "BfIndexDraw": 30.0,
+                "BfAmountHome": 4_000_000.0,
+                "BfAmountAway": 500_000.0,
+                "BfAmountDraw": 1_500_000.0,
+            },
+        )
+        adjusted, note = shallow_antihot_value_confirmation_guard(
+            match,
+            -0.24,
+            [
+                Signal(
+                    "亚盘水位",
+                    -0.52,
+                    0.50,
+                    True,
+                    "高点回撤 T-115 +0.716->当前 +0.480；公司极值后回撤同向 12/13，公司强确认",
+                ),
+                Signal("公司一致性", -0.20, 0.0, True, "强确认"),
+                Signal("必发成交走势", 0.10, 0.135, True, "成交回上盘"),
+                Signal("欧赔/Kelly", 0.20, 0.085, True, "欧赔回上盘"),
+                Signal("市场平衡/背离", -0.20, 0.065, True, "盘口确认回撤"),
+                Signal("快照趋势", -0.30, 0.04, True, "快照下盘"),
+                Signal("资金/盘口弹性", -0.04, 0.065, True, "响应偏下"),
+            ],
+        )
+
+        self.assertEqual(adjusted, -0.24)
+        self.assertIsNone(note)
 
     def test_deep_favorite_live_recovery_invalidates_stale_lower_median(self):
         raw = {

@@ -51,6 +51,7 @@ from worldcup_ah_cli import (
     EuroTrendPoint,
     HandicapRow,
     Match,
+    MODEL_DIRECTION_EPSILON,
     MODEL_VERSION,
     OkoooSnapshotReplayClient,
     Predictor,
@@ -500,6 +501,21 @@ def median_snapshot_prediction_dict(
             last_score,
             last_signals,
         )
+        last_warnings = last.get("warnings") if isinstance(last.get("warnings"), list) else []
+        shallow_value_guarded_last = any(
+            "浅盘反热门价值确认保护" in str(warning) for warning in last_warnings
+        )
+        if (
+            shallow_value_guarded_last
+            and last_score > 0
+            and guarded_score < 0
+            and line_depth(match.asian_line) <= 0.5
+        ):
+            guarded_score = max(guarded_score, MODEL_DIRECTION_EPSILON)
+            recommendation = _recommendation_from_median_score(guarded_score)
+            guard_notes.append(
+                "最后快照触发浅盘反热门价值确认保护，中位数跟随临场确认回拉为轻微上盘"
+            )
     else:
         recommendation = _recommendation_from_median_score(median_score)
     purchase_team = ""
@@ -722,7 +738,7 @@ def run_validate_snapshots_from_dir(
         "push": "走水",
         "half_loss": "半输",
         "full_loss": "全输",
-        "na": "观望",
+        "na": "无投注",
         "missing": "缺窗口",
         "excluded": "排除",
         "error": "错误",

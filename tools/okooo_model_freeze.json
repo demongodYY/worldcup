@@ -1,8 +1,8 @@
 {
-  "model_version": "okooo-ah-fair-line-v7-2026-07-01",
-  "model_fingerprint": "70cc197f6ab8af52b401f04334a30770207e68bf5c3666ce4c53b6862d49609d",
-  "frozen_at": "2026-07-01T01:01:09+08:00",
+  "model_version": "okooo-ah-fair-line-v9-2026-07-01",
+  "model_fingerprint": "e652bd4b327e39ddcc40e7a9ec4e5bb77d15b29abb40b5011f433c717fd48ea4",
+  "frozen_at": "2026-07-01T01:58:00+08:00",
   "validation_policy": "last_two_eligible_prematch_snapshots_median",
   "settlement_market": "latest_of_two_snapshot_line_and_price",
-  "notes": "Fair-line v7 freeze: v6 fair-line stack, with Bifa index changed to context-only for market confirmation, payout-pressure interpretation, market elasticity, and hot-favorite trap logic. It no longer contributes direct direction weight in Okooo scoring. Historical jsonl are sample-in validation; new matches use this freeze for walk-forward."
+  "notes": "Fair-line v9 freeze: Bifa index remains context-only, outputs use binary upper/lower direction with light/medium/strong strength only, and shallow anti-hot requires value confirmation so upper risk is not automatically treated as lower value. Weak shallow lower signals with late upper recovery are pulled back to light upper; confirmed high-point retracement and coherent lower clusters are preserved. Historical jsonl are sample-in validation; new matches use this freeze for walk-forward."
 }
