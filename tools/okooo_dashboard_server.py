@@ -22,10 +22,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from asian_handicap_validation import settle_asian_handicap, summarize_settlements  # noqa: E402
+from okooo_review2 import (  # noqa: E402
+    enrich_records_with_review2 as enrich_review2_records,
+    review2_prediction_pricing,
+    review2_summary,
+)
 from okooo_ah_cli import (  # noqa: E402
     DEFAULT_OKOOO_VALIDATE_SCORES_PATH,
     OKOOO_DEFAULT_ISSUE,
     OkoooClient,
+    attach_review2_pricing,
     attach_snapshot_replay_fields,
     build_validate_snapshot_records,
     cookie_from_env,
@@ -156,6 +162,7 @@ def normalize_result_dict(result: dict[str, Any]) -> dict[str, Any]:
         "decision_reason": result.get("decision_reason") or "",
         "warnings": result.get("warnings") if isinstance(result.get("warnings"), list) else [],
         "signals": result.get("signals") if isinstance(result.get("signals"), list) else [],
+        "review2": result.get("review2") if isinstance(result.get("review2"), dict) else None,
         "snapshot_median_count": result.get("snapshot_median_count"),
         "snapshot_median_total_count": result.get("snapshot_median_total_count"),
         "last_replay_score": result.get("last_replay_score"),
@@ -726,6 +733,8 @@ def build_snapshot_events(snapshot_root: Path) -> list[dict[str, Any]]:
             match=match_from_dict(match_dict) if match_dict else None,
         )
         normalized = normalize_result_dict(result)
+        if normalized.get("review2") is None and match_dict:
+            normalized["review2"] = review2_prediction_pricing(result, match_dict)
         score_delta = last_metrics["score"] - first_metrics["score"]
         heat_delta = last_metrics["heat_edge"] - first_metrics["heat_edge"]
         amount_delta = last_metrics["amount_edge"] - first_metrics["amount_edge"]
@@ -956,12 +965,18 @@ def build_validate_records(snapshot_root: Path, scores_json: Path | None) -> dic
     )
     for record in records:
         record["last_fetched_at"] = record.get("fetched_at") or ""
+    enrich_review2_records(
+        records,
+        lambda event_id: (items[-1] if (items := read_jsonl(snapshot_root / f"{event_id}.jsonl")) else None),
+    )
     records = sorted(records, key=validate_record_sort_key, reverse=True)
+    stats = summarize_validate_stats(records)
+    stats["review2"] = review2_summary(records)
     return {
         "scores_json": str(effective_scores),
         "aggregation": "last_two_median",
         "records": records,
-        "stats": summarize_validate_stats(records),
+        "stats": stats,
     }
 
 
@@ -1031,6 +1046,7 @@ def predict_latest(config: DashboardConfig, match_id: int, *, save_snapshot: boo
     client.refresh()
     match: Match = client.build_match(match_id)
     result = Predictor(client, store).analyze(match)
+    attach_review2_pricing(result)
     attach_snapshot_replay_fields(client, result.match)
     token = str(uuid.uuid4())
     PENDING_PREDICTIONS[token] = result
@@ -1063,6 +1079,7 @@ def save_pending_prediction(config: DashboardConfig, token: str) -> dict[str, An
 
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "OkoooDashboard/1.0"
+    client_disconnect_errors = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 
     @property
     def config(self) -> DashboardConfig:
@@ -1073,12 +1090,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+        except self.client_disconnect_errors:
+            return
 
     def send_file(self, path: Path, content_type: str) -> None:
         try:
@@ -1086,12 +1106,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except OSError:
             self.send_error(HTTPStatus.NOT_FOUND, "file not found")
             return
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+        except self.client_disconnect_errors:
+            return
 
     def read_json_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -1105,6 +1128,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return payload
 
     def handle_error(self, exc: Exception) -> None:
+        if isinstance(exc, self.client_disconnect_errors):
+            return
         status = HTTPStatus.BAD_REQUEST if isinstance(exc, DataError) else HTTPStatus.INTERNAL_SERVER_ERROR
         if not isinstance(exc, DataError):
             traceback.print_exc()

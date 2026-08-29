@@ -623,6 +623,7 @@ class AnalysisResult:
     purchase_score: float = 0.0
     decision_reason: str = ""
     is_reversed: bool = False
+    review2: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.model_recommendation:
@@ -712,6 +713,7 @@ class AnalysisResult:
                 for signal in self.signals
             ],
             "warnings": self.warnings,
+            "review2": self.review2,
         }
 
 
@@ -6562,6 +6564,8 @@ def print_analysis(result: AnalysisResult, verbose: bool = False) -> None:
         f"置信度 {result.confidence}% | 完整度 {result.completeness}% | score {result.score:+.3f}"
     )
     print(f"  [DECISION] {result.decision_reason}")
+    if result.review2:
+        print(f"  [ROI] {review2_display_text(result.review2)}")
     for signal in result.signals:
         if verbose or signal.available:
             mark = "OK" if signal.available else "NA"
@@ -6573,6 +6577,32 @@ def print_analysis(result: AnalysisResult, verbose: bool = False) -> None:
 
 def purchase_display_text(result: AnalysisResult) -> str:
     return f"{result.purchase_side}({result.strength}:{result.purchase_team})"
+
+
+def review2_display_text(review2: dict[str, Any]) -> str:
+    side = None
+    sides = review2.get("sides") if isinstance(review2.get("sides"), dict) else {}
+    rec_side = review2.get("recommendation_side")
+    if isinstance(sides, dict):
+        side = sides.get(rec_side)
+    side = side if isinstance(side, dict) else {}
+    euro_roi = side.get("euro_roi")
+    model_roi = side.get("model_roi")
+    euro_kelly = side.get("euro_kelly")
+    model_kelly = side.get("model_kelly")
+
+    def pct(value: Any) -> str:
+        try:
+            return f"{float(value):+.1%}"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    return (
+        f"R2 {review2.get('decision') or '-'} {review2.get('recommendation_label') or '-'} | "
+        f"ROI 欧 {pct(euro_roi)} / 模 {pct(model_roi)} | "
+        f"Kelly 欧 {pct(euro_kelly)} / 模 {pct(model_kelly)} | "
+        f"{review2.get('risk') or '-'}"
+    )
 
 
 def print_snapshot_saved(path: Path, result: AnalysisResult) -> None:

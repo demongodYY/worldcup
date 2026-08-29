@@ -41,6 +41,9 @@ from asian_handicap_validation import (
     snapshot_validation_issues,
     summarize_settlements,
 )
+from okooo_review2 import enrich_records_with_review2 as enrich_review2_records
+from okooo_review2 import review2_prediction_pricing
+from okooo_review2 import review2_summary
 
 # 本脚本所在目录即仓库根；默认快照与比分表相对此目录解析，避免当前工作目录不在仓库根时找不到路径。
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -723,6 +726,7 @@ def run_validate_snapshots_from_dir(
     mode: str = "replay",
     freeze: dict[str, Any] | None = None,
     history_snapshot_root: Path | None = None,
+    review2: bool = False,
 ) -> int:
     """Validate one last-two-snapshot median decision per event."""
     rows = build_validate_snapshot_records(
@@ -732,6 +736,15 @@ def run_validate_snapshots_from_dir(
         freeze=freeze,
         history_snapshot_root=history_snapshot_root,
     )
+    if review2:
+        def latest_snapshot(event_id: int) -> dict[str, Any] | None:
+            path = snapshot_root / f"{event_id}.jsonl"
+            if not path.is_file():
+                return None
+            records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            return records[-1] if records else None
+
+        enrich_review2_records(rows, latest_snapshot)
     outcome_text = {
         "full_win": "全赢",
         "half_win": "半赢",
@@ -780,6 +793,24 @@ def run_validate_snapshots_from_dir(
             f"半输 {stats['half_loss']} 全输 {stats['full_loss']}；无可用水位，ROI unavailable"
         )
     )
+    if review2:
+        summary = review2_summary(rows)
+        labels = {
+            "strict": "R2严格",
+            "balanced": "R2均衡",
+            "risk_veto": "R2风险否决",
+            "loose": "R2宽松",
+        }
+        print("\nreview-2 净胜球 ROI/Kelly 策略：")
+        for key, label in labels.items():
+            item = summary["strategies"][key]
+            roi = item.get("roi")
+            roi_text = f"{float(roi):+.1%}" if roi is not None else "N/A"
+            print(
+                f"{label}: {item['bets']} 注，净收益 {item['net_profit']:+.3f}u，ROI {roi_text}；"
+                f"全赢 {item['full_win']} 半赢 {item['half_win']} 走水 {item['push']} "
+                f"半输 {item['half_loss']} 全输 {item['full_loss']}"
+            )
     if stats["missing"] or stats["excluded"]:
         print(f"不足两条/缺快照 {stats['missing']}，排除 {stats['excluded']}")
     return 0 if (not fail_on_miss or not any_loss) else 1
@@ -2080,6 +2111,7 @@ def cmd_validate_snapshots(_client: OkoooClient, store: SnapshotStore, args: arg
         history_snapshot_root=Path(args.history_snapshot_dir).expanduser()
         if args.history_snapshot_dir
         else None,
+        review2=bool(args.review2),
     )
 
 
@@ -2089,11 +2121,16 @@ def attach_snapshot_replay_fields(client: OkoooClient, match: Match) -> None:
         attach(match)
 
 
+def attach_review2_pricing(result: AnalysisResult) -> None:
+    result.review2 = review2_prediction_pricing(result.to_dict(), match_to_dict(result.match))
+
+
 def cmd_predict(client: OkoooClient, store: SnapshotStore, args: argparse.Namespace) -> int:
     client.refresh()
     match = client.build_match(args.match_id)
     predictor = Predictor(client, store)
     result = predictor.analyze(match)
+    attach_review2_pricing(result)
     if args.save_snapshot:
         attach_snapshot_replay_fields(client, result.match)
         path = store.save(result)
@@ -2112,6 +2149,7 @@ def cmd_snapshot(client: OkoooClient, store: SnapshotStore, args: argparse.Names
     for match_id in args.match_ids:
         match = client.build_match(match_id)
         result = predictor.analyze(match)
+        attach_review2_pricing(result)
         attach_snapshot_replay_fields(client, result.match)
         path = store.save(result)
         print_snapshot_saved(path, result)
@@ -2156,6 +2194,7 @@ def cmd_watch(client: OkoooClient, store: SnapshotStore, args: argparse.Namespac
                         flush=True,
                     )
                     result = predictor.analyze(task.match)
+                    attach_review2_pricing(result)
                     attach_snapshot_replay_fields(client, result.match)
                     path = store.save(result, fetched_at=now)
                     print_snapshot_saved(path, result)
@@ -2249,6 +2288,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="replay 模式用于趋势历史的快照目录；默认尝试 .okooo_snapshots_pre_v5_freeze",
+    )
+    val.add_argument(
+        "--review2",
+        action="store_true",
+        help="追加 review-2 净胜球 ROI/Kelly 分层购买策略统计",
     )
     val.set_defaults(func=cmd_validate_snapshots)
 

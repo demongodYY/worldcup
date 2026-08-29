@@ -705,7 +705,8 @@
             <div class="stat"><span>亚盘方向 · 0.50</span><strong>公司方向 + 路径极值</strong><small>深盘退浅先降强度，胜负未反向不直接翻下盘</small></div>
             <div class="stat"><span>交易确认 · 0.20</span><strong>异常份额 + 价格冲击</strong><small>+ 资金后盘口响应</small></div>
             <div class="stat"><span>深度风险 · 0.095</span><strong>赢盘门槛扣减</strong><small>合理盘口与打穿能力只作风险参考</small></div>
-            <div class="stat"><span>合成方式</span><strong>一次线性合成</strong><small>澳客源不再二次 bump / 回撤 / 翻向</small></div>
+            <div class="stat"><span>R2 定价</span><strong>欧赔去水 + Kelly轻修正</strong><small>再拆净胜球分布算亚盘 ROI</small></div>
+            <div class="stat"><span>R2 购买</span><strong>浅盘看价格，深盘看方向</strong><small>浅盘需正ROI，深盘保留模型方向并标风险</small></div>
           </div>
         </div>
       </div>
@@ -721,6 +722,8 @@
               <button class="metric-tab" type="button" data-filter="hit">全赢 / 半赢</button>
               <button class="metric-tab" type="button" data-filter="miss">半输 / 全输</button>
               <button class="metric-tab" type="button" data-filter="push">走水</button>
+              <button class="metric-tab" type="button" data-filter="review2_buy">R2 买</button>
+              <button class="metric-tab" type="button" data-filter="review2_skip">R2 放弃</button>
               <button class="metric-tab" type="button" data-filter="missing">排除 / 不足两条</button>
             </div>
             <span class="muted" id="scoresPath"></span>
@@ -737,6 +740,9 @@
                   <th>模型</th>
                   <th>末两条中位数</th>
                   <th>比分</th>
+                  <th>R2决策</th>
+                  <th>R2推荐ROI</th>
+                  <th>R2风险</th>
                   <th>结果</th>
                   <th>收益</th>
                   <th>快照时间</th>
@@ -795,6 +801,13 @@
       return `${Math.round(Number(value) * 100)}%`;
     }
 
+    function signedPct(value, digits = 1) {
+      if (value === null || value === undefined) return "-";
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "-";
+      return `${n >= 0 ? "+" : ""}${(n * 100).toFixed(digits)}%`;
+    }
+
     function shortTime(iso) {
       if (!iso) return "-";
       const d = new Date(iso);
@@ -840,6 +853,46 @@
         missing: "缺快照",
         error: "错误"
       }[outcome] || "-";
+    }
+
+    function classForReview2Decision(decision) {
+      if (decision === "买") return "hit";
+      if (decision === "放弃") return "na";
+      return "soft";
+    }
+
+    function review2StrategySummary(review2, key) {
+      const item = review2?.strategies?.[key];
+      if (!item || !item.bets) return "-";
+      return `${pct(item.roi)} / ${fmt(item.net_profit, 2)}u`;
+    }
+
+    function review2RecommendationRoi(row) {
+      const review2 = row?.review2;
+      if (!review2 || !review2.recommendation_side || !review2.sides) return "-";
+      const side = review2.sides[review2.recommendation_side];
+      if (!side) return "-";
+      return `欧 ${signedPct(side.euro_roi)} / 模 ${signedPct(side.model_roi)}`;
+    }
+
+    function review2RecommendationKelly(row) {
+      const review2 = row?.review2;
+      if (!review2 || !review2.recommendation_side || !review2.sides) return "-";
+      const side = review2.sides[review2.recommendation_side];
+      if (!side) return "-";
+      return `欧 ${signedPct(side.euro_kelly)} / 模 ${signedPct(side.model_kelly)}`;
+    }
+
+    function renderReview2Pricing(review2) {
+      if (!review2) return "";
+      return `
+        <div class="detail-grid" style="margin-top: 10px;">
+          ${statHtml("R2购买建议", review2.decision || "-", review2.risk || "-")}
+          ${statHtml("R2推荐", review2.recommendation_label || "-")}
+          ${statHtml("R2推荐ROI", review2RecommendationRoi({ review2 }))}
+          ${statHtml("R2 Kelly", review2RecommendationKelly({ review2 }))}
+        </div>
+      `;
     }
 
     function recommendationTag(item) {
@@ -1019,6 +1072,7 @@
           ${statHtml("置信 / 完整度", `${result.confidence}% / ${result.completeness}%`)}
           ${statHtml("盘口", `${item.asian_line || "0"}`, `深度变化 ${fmt(item.line_depth_delta, 2)}`)}
         </div>
+        ${renderReview2Pricing(result.review2)}
 
         <div class="metric-tabs" id="metricTabs"></div>
         <div class="chart-box" id="chartBox"></div>
@@ -1302,6 +1356,7 @@
           ${statHtml("置信 / 完整度", `${result.confidence}% / ${result.completeness}%`)}
           ${statHtml("状态", data.saved ? "已存入快照" : "未存入快照")}
         </div>
+        ${renderReview2Pricing(result.review2)}
         <span class="badge ${sideClass}">${escapeHtml(recommendationTag(result))}</span>
         <span class="notice">${escapeHtml(result.decision_reason || "")}</span>
         <div class="signals" style="margin-top: 10px;">${renderSignals(result.signals)}</div>
@@ -1339,6 +1394,7 @@
       const validation = state.data?.validation;
       const stats = validation?.stats || {};
       const rolling = stats.rolling || {};
+      const review2 = stats.review2 || {};
       const rollingText = (item) => item?.bets ? `${pct(item.roi)} / ${fmt(item.net_profit, 2)}u` : "-";
       const alerts = Array.isArray(stats.alerts) ? stats.alerts : [];
       el("validateStats").innerHTML = [
@@ -1347,6 +1403,9 @@
         statHtml("半输 / 全输", `${stats.half_loss || 0} / ${stats.full_loss || 0}`),
         statHtml("净收益", stats.roi_bets ? `${fmt(stats.net_profit, 3)}u` : "-"),
         statHtml("ROI", stats.roi === null || stats.roi === undefined ? "-" : pct(stats.roi)),
+        statHtml("R2均衡", review2StrategySummary(review2, "balanced"), `${review2.strategies?.balanced?.bets || 0} 注`),
+        statHtml("R2风险否决", review2StrategySummary(review2, "risk_veto"), `${review2.strategies?.risk_veto?.bets || 0} 注`),
+        statHtml("R2宽松", review2StrategySummary(review2, "loose"), `${review2.strategies?.loose?.bets || 0} 注`),
         statHtml("近13 ROI", rollingText(rolling.last_13), `${rolling.last_13?.bets || 0} 注`),
         statHtml("浅盘近13", rollingText(rolling.shallow_last_13), `${rolling.shallow_last_13?.bets || 0} 注`),
         statHtml("浅盘下盘", rollingText(rolling.shallow_lower_last_13), `${rolling.shallow_lower_last_13?.bets || 0} 注`),
@@ -1368,6 +1427,8 @@
         }
         if (state.validateFilter === "hit") return row.outcome === "full_win" || row.outcome === "half_win";
         if (state.validateFilter === "miss") return row.outcome === "full_loss" || row.outcome === "half_loss";
+        if (state.validateFilter === "review2_buy") return Boolean(row.review2?.strategies?.balanced);
+        if (state.validateFilter === "review2_skip") return row.status === "ok" && row.review2 && !row.review2?.strategies?.balanced;
         return row.outcome === state.validateFilter;
       });
       el("validateRows").innerHTML = filtered.map((row) => `
@@ -1382,11 +1443,14 @@
           <td>${escapeHtml(row.model_recommendation || "")}</td>
           <td class="${Number(row.score || 0) >= 0 ? "positive" : "negative"}">${row.score === undefined ? "-" : fmt(row.score, 3)}</td>
           <td>${escapeHtml(row.scoreline || "")}</td>
+          <td><span class="badge ${classForReview2Decision(row.review2?.decision)}">${escapeHtml(row.review2?.decision || "-")}</span></td>
+          <td>${escapeHtml(review2RecommendationRoi(row))}</td>
+          <td>${escapeHtml(row.review2?.risk || "-")}</td>
           <td><span class="badge ${classForOutcome(row.outcome)}">${outcomeText(row.outcome)}</span></td>
           <td>${row.profit === undefined || row.profit === null ? "-" : `${fmt(row.profit, 3)}u`}</td>
           <td>${shortTime(row.last_fetched_at)}</td>
         </tr>
-      `).join("") || `<tr><td colspan="11"><div class="empty">没有匹配记录</div></td></tr>`;
+      `).join("") || `<tr><td colspan="14"><div class="empty">没有匹配记录</div></td></tr>`;
     }
 
     function bindStaticEvents() {
