@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -112,6 +113,276 @@ def load_okooo_validate_scores(path: Path | None) -> dict[int, tuple[int, int]]:
         if isinstance(v, (list, tuple)) and len(v) >= 2:
             out[eid] = (int(v[0]), int(v[1]))
     return out
+
+
+def parse_validate_scoreline(score: str) -> tuple[int, int]:
+    text = score.strip()
+    m = re.fullmatch(r"(\d+)\s*[-:：]\s*(\d+)", text)
+    if not m:
+        raise ValueError("比分格式应为 HOME-AWAY，例如 2-1")
+    return int(m.group(1)), int(m.group(2))
+
+
+def parse_okooo_final_score_from_html(html_text: str) -> tuple[int, int] | None:
+    for pattern in (
+        r"<span\b[^>]*>.*?</span>\s*(?:<em\b[^>]*>.*?</em>\s*)?<strong\b[^>]*>\s*(\d+)\s*-\s*(\d+)\s*</strong>\s*<b\b[^>]*>.*?</b>",
+        r"<strong\b[^>]*>\s*(\d+)\s*-\s*(\d+)\s*</strong>",
+    ):
+        m = re.search(pattern, html_text or "", flags=re.I | re.S)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def parse_okooo_livecenter_final_scores(html_text: str) -> dict[int, tuple[int, int]]:
+    """Parse completed match scores embedded in one Okooo livecenter date page."""
+    out: dict[int, tuple[int, int]] = {}
+    for row in re.finditer(r"<tr\b(?P<attrs>[^>]*)>(?P<body>.*?)</tr>", html_text or "", flags=re.I | re.S):
+        event = re.search(r"\bmatchid=[\"'](\d+)[\"']", row.group("attrs"), flags=re.I)
+        state = re.search(r"\bstate=[\"']([^\"']+)[\"']", row.group("attrs"), flags=re.I)
+        if state is None or state.group(1).strip().lower() != "end":
+            continue
+        score = re.search(
+            r"ctrl_homescore[^>]*>\s*(\d+)\s*</b>.*?ctrl_awayscore[^>]*>\s*(\d+)\s*</b>",
+            row.group("body"),
+            flags=re.I | re.S,
+        )
+        if event and score:
+            out[int(event.group(1))] = (int(score.group(1)), int(score.group(2)))
+    return out
+
+
+def fetch_okooo_livecenter_final_scores(
+    date: str,
+    *,
+    timeout: float,
+    cookie: str | None,
+) -> dict[int, tuple[int, int]]:
+    url = f"{OKOOO_BASE_URL}/livecenter/?date={urllib.parse.quote(date)}"
+    html_text = decode_okooo(http_bytes(url, timeout=timeout, cookie=cookie, referer=OKOOO_BASE_URL + "/"))
+    return parse_okooo_livecenter_final_scores(html_text)
+
+
+def fetch_okooo_match_final_score(
+    match_id: int,
+    *,
+    timeout: float,
+    cookie: str | None,
+) -> tuple[int, int] | None:
+    last_error: DataError | None = None
+    fetched_any = False
+    sections = ["odds", "ah"]
+    if cookie:
+        sections.append("exchanges/detail")
+    for section in sections:
+        url = f"{OKOOO_BASE_URL}/soccer/match/{match_id}/{section}/"
+        try:
+            html_text = decode_okooo(
+                http_bytes(url, timeout=timeout, cookie=cookie, referer=OKOOO_BASE_URL + "/jingcai/shuju/betfa/dqjc/")
+            )
+        except DataError as exc:
+            last_error = exc
+            continue
+        fetched_any = True
+        score = parse_okooo_final_score_from_html(html_text)
+        if score is not None:
+            return score
+    if last_error is not None and not fetched_any:
+        raise last_error
+    return None
+
+
+def write_okooo_validate_score(
+    path: Path | None,
+    event_id: int,
+    home_goals: int,
+    away_goals: int,
+) -> tuple[Path, tuple[int, int] | None]:
+    if home_goals < 0 or away_goals < 0:
+        raise ValueError("进球数不能为负数")
+    effective = path if path is not None else DEFAULT_OKOOO_VALIDATE_SCORES_PATH
+    effective = effective.expanduser()
+    if effective.is_file():
+        data = json.loads(effective.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"比分表必须是 JSON object: {effective}")
+    else:
+        effective.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "_description": "澳客 event_id -> [主队进球, 客队进球]。validate-snapshots / backtest --replay。",
+        }
+
+    key = str(event_id)
+    old_value = data.get(key)
+    old_score: tuple[int, int] | None = None
+    if isinstance(old_value, (list, tuple)) and len(old_value) >= 2:
+        old_score = (int(old_value[0]), int(old_value[1]))
+    data[key] = [int(home_goals), int(away_goals)]
+    # Keep each score on one line so a routine batch settlement does not
+    # reformat the entire historical validation table.
+    entries = [
+        f"  {json.dumps(str(item_key), ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
+        for item_key, value in data.items()
+    ]
+    effective.write_text("{\n" + ",\n".join(entries) + "\n}\n", encoding="utf-8")
+    return effective, old_score
+
+
+def okooo_final_score_for_match(client: OkoooClient, match_id: int) -> tuple[int, int]:
+    try:
+        client.refresh(core_only=True)
+    except DataError:
+        pass
+    match = client.base_matches.get(match_id)
+    if match is not None and match.final_score is not None:
+        return match.final_score
+    score = fetch_okooo_match_final_score(match_id, timeout=client.timeout, cookie=client.cookie)
+    if score is not None:
+        return score
+    if match is None:
+        raise DataError(f"Okooo match id not found or has no finished score: {match_id}")
+    raise DataError(f"Okooo match id has no finished score in {client.issue}: {match_id}")
+
+
+def finished_snapshot_match_dates(
+    snapshot_root: Path,
+    *,
+    since: datetime | None = None,
+) -> dict[int, tuple[str, str, str]]:
+    """Return past-kickoff Okooo event ids recorded in local snapshots.
+
+    Finished matches disappear from Okooo's current issue page, so the snapshot
+    history is the authoritative list of matches that still need settlement.
+    """
+    if not snapshot_root.is_dir():
+        return {}
+    now = datetime.now(timezone.utc)
+    matches: dict[int, tuple[str, str, str]] = {}
+    for path in snapshot_root.glob("*.jsonl"):
+        try:
+            records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except (OSError, json.JSONDecodeError):
+            continue
+        for record in records:
+            match = record.get("match") if isinstance(record, dict) else None
+            if not isinstance(match, dict):
+                continue
+            try:
+                event_id = int(match["event_id"])
+                kickoff = parse_utc_datetime(match.get("match_time"))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if kickoff is None or kickoff > now:
+                continue
+            fetched_at = parse_utc_datetime(record.get("fetched_at"))
+            if since is not None and (fetched_at is None or fetched_at < since):
+                continue
+            matches[event_id] = (
+                kickoff.astimezone(OKOOO_TZ).date().isoformat(),
+                str(match.get("home") or ""),
+                str(match.get("away") or ""),
+            )
+    return matches
+
+
+def finished_snapshot_matches(snapshot_root: Path) -> dict[int, tuple[str, str]]:
+    return {
+        event_id: (home, away)
+        for event_id, (_date, home, away) in finished_snapshot_match_dates(snapshot_root).items()
+    }
+
+
+def fill_finished_okooo_validate_scores(
+    client: OkoooClient,
+    path: Path | None,
+    *,
+    only_missing: bool = True,
+    snapshot_root: Path | None = None,
+    snapshot_since: datetime | None = None,
+) -> tuple[Path, list[tuple[int, tuple[int, int], tuple[int, int] | None, str, str]]]:
+    client.refresh(core_only=True)
+    existing = load_okooo_validate_scores(path) if (path or DEFAULT_OKOOO_VALIDATE_SCORES_PATH).is_file() else {}
+    updates: list[tuple[int, tuple[int, int], tuple[int, int] | None, str, str]] = []
+    candidates: dict[int, tuple[tuple[int, int] | None, str, str]] = {
+        match.okooo_id: (match.final_score, match.home, match.away)
+        for match in client.base_matches.values()
+    }
+    snapshot_events = finished_snapshot_match_dates(snapshot_root, since=snapshot_since) if snapshot_root is not None else {}
+    if snapshot_events:
+        for event_id, (_date, home, away) in snapshot_events.items():
+            candidates.setdefault(event_id, (None, home, away))
+
+    unresolved = [event_id for event_id in snapshot_events if candidates[event_id][0] is None and event_id not in existing]
+    if snapshot_root is not None and unresolved:
+        daily_scores: dict[int, tuple[int, int]] = {}
+        fetched_dates: set[str] = set()
+        dates = sorted({snapshot_events[event_id][0] for event_id in unresolved})
+        # One livecenter page contains every result on that date. Limit parallel
+        # requests so a multi-day replay remains quick without hammering Okooo.
+        with ThreadPoolExecutor(max_workers=min(4, len(unresolved))) as executor:
+            futures = {
+                executor.submit(
+                    fetch_okooo_livecenter_final_scores,
+                    date,
+                    timeout=client.timeout,
+                    cookie=client.cookie,
+                ): date
+                for date in dates
+            }
+            for future in as_completed(futures):
+                date = futures[future]
+                try:
+                    daily_scores.update(future.result())
+                except DataError:
+                    continue
+                fetched_dates.add(date)
+
+        for event_id in unresolved:
+            score = daily_scores.get(event_id)
+            if score is not None:
+                _, home, away = candidates[event_id]
+                candidates[event_id] = (score, home, away)
+
+        # A successfully fetched livecenter page is authoritative: an event
+        # without an End score is still in progress, so do not settle it from
+        # the mutable score shown on its detail page. Use detail-page fallback
+        # only when the date page itself was unavailable.
+        still_unresolved = [
+            event_id
+            for event_id in unresolved
+            if candidates[event_id][0] is None and snapshot_events[event_id][0] not in fetched_dates
+        ]
+        if still_unresolved:
+            with ThreadPoolExecutor(max_workers=min(4, len(still_unresolved))) as executor:
+                futures = {
+                    executor.submit(
+                        fetch_okooo_match_final_score,
+                        event_id,
+                        timeout=client.timeout,
+                        cookie=client.cookie,
+                    ): event_id
+                    for event_id in still_unresolved
+                }
+                for future in as_completed(futures):
+                    event_id = futures[future]
+                    try:
+                        score = future.result()
+                    except DataError:
+                        continue
+                    if score is not None:
+                        _, home, away = candidates[event_id]
+                        candidates[event_id] = (score, home, away)
+
+    for event_id, (score, home, away) in sorted(candidates.items()):
+        if only_missing and event_id in existing:
+            continue
+        if score is None:
+            continue
+        effective, old_score = write_okooo_validate_score(path, event_id, score[0], score[1])
+        updates.append((event_id, score, old_score, home, away))
+        path = effective
+    effective = path if path is not None else DEFAULT_OKOOO_VALIDATE_SCORES_PATH
+    return effective.expanduser(), updates
 
 
 def _replay_recommendation_outcome(
@@ -891,6 +1162,7 @@ class OkoooBaseMatch:
     home_sel: BifaSelection
     draw_sel: BifaSelection
     away_sel: BifaSelection
+    final_score: tuple[int, int] | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1111,7 +1383,7 @@ def parse_detail_time(value: str) -> datetime | None:
         return None
 
 
-def match_meta(block_html: str) -> tuple[str, str, datetime, str, str, str]:
+def match_meta(block_html: str) -> tuple[str, str, datetime, str, str, str, tuple[int, int] | None]:
     title = re.search(
         r"<p[^>]*class=[\"']float_l[\"'][^>]*>\s*<b>(.*?)</b>\s*<b>(.*?)</b>\s*<b>(.*?)</b>",
         block_html,
@@ -1126,7 +1398,7 @@ def match_meta(block_html: str) -> tuple[str, str, datetime, str, str, str]:
     # 未赛：…<span>主队</span>…<strong>VS</strong><b>客队</b>；已赛复盘：…<span>主队</span><em>(-1)</em><strong>1-1</strong><b>客队</b>
     teams = re.search(
         r"<span>(?P<home>.*?)</span>\s*(?P<hc><em\b[^>]*>.*?</em>)?\s*(?:<strong>\s*VS\s*</strong>\s*<b>(?P<away_vs>.*?)</b>"
-        r"|<strong>\s*\d+\s*-\s*\d+\s*</strong>\s*<b>(?P<away_sc>.*?)</b>)",
+        r"|<strong>\s*(?P<hg>\d+)\s*-\s*(?P<ag>\d+)\s*</strong>\s*<b>(?P<away_sc>.*?)</b>)",
         block_html,
         flags=re.I | re.S,
     )
@@ -1138,7 +1410,10 @@ def match_meta(block_html: str) -> tuple[str, str, datetime, str, str, str]:
     if not away_raw:
         raise DataError("cannot parse Okooo away team")
     away = clean_html_text(away_raw)
-    return jc_code, league, kickoff, home, away, handicap
+    final_score = None
+    if teams.group("hg") is not None and teams.group("ag") is not None:
+        final_score = (int(teams.group("hg")), int(teams.group("ag")))
+    return jc_code, league, kickoff, home, away, handicap, final_score
 
 
 def split_match_blocks(html_text: str, marker: str) -> list[str]:
@@ -1170,7 +1445,7 @@ def parse_betfa_html(html_text: str) -> dict[int, OkoooBaseMatch]:
         if oid is None:
             continue
         try:
-            jc_code, league, kickoff, home, away, handicap = match_meta(block)
+            jc_code, league, kickoff, home, away, handicap, final_score = match_meta(block)
         except DataError:
             continue
         selections: dict[str, BifaSelection] = {}
@@ -1223,6 +1498,10 @@ def parse_betfa_html(html_text: str) -> dict[int, OkoooBaseMatch]:
             "_okooo_euro_prob_draw": draw_sel.euro_prob_pct,
             "_okooo_euro_prob_away": away_sel.euro_prob_pct,
         }
+        if final_score is not None:
+            raw["_okooo_final_score"] = list(final_score)
+            raw["_okooo_home_goals"] = final_score[0]
+            raw["_okooo_away_goals"] = final_score[1]
         out[oid] = OkoooBaseMatch(
             okooo_id=oid,
             jc_code=jc_code,
@@ -1234,6 +1513,7 @@ def parse_betfa_html(html_text: str) -> dict[int, OkoooBaseMatch]:
             home_sel=home_sel,
             draw_sel=draw_sel,
             away_sel=away_sel,
+            final_score=final_score,
             raw=raw,
         )
     return out
@@ -1914,8 +2194,46 @@ def is_world_cup_league(league: str) -> bool:
     return "世界杯" in text or "世界盃" in text or "world cup" in text.lower()
 
 
+LEAGUE_FILTER_ALIASES: dict[str, tuple[str, ...]] = {
+    "world_cup": ("世界杯", "世界盃", "world cup"),
+    "premier_league": ("英超", "英格兰超级联赛", "英格蘭超級聯賽", "premier league", "epl"),
+    "la_liga": ("西甲", "西班牙甲级联赛", "西班牙甲級聯賽", "la liga", "laliga", "primera division", "primera división"),
+    "bundesliga": ("德甲", "德国甲级联赛", "德國甲級聯賽", "bundesliga"),
+}
+
+
+def selected_league_filter_keys(args: argparse.Namespace) -> tuple[str, ...]:
+    keys = []
+    for key in LEAGUE_FILTER_ALIASES:
+        if getattr(args, key, False):
+            keys.append(key)
+    return tuple(keys)
+
+
+def league_matches_filter_key(league: str, key: str) -> bool:
+    text = league or ""
+    lower = text.lower()
+    return any(alias in text or alias in lower for alias in LEAGUE_FILTER_ALIASES[key])
+
+
+def league_matches_any_filter(league: str, keys: tuple[str, ...]) -> bool:
+    return not keys or any(league_matches_filter_key(league, key) for key in keys)
+
+
+def add_league_filter_args(parser: argparse.ArgumentParser, *, include_watch_note: bool = False) -> None:
+    suffix = "；可叠加多个联赛参数，按 OR 匹配；再与 --league-contains 叠加精筛"
+    parser.add_argument("--world-cup", action="store_true", help="仅世界杯" + suffix)
+    parser.add_argument("--epl", "--premier-league", dest="premier_league", action="store_true", help="仅英超 / Premier League" + suffix)
+    parser.add_argument("--la-liga", "--laliga", dest="la_liga", action="store_true", help="仅西甲 / La Liga" + suffix)
+    parser.add_argument("--bundesliga", dest="bundesliga", action="store_true", help="仅德甲 / Bundesliga" + suffix)
+    help_text = "联赛名包含文本"
+    if include_watch_note:
+        help_text += "；与 --match-ids 或联赛快捷参数可叠加"
+    parser.add_argument("--league-contains", default="", help=help_text)
+
+
 def base_match_matches_filters(match: OkoooBaseMatch, args: argparse.Namespace) -> bool:
-    if getattr(args, "world_cup", False) and not is_world_cup_league(match.league):
+    if not league_matches_any_filter(match.league, selected_league_filter_keys(args)):
         return False
     league_contains = (getattr(args, "league_contains", "") or "").strip()
     if league_contains and league_contains not in match.league:
@@ -1981,13 +2299,13 @@ def print_okooo_watch_summary(tasks: list[ScheduledTask], completed: set[str]) -
 
 def selected_watch_match_ids(client: OkoooClient, args: argparse.Namespace) -> list[int]:
     ids = [int(x) for x in (args.match_ids or "").split(",") if x.strip()]
-    if args.world_cup:
+    if selected_league_filter_keys(args):
         for match in client.base_matches.values():
-            if is_world_cup_league(match.league):
+            if base_match_matches_filters(match, args):
                 ids.append(match.okooo_id)
     ids = list(dict.fromkeys(ids))
     if not ids:
-        raise SystemExit("watch requires --match-ids id1,id2,... or --world-cup")
+        raise SystemExit("watch requires --match-ids id1,id2,... or a league filter such as --world-cup/--epl/--la-liga/--bundesliga")
     return ids[: args.limit]
 
 
@@ -2113,6 +2431,89 @@ def cmd_validate_snapshots(_client: OkoooClient, store: SnapshotStore, args: arg
         else None,
         review2=bool(args.review2),
     )
+
+
+def cmd_validate_score(_client: OkoooClient, store: SnapshotStore, args: argparse.Namespace) -> int:
+    try:
+        if args.from_okooo and args.all_finished:
+            snapshot_since = (
+                None
+                if args.snapshot_days <= 0
+                else datetime.now(timezone.utc) - timedelta(days=args.snapshot_days)
+            )
+            snapshot_matches = finished_snapshot_match_dates(Path(store.root), since=snapshot_since)
+            path, updates = fill_finished_okooo_validate_scores(
+                _client,
+                args.scores_json,
+                only_missing=not args.overwrite,
+                snapshot_root=Path(store.root),
+                snapshot_since=snapshot_since,
+            )
+            if updates:
+                action = "新增/更新" if args.overwrite else "新增"
+                print(f"已从 Okooo {action} {len(updates)} 场完场比分:")
+                for event_id, score, old_score, home, away in updates[:20]:
+                    old = "" if old_score is None else f" {old_score[0]}-{old_score[1]} ->"
+                    print(f"  {event_id} {home} vs {away}:{old} {score[0]}-{score[1]}")
+                if len(updates) > 20:
+                    print(f"  ... 另 {len(updates) - 20} 场")
+            else:
+                if snapshot_matches:
+                    known_scores = load_okooo_validate_scores(args.scores_json)
+                    missing_scores = [event_id for event_id in snapshot_matches if event_id not in known_scores]
+                    if not missing_scores:
+                        print(f"快照中 {len(snapshot_matches)} 场已开赛比赛均已有 validate 终场比分，无需写入。")
+                    elif not _client.cookie:
+                        print(f"快照中 {len(snapshot_matches)} 场已开赛比赛有 {len(missing_scores)} 场尚未取得终场比分。")
+                        print("未配置 OKOOO_COOKIE；澳客历史比赛页会被 WAF 拦截（HTTP 405），因此无法自动取分。")
+                        print("请在 .env 配置 OKOOO_COOKIE，或使用 --cookie-file 指定浏览器 Cookie 文件后重试。")
+                    else:
+                        print(
+                            f"快照中 {len(snapshot_matches) - len(missing_scores)} 场已有比分；"
+                            f"另 {len(missing_scores)} 场尚未明确完场，已跳过。"
+                        )
+                else:
+                    print("当前期及本地快照中没有需要补分的已开赛比赛。")
+            print(f"比分表: {path}")
+            if not args.run:
+                return 0
+        else:
+            if args.match_id is None:
+                raise ValueError("需要 --match-id；批量补完场比分请用 --from-okooo --all-finished")
+            if args.from_okooo:
+                home_goals, away_goals = okooo_final_score_for_match(_client, int(args.match_id))
+            elif args.score:
+                home_goals, away_goals = parse_validate_scoreline(args.score)
+            else:
+                if args.home_goals is None or args.away_goals is None:
+                    raise ValueError("需要 --score HOME-AWAY，或 --from-okooo，或同时提供 --home-goals 与 --away-goals")
+                home_goals, away_goals = int(args.home_goals), int(args.away_goals)
+            path, old_score = write_okooo_validate_score(args.scores_json, int(args.match_id), home_goals, away_goals)
+
+            if old_score is None:
+                print(f"已新增 validate 比分: {args.match_id} = {home_goals}-{away_goals}")
+            else:
+                print(f"已更新 validate 比分: {args.match_id} {old_score[0]}-{old_score[1]} -> {home_goals}-{away_goals}")
+            print(f"比分表: {path}")
+            if not args.run:
+                return 0
+    except (OSError, ValueError, json.JSONDecodeError, DataError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        path
+    except NameError:
+        path = args.scores_json or DEFAULT_OKOOO_VALIDATE_SCORES_PATH
+    run_args = argparse.Namespace(
+        scores_json=path,
+        allow_miss=args.allow_miss,
+        walk_forward=args.walk_forward,
+        freeze_manifest=args.freeze_manifest,
+        history_snapshot_dir=args.history_snapshot_dir,
+        review2=args.review2,
+    )
+    return cmd_validate_snapshots(_client, store, run_args)
 
 
 def attach_snapshot_replay_fields(client: OkoooClient, match: Match) -> None:
@@ -2245,8 +2646,7 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--limit", type=int, default=30)
     u.add_argument("--include-past", action="store_true", help="包含已开赛/已结束场次")
     u.add_argument("--all-future", action="store_true", help="列出所有未来比赛，不按 --hours 截断")
-    u.add_argument("--world-cup", action="store_true", help="仅世界杯")
-    u.add_argument("--league-contains", default="", help="联赛名包含文本")
+    add_league_filter_args(u)
     u.add_argument("--full", action="store_true", help="同时抓取盘口/凯利等页面用于健康检查")
     u.set_defaults(func=cmd_upcoming)
 
@@ -2296,6 +2696,60 @@ def build_parser() -> argparse.ArgumentParser:
     )
     val.set_defaults(func=cmd_validate_snapshots)
 
+    vs = sub.add_parser(
+        "validate-score",
+        aliases=["validate"],
+        help="赛后写入/更新一场比赛的 validate 比分",
+    )
+    vs.add_argument("--match-id", type=int, default=None, help="澳客 match id / event_id")
+    vs.add_argument("--score", default="", help="终场比分，格式 HOME-AWAY，例如 2-1（主队-客队）")
+    vs.add_argument("--home-goals", type=int, default=None, help="主队进球；可替代 --score")
+    vs.add_argument("--away-goals", type=int, default=None, help="客队进球；可替代 --score")
+    vs.add_argument("--from-okooo", action="store_true", help="从澳客读取完场比分；单场时会再尝试比赛页兜底")
+    vs.add_argument("--all-finished", action="store_true", help="配合 --from-okooo：补当前期及本地快照中已开赛比赛的终场比分")
+    vs.add_argument(
+        "--snapshot-days",
+        type=float,
+        default=3.0,
+        help="配合 --all-finished：扫描最近多少天写入的快照，默认 3；设为 0 扫描全部历史快照",
+    )
+    vs.add_argument("--overwrite", action="store_true", help="配合 --all-finished：允许覆盖比分表中已有赛果")
+    vs.add_argument(
+        "--scores-json",
+        type=Path,
+        default=None,
+        help="要更新的比分表，默认 tools/okooo_validate_scores.json",
+    )
+    vs.add_argument("--run", action="store_true", help="写入后立刻运行 validate-snapshots")
+    vs.add_argument(
+        "--allow-miss",
+        action="store_true",
+        help="配合 --run：存在半输/全输时仍退出 0",
+    )
+    vs.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="配合 --run：使用冻结模型 walk-forward 模式",
+    )
+    vs.add_argument(
+        "--freeze-manifest",
+        type=Path,
+        default=DEFAULT_OKOOO_MODEL_FREEZE_PATH,
+        help="配合 --run --walk-forward：模型冻结清单",
+    )
+    vs.add_argument(
+        "--history-snapshot-dir",
+        type=Path,
+        default=None,
+        help="配合 --run replay 模式：趋势历史快照目录",
+    )
+    vs.add_argument(
+        "--review2",
+        action="store_true",
+        help="配合 --run：追加 review-2 分层统计",
+    )
+    vs.set_defaults(func=cmd_validate_score)
+
     fr = sub.add_parser(
         "freeze-snapshots",
         help="用当前冻结模型重放本地 jsonl，写入 schema 2 与 model_version/fingerprint",
@@ -2335,8 +2789,8 @@ def build_parser() -> argparse.ArgumentParser:
     tr.set_defaults(func=cmd_trend)
 
     w = sub.add_parser("watch", help="按赛前窗口滚动预测并保存快照")
-    w.add_argument("--match-ids", default="", help="逗号分隔 Okooo match id；可与 --world-cup 叠加")
-    w.add_argument("--world-cup", action="store_true", help="自动观察当前期所有世界杯比赛")
+    w.add_argument("--match-ids", default="", help="逗号分隔 Okooo match id；可与联赛筛选叠加")
+    add_league_filter_args(w, include_watch_note=True)
     w.add_argument("--horizon-hours", type=float, default=24.0, help="扫描未来多少小时，默认 24")
     w.add_argument("--limit", type=int, default=20, help="最多观察多少场，默认 20")
     w.add_argument("--interval", type=float, default=float(os.environ.get("OKOOO_POLL_SEC", "120")), help="检查间隔秒数")

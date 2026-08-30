@@ -72,6 +72,17 @@ class Titan007ParserTests(unittest.TestCase):
         self.assertTrue(_upcoming_league_ok("世界杯小组赛", "小组", True))
         self.assertFalse(_upcoming_league_ok("世界杯", "小组", True))
 
+    def test_upcoming_league_top_euro_filters(self) -> None:
+        keys = ("premier_league", "la_liga", "bundesliga")
+        self.assertTrue(_upcoming_league_ok("英超", "", False, keys))
+        self.assertTrue(_upcoming_league_ok("西甲", "", False, keys))
+        self.assertTrue(_upcoming_league_ok("德甲", "", False, keys))
+        self.assertTrue(_upcoming_league_ok("English Premier League", "", False, keys))
+        self.assertTrue(_upcoming_league_ok("Spanish La Liga", "", False, keys))
+        self.assertTrue(_upcoming_league_ok("German Bundesliga", "", False, keys))
+        self.assertFalse(_upcoming_league_ok("意甲", "", False, keys))
+        self.assertFalse(_upcoming_league_ok("英超", "西", False, keys))
+
     def test_bf_match_time_js_month(self) -> None:
         """Titan007 uses JavaScript month (5 = June), not ISO 1–12."""
         from zoneinfo import ZoneInfo

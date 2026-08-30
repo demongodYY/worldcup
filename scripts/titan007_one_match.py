@@ -12,6 +12,7 @@
     python3 scripts/titan007_one_match.py predict 2906745 --okooo-ids 2906745=1316319
     python3 scripts/titan007_one_match.py upcoming --hours 72 --limit 30
     python3 scripts/titan007_one_match.py upcoming -w --hours 168 --limit 20
+    python3 scripts/titan007_one_match.py upcoming --epl --la-liga --bundesliga --hours 168 --limit 40
     # 等价: --world-cup / --wc
 """
 
@@ -31,8 +32,10 @@ if str(_REPO) not in sys.path:
 
 from okooo_bifa import OKOOO_EXCHANGES_DETAIL_TMPL, resolve_okooo_bifa_match  # noqa: E402
 from titan007_ah_cli import (  # noqa: E402
+    _add_league_filter_args,
     _cookie_from_env,
     _snapshot_dir,
+    _selected_league_filter_keys,
     _upcoming_league_ok,
     cmd_predict,
 )
@@ -99,6 +102,7 @@ def cmd_upcoming_okooo(client: Titan007Client, args: argparse.Namespace) -> int:
     upper = datetime(2100, 1, 1, tzinfo=timezone.utc) if args.all_future else limit
     league_kw = (args.league_contains or "").strip()
     world_cup = bool(args.world_cup)
+    league_keys = _selected_league_filter_keys(args)
     fetch_euro = args.fetch_euro
     tz = _bf_match_timezone()
     tmap = client._okooo_titan_map or {}
@@ -108,7 +112,7 @@ def cmd_upcoming_okooo(client: Titan007Client, args: argparse.Namespace) -> int:
         m = client.build_match(sid, fetch_1x2=fetch_euro)
         if m.match_time <= now or m.match_time > upper:
             continue
-        if not _upcoming_league_ok(m.league_name or "", league_kw, world_cup):
+        if not _upcoming_league_ok(m.league_name or "", league_kw, world_cup, league_keys):
             continue
         okid: str | int = "-"
         src = "-"
@@ -209,15 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     p_up.add_argument("--hours", type=float, default=48.0)
     p_up.add_argument("--limit", type=int, default=80)
     p_up.add_argument("--all-future", action="store_true", help="不按 --hours 截断上界")
-    p_up.add_argument(
-        "-w",
-        "--wc",
-        "--world-cup",
-        dest="world_cup",
-        action="store_true",
-        help="只输出世界杯场次（联赛名含 世界杯 / 世界盃 / World Cup）；与 --league-contains 同时传时为 AND",
-    )
-    p_up.add_argument("--league-contains", type=str, default="", metavar="SUBSTR")
+    _add_league_filter_args(p_up)
     p_up.add_argument(
         "--fetch-euro",
         action="store_true",

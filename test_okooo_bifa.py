@@ -104,6 +104,8 @@ class OkoooAhCliBetfaParseTests(unittest.TestCase):
         self.assertEqual(m.home, "西班牙")
         self.assertEqual(m.away, "佛得角")
         self.assertEqual(m.lottery_handicap, "-2")
+        self.assertEqual(m.final_score, (0, 0))
+        self.assertEqual(m.raw["_okooo_final_score"], [0, 0])
 
 
 class OkoooBifaTests(unittest.TestCase):

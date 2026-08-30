@@ -40,6 +40,60 @@ def _snapshot_dir(cli_value: str | None) -> str:
     return (cli_value or os.environ.get("TITAN007_SNAPSHOT_DIR") or ".titan007_snapshots").strip()
 
 
+LEAGUE_FILTER_ALIASES: dict[str, tuple[str, ...]] = {
+    "world_cup": ("世界杯", "世界盃", "world cup"),
+    "premier_league": ("英超", "英格兰超级联赛", "英格蘭超級聯賽", "premier league", "epl"),
+    "la_liga": ("西甲", "西班牙甲级联赛", "西班牙甲級聯賽", "la liga", "laliga", "primera division", "primera división"),
+    "bundesliga": ("德甲", "德国甲级联赛", "德國甲級聯賽", "bundesliga"),
+}
+
+LEAGUE_FILTER_LABELS: dict[str, str] = {
+    "world_cup": "世界杯",
+    "premier_league": "英超",
+    "la_liga": "西甲",
+    "bundesliga": "德甲",
+}
+
+
+def _selected_league_filter_keys(args: argparse.Namespace) -> tuple[str, ...]:
+    return tuple(key for key in LEAGUE_FILTER_ALIASES if getattr(args, key, False))
+
+
+def _league_filter_label(keys: tuple[str, ...], league_kw: str) -> str:
+    parts = [LEAGUE_FILTER_LABELS[key] for key in keys]
+    if league_kw:
+        parts.append(f"联赛名含 {league_kw!r}")
+    return " / ".join(parts) if parts else "全部联赛"
+
+
+def _league_matches_key(match_league: str, key: str) -> bool:
+    text = match_league or ""
+    lower = text.lower()
+    return any(alias in text or alias in lower for alias in LEAGUE_FILTER_ALIASES[key])
+
+
+def _add_league_filter_args(parser: argparse.ArgumentParser) -> None:
+    suffix = "；可叠加多个联赛参数，按 OR 匹配；再与 --league-contains 叠加精筛"
+    parser.add_argument(
+        "-w",
+        "--wc",
+        "--world-cup",
+        dest="world_cup",
+        action="store_true",
+        help="只输出世界杯场次（联赛名须含 世界杯 / 世界盃 / World Cup）" + suffix,
+    )
+    parser.add_argument("--epl", "--premier-league", dest="premier_league", action="store_true", help="只输出英超 / Premier League" + suffix)
+    parser.add_argument("--la-liga", "--laliga", dest="la_liga", action="store_true", help="只输出西甲 / La Liga" + suffix)
+    parser.add_argument("--bundesliga", dest="bundesliga", action="store_true", help="只输出德甲 / Bundesliga" + suffix)
+    parser.add_argument(
+        "--league-contains",
+        type=str,
+        default="",
+        metavar="SUBSTR",
+        help="仅保留联赛名（bfdata 第 2 列）包含该子串的场次",
+    )
+
+
 def cmd_sources(client: Titan007Client, _store: SnapshotStore, args: argparse.Namespace) -> int:
     ts = str(int(time.time() * 1000))
     print("Titan007 feed health (Referer required for livestatic):")
@@ -89,16 +143,22 @@ def cmd_predict(client: Titan007Client, store: SnapshotStore, args: argparse.Nam
     return 0
 
 
-def _upcoming_league_ok(match_league: str, league_kw: str, world_cup: bool) -> bool:
-    """League filter for ``upcoming``（``--world-cup`` 与 ``--league-contains`` 同时指定时为 AND）。"""
+def _upcoming_league_ok(
+    match_league: str,
+    league_kw: str,
+    world_cup: bool,
+    league_keys: tuple[str, ...] = (),
+) -> bool:
+    """League filter for ``upcoming``（快捷联赛按 OR，``--league-contains`` 为 AND）。"""
     ln = match_league or ""
-    wc_ok = True
-    if world_cup:
-        wc_ok = "世界杯" in ln or "世界盃" in ln or "world cup" in ln.lower()
+    keys = league_keys or (("world_cup",) if world_cup else ())
+    preset_ok = True
+    if keys:
+        preset_ok = any(_league_matches_key(ln, key) for key in keys)
     sub_ok = True
     if league_kw:
         sub_ok = league_kw in ln
-    return wc_ok and sub_ok
+    return preset_ok and sub_ok
 
 
 def cmd_upcoming(client: Titan007Client, _store: SnapshotStore, args: argparse.Namespace) -> int:
@@ -124,7 +184,8 @@ def cmd_upcoming(client: Titan007Client, _store: SnapshotStore, args: argparse.N
     upper = datetime(2100, 1, 1, tzinfo=timezone.utc) if args.all_future else limit
     league_kw = (args.league_contains or "").strip()
     world_cup = bool(getattr(args, "world_cup", False))
-    want_league_filter = world_cup or bool(league_kw)
+    league_keys = _selected_league_filter_keys(args)
+    want_league_filter = bool(league_keys) or bool(league_kw)
     rows: list[tuple[datetime, int, str, str, str]] = []
     fetch_euro = args.fetch_euro
     next_future: datetime | None = None
@@ -136,12 +197,12 @@ def cmd_upcoming(client: Titan007Client, _store: SnapshotStore, args: argparse.N
             latest_in_index = m.match_time
         if m.match_time > now and (next_future is None or m.match_time < next_future):
             next_future = m.match_time
-        if want_league_filter and m.match_time > now and _upcoming_league_ok(m.league_name or "", league_kw, world_cup):
+        if want_league_filter and m.match_time > now and _upcoming_league_ok(m.league_name or "", league_kw, world_cup, league_keys):
             if next_future_kw is None or m.match_time < next_future_kw:
                 next_future_kw = m.match_time
         if m.match_time <= now or m.match_time > upper:
             continue
-        if not _upcoming_league_ok(m.league_name or "", league_kw, world_cup):
+        if not _upcoming_league_ok(m.league_name or "", league_kw, world_cup, league_keys):
             continue
         rows.append((m.match_time, sid, m.home, m.away, m.league_name))
     rows.sort()
@@ -166,14 +227,12 @@ def cmd_upcoming(client: Titan007Client, _store: SnapshotStore, args: argparse.N
         )
     else:
         print(f"筛选窗口: {now.isoformat()} ～ {limit.isoformat()}（--hours={hours}）", flush=True)
-    if world_cup:
-        print("筛选: 仅世界杯（联赛名含 世界杯 / 世界盃 / World Cup）", flush=True)
-    elif league_kw:
-        print(f"联赛名须包含: {league_kw!r}", flush=True)
+    if want_league_filter:
+        print(f"联赛筛选: {_league_filter_label(league_keys, league_kw)}", flush=True)
     if not rows:
         print("（窗口内没有比赛。）", flush=True)
         if want_league_filter and next_future_kw is not None:
-            hint = "世界杯筛选" if world_cup else f"含 {league_kw!r}"
+            hint = _league_filter_label(league_keys, league_kw)
             print(
                 f"提示: {hint} 的场次里，最近一场未来开球为 {next_future_kw.isoformat()} (UTC)；"
                 "若与窗口不符可加 ``--all-future`` 或加大 ``--hours``。",
@@ -297,7 +356,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "从赛程索引筛未来比赛。默认赛程源为 live（与 oldIndexall 同源的 bfdata_ut）；"
             "可用全局 --schedule-source 改为 bf 或 jc。"
-            "筛世界杯可加 ``--world-cup``、``-w`` 或 ``--wc``（只保留联赛名匹配 世界杯/世界盃/World Cup 的场次）。"
+            "筛世界杯可加 ``--world-cup``、``-w`` 或 ``--wc``；筛英超/西甲/德甲可加 "
+            "``--epl``、``--la-liga``、``--bundesliga``，多个快捷联赛参数按 OR 匹配。"
             "需要 **澳客比赛 ID** 时加 ``--with-okooo``（会多一次 betfa 请求，并在每行输出 ``okooo_id`` / ``match_source``）。"
             "若索引里全是已赛场次，则列不出未来球；跨度大时用 ``--all-future --limit 5``。"
             "每行第二列是 ScheduleID，与 predict --match-id 相同。"
@@ -312,21 +372,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="不按 --hours 截断上界，列出索引中所有「开球晚于当前时间」的场次（再受 --limit 限制）；"
         "适合世界杯跨度长、不想把 --hours 拉到几千的情况。",
     )
-    u.add_argument(
-        "-w",
-        "--wc",
-        "--world-cup",
-        dest="world_cup",
-        action="store_true",
-        help="只输出世界杯场次（联赛名须含 世界杯、世界盃 或 World Cup）；与 --league-contains 同时传时为 AND",
-    )
-    u.add_argument(
-        "--league-contains",
-        type=str,
-        default="",
-        metavar="SUBSTR",
-        help="仅保留联赛名（bfdata 第 2 列）包含该子串的场次；只筛世界杯请用 --world-cup / -w / --wc",
-    )
+    _add_league_filter_args(u)
     u.add_argument(
         "--fetch-euro",
         action="store_true",

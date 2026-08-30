@@ -5,7 +5,16 @@ import unittest
 from pathlib import Path
 from statistics import median
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
+from okooo_ah_cli import (
+    base_match_matches_filters,
+    fill_finished_okooo_validate_scores,
+    finished_snapshot_matches,
+    parse_okooo_livecenter_final_scores,
+    parse_validate_scoreline,
+    write_okooo_validate_score,
+)
 from tools.okooo_dashboard_server import (
     build_snapshot_events,
     recommendation_outcome,
@@ -75,6 +84,97 @@ def snapshot_record(
 
 
 class OkoooDashboardTests(unittest.TestCase):
+    def test_parse_validate_scoreline_accepts_common_separators(self) -> None:
+        self.assertEqual(parse_validate_scoreline("2-1"), (2, 1))
+        self.assertEqual(parse_validate_scoreline("2:1"), (2, 1))
+        self.assertEqual(parse_validate_scoreline("2：1"), (2, 1))
+
+    def test_parse_okooo_livecenter_final_scores(self) -> None:
+        page = '''
+        <tr state="End" matchid="1331779">
+          <td><b class="font_red ctrl_homescore">1</b><b class="font_red ctrl_scoresplit">-</b><b class="font_red ctrl_awayscore">1</b></td>
+        </tr>
+        <tr state="On" matchid="1331783">
+          <td><b class="font_red ctrl_homescore">3</b><b class="font_red ctrl_scoresplit">-</b><b class="font_red ctrl_awayscore">0</b></td>
+        </tr>
+        '''
+        self.assertEqual(parse_okooo_livecenter_final_scores(page), {1331779: (1, 1)})
+
+    def test_write_okooo_validate_score_adds_and_updates_score(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scores.json"
+            effective, old = write_okooo_validate_score(path, 123, 2, 1)
+            self.assertEqual(effective, path)
+            self.assertIsNone(old)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["123"], [2, 1])
+
+            _, old = write_okooo_validate_score(path, 123, 3, 0)
+
+            self.assertEqual(old, (2, 1))
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["123"], [3, 0])
+
+    def test_fill_finished_okooo_validate_scores_only_adds_missing_by_default(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.base_matches = {
+                    1: SimpleNamespace(okooo_id=1, final_score=(2, 1), kickoff="a", home="主一", away="客一"),
+                    2: SimpleNamespace(okooo_id=2, final_score=(0, 0), kickoff="b", home="主二", away="客二"),
+                    3: SimpleNamespace(okooo_id=3, final_score=None, kickoff="c", home="主三", away="客三"),
+                }
+
+            def refresh(self, *, core_only: bool = False) -> None:
+                self.core_only = core_only
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scores.json"
+            path.write_text(json.dumps({"1": [9, 9]}, ensure_ascii=False), encoding="utf-8")
+
+            _, updates = fill_finished_okooo_validate_scores(Client(), path)
+
+            self.assertEqual([item[0] for item in updates], [2])
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["1"], [9, 9])
+            self.assertEqual(data["2"], [0, 0])
+
+    def test_finished_snapshot_matches_only_returns_started_events(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            past = snapshot_record("2026-08-01T10:00:00+00:00", 0.1, home_index=50, away_index=30, event_id=11)
+            past["match"]["home"] = "主队一"
+            future = snapshot_record("2026-08-01T10:00:00+00:00", 0.1, home_index=50, away_index=30, event_id=12, match_time="2099-01-01T12:00:00+00:00")
+            (root / "scores.jsonl").write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in (past, future)),
+                encoding="utf-8",
+            )
+            self.assertEqual(finished_snapshot_matches(root), {11: ("主队一", "客队")})
+
+    def test_okooo_league_filters_match_top_euro_leagues(self) -> None:
+        args = SimpleNamespace(
+            world_cup=False,
+            premier_league=True,
+            la_liga=True,
+            bundesliga=True,
+            league_contains="",
+        )
+        self.assertTrue(base_match_matches_filters(SimpleNamespace(league="英超"), args))
+        self.assertTrue(base_match_matches_filters(SimpleNamespace(league="西甲"), args))
+        self.assertTrue(base_match_matches_filters(SimpleNamespace(league="德甲"), args))
+        self.assertTrue(base_match_matches_filters(SimpleNamespace(league="Premier League"), args))
+        self.assertFalse(base_match_matches_filters(SimpleNamespace(league="意甲"), args))
+
+    def test_okooo_league_contains_still_refines_preset_filters(self) -> None:
+        args = SimpleNamespace(
+            world_cup=False,
+            premier_league=True,
+            la_liga=True,
+            bundesliga=False,
+            league_contains="西",
+        )
+        self.assertFalse(base_match_matches_filters(SimpleNamespace(league="英超"), args))
+        self.assertTrue(base_match_matches_filters(SimpleNamespace(league="西甲"), args))
+
     def test_build_snapshot_events_summarizes_series(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "42.jsonl"

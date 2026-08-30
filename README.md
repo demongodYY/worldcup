@@ -31,6 +31,12 @@ python3 okooo_ah_cli.py sources
 python3 okooo_ah_cli.py upcoming --world-cup --all-future --limit 30
 ```
 
+列出英超、西甲、德甲比赛：
+
+```bash
+python3 okooo_ah_cli.py upcoming --epl --la-liga --bundesliga --all-future --limit 60
+```
+
 预测单场澳客 match id：
 
 ```bash
@@ -42,6 +48,12 @@ python3 okooo_ah_cli.py predict --match-id 1316320 --json
 
 ```bash
 python3 okooo_ah_cli.py watch --world-cup --horizon-hours 72 --limit 20 --verbose
+```
+
+按赛前窗口滚动保存英超、西甲、德甲快照：
+
+```bash
+python3 okooo_ah_cli.py watch --epl --la-liga --bundesliga --horizon-hours 72 --limit 30 --verbose
 ```
 
 用 Titan007 查未来场次并带出澳客 id：
@@ -66,15 +78,36 @@ python3 scripts/titan007_one_match.py predict 2906745 --okooo-ids 2906745=131631
 python3 okooo_ah_cli.py --help
 python3 okooo_ah_cli.py sources
 python3 okooo_ah_cli.py upcoming --world-cup --hours 72 --limit 30
+python3 okooo_ah_cli.py upcoming --epl --la-liga --bundesliga --hours 72 --limit 60
 python3 okooo_ah_cli.py upcoming --world-cup --all-future --full
 python3 okooo_ah_cli.py predict --match-id 1316320 --verbose --save-snapshot
 python3 okooo_ah_cli.py snapshot --match-ids 1316320 1316319
 python3 okooo_ah_cli.py trend --match-id 1316320
 python3 okooo_ah_cli.py watch --world-cup --horizon-hours 72 --interval 120 --verbose
+python3 okooo_ah_cli.py watch --epl --la-liga --bundesliga --horizon-hours 72 --interval 120 --verbose
 python3 okooo_ah_cli.py --no-dotenv validate-snapshots
 ```
 
 `validate-snapshots`：不访问网络，只读本地 `.okooo_snapshots` 与 `tools/okooo_validate_scores.json`。每场取最后两条合格赛前快照，以两次预测 score 的中位数决定方向，并使用最新一条快照当时的真实盘口和水位结算；输出全赢、半赢、走水、半输、全输、单位净收益和 ROI。不足两条、赛后快照、历史导入和固定占位字段不会进入验证；缺失水位显示 unavailable，不进入 ROI。存在半输/全输时默认 **退出码 1**；仅打印统计可加 `--allow-miss`。
+
+赛后更新单场复盘比分：
+
+```bash
+python3 okooo_ah_cli.py validate --match-id 1316320 --score 2-1
+python3 okooo_ah_cli.py validate --match-id 1316320 --from-okooo
+python3 okooo_ah_cli.py validate --match-id 1316320 --score 2-1 --run --allow-miss
+```
+
+从澳客批量补已完场比分（包含本地快照中已开赛、但已从当前期移除的比赛）：
+
+```bash
+python3 okooo_ah_cli.py validate --from-okooo --all-finished
+python3 okooo_ah_cli.py validate --from-okooo --all-finished --run --allow-miss
+```
+
+历史比赛页受澳客 WAF 保护；批量自动补分前，请在 `.env` 配置有效的 `OKOOO_COOKIE`，或通过 `--cookie-file` 指定从浏览器导出的 Cookie 文件。Cookie 缺失或失效时，命令会说明无法回查的原因，不会把“未拿到比分”误报成“没有完场比赛”。
+
+批量模式默认只补 `tools/okooo_validate_scores.json` 里缺失的比赛；需要覆盖已有比分时加 `--overwrite`。
 
 历史研究可用当前代码重放：
 
@@ -99,7 +132,9 @@ python3 okooo_ah_cli.py --no-dotenv validate-snapshots \
 - `--no-trade-trend`：关闭必发明细和近 3 小时成交接口探测。
 - `--snapshot-dir DIR`：快照目录；未指定时默认使用**仓库根**下的 `.okooo_snapshots`（与当前工作目录无关），也可用 `OKOOO_SNAPSHOT_DIR`。
 - `upcoming --world-cup`：只筛世界杯 / 世界盃 / World Cup。
+- `upcoming --epl --la-liga --bundesliga`：筛英超、西甲、德甲；三个参数可单独用，也可叠加，叠加时按任一联赛命中。
 - `watch --world-cup`：自动观察当前期所有世界杯比赛。
+- `watch --epl --la-liga --bundesliga`：自动观察当前期英超、西甲、德甲比赛。
 
 ### 澳客数据源
 
@@ -277,6 +312,7 @@ T-24h, T-8h, T-4h, T-2h, T-60m, T-30m
 ```bash
 python3 scripts/titan007_one_match.py upcoming --hours 72 --limit 40
 python3 scripts/titan007_one_match.py upcoming -w --hours 168 --limit 40
+python3 scripts/titan007_one_match.py upcoming --epl --la-liga --bundesliga --hours 168 --limit 60
 python3 scripts/titan007_one_match.py upcoming -w --all-future --limit 20 --json
 
 python3 scripts/titan007_one_match.py 2906745
